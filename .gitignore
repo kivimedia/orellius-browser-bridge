@@ -1,0 +1,6 @@
+node_modules/
+host/native-host-wrapper.sh
+.env
+*.log
+.DS_Store
+sqlite_mcp_server.db
