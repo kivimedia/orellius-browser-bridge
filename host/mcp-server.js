@@ -2,19 +2,31 @@
 
 // MCP Server for Orellius Browser Bridge extension.
 // Started by Claude Code via stdio MCP transport.
-// Also runs a TCP server for the native messaging host to connect.
-// Bridges MCP tool calls to the Chrome extension and returns results.
+// Connects as a TCP CLIENT to the hub process (hub.js) which multiplexes
+// multiple MCP server sessions through a single native host connection.
+// This enables multiple Claude Code instances to control different browser tabs.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { z } from "zod";
+import { fileURLToPath } from "node:url";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const DEFAULT_PORT = 18765;
+const SESSION_ID = crypto.randomUUID().slice(0, 8);
+
+function log(msg) {
+  const ts = new Date().toISOString().slice(11, 19);
+  process.stderr.write(`[mcp-server ${SESSION_ID} ${ts}] ${msg}\n`);
+}
 
 function getPort() {
   const configPath = path.join(os.homedir(), ".config", "orellius-browser-bridge", "config.json");
@@ -26,119 +38,83 @@ function getPort() {
   }
 }
 
-// --- TCP bridge to native host ---
+// --- TCP client to hub ---
 
-let nativeHostSocket = null;
+const TCP_PORT = getPort();
+let hubSocket = null;
+let hubBuffer = Buffer.alloc(0);
 const pendingRequests = new Map(); // id -> { resolve, reject, timer }
 let requestIdCounter = 0;
+let registered = false;
 
 function sendToExtension(tool, args) {
   return new Promise((resolve, reject) => {
-    if (!nativeHostSocket || nativeHostSocket.destroyed) {
+    if (!hubSocket || hubSocket.destroyed) {
       reject(new Error("Browser extension is not connected. Make sure a supported Chromium browser is running with the Orellius Browser Bridge extension installed and enabled."));
       return;
     }
-    const id = String(++requestIdCounter);
+    const id = `${SESSION_ID}_${++requestIdCounter}`;
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
       reject(new Error("Tool request timed out after 60s"));
     }, 60000);
-    pendingRequests.set(id, { resolve, reject, timer, tool, args, resent: false });
-    const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
-    const ok = nativeHostSocket.write(msg);
-    if (!ok) {
-      // Socket buffer full or broken — wait for drain or error
-      nativeHostSocket.once("error", () => {
-        if (pendingRequests.has(id)) {
-          clearTimeout(timer);
-          pendingRequests.delete(id);
-          reject(new Error("Browser extension connection lost while sending request."));
-        }
-      });
-    }
+    pendingRequests.set(id, { resolve, reject, timer });
+    const msg = JSON.stringify({ id, sessionId: SESSION_ID, type: "tool_request", tool, args }) + "\n";
+    hubSocket.write(msg);
   });
 }
 
-const TCP_PORT = getPort();
-
-// Write a pidfile so we can detect stale servers
-const pidfilePath = path.join(os.tmpdir(), `orellius-browser-bridge-mcp-${TCP_PORT}.pid`);
-
-async function killStaleServer() {
-  try {
-    const oldPid = parseInt(fs.readFileSync(pidfilePath, "utf-8").trim(), 10);
-    if (oldPid && oldPid !== process.pid) {
-      try {
-        process.kill(oldPid, 0);
-        process.kill(oldPid, "SIGTERM");
-        await new Promise((r) => setTimeout(r, 500));
-      } catch {
-        // Process already dead
-      }
-      try { fs.unlinkSync(pidfilePath); } catch {}
-    }
-  } catch {
-    // No pidfile
-  }
+/** Ensure hub.js is running. Spawns it as a detached background process if needed. */
+async function ensureHub() {
+  // Try connecting - if it works, hub is already running
+  return new Promise((resolve) => {
+    const probe = new net.Socket();
+    probe.connect(TCP_PORT, "127.0.0.1", () => {
+      probe.destroy();
+      resolve(); // Hub is running
+    });
+    probe.on("error", () => {
+      probe.destroy();
+      // Hub not running - spawn it
+      log("Hub not running, spawning...");
+      const hubPath = path.join(__dirname, "hub.js");
+      const child = spawn(process.execPath, [hubPath], {
+        detached: true,
+        stdio: "ignore",
+        env: { ...process.env },
+      });
+      child.unref();
+      // Wait a moment for it to start listening
+      setTimeout(resolve, 1000);
+    });
+  });
 }
 
-function writePidfile() {
-  try {
-    fs.writeFileSync(pidfilePath, String(process.pid));
-  } catch {
-    // Non-fatal
-  }
-}
+function connectToHub() {
+  if (hubSocket && !hubSocket.destroyed) return;
 
-function cleanupPidfile() {
-  try {
-    const content = fs.readFileSync(pidfilePath, "utf-8").trim();
-    if (content === String(process.pid)) fs.unlinkSync(pidfilePath);
-  } catch {
-    // Non-fatal
-  }
-}
+  hubSocket = new net.Socket();
+  hubSocket.connect(TCP_PORT, "127.0.0.1", () => {
+    log(`Connected to hub on port ${TCP_PORT}`);
+    // Register as MCP client with our sessionId
+    hubSocket.write(JSON.stringify({ type: "register_mcp_client", sessionId: SESSION_ID }) + "\n");
+  });
 
-function shutdown() {
-  cleanupPidfile();
-  if (nativeHostSocket && !nativeHostSocket.destroyed) nativeHostSocket.destroy();
-  for (const [id, { reject, timer }] of pendingRequests) {
-    clearTimeout(timer);
-    reject(new Error("Server shutting down"));
-  }
-  pendingRequests.clear();
-  tcpServer.close();
-  process.exit(0);
-}
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-process.on("SIGHUP", shutdown);
-// When parent process (Claude Code) dies, stdin closes
-process.stdin.on("end", shutdown);
-process.stdin.resume(); // Ensure 'end' fires even though StdioServerTransport also reads
-
-const tcpServer = net.createServer((socket) => {
-  // Reject new connections if we already have an active one.
-  // This prevents multiple browser profiles from fighting over the connection.
-  if (nativeHostSocket && !nativeHostSocket.destroyed) {
-    socket.end(JSON.stringify({ type: "error", error: "Another browser profile is already connected. Disable the extension in other profiles." }) + "\n");
-    socket.destroy();
-    return;
-  }
-  nativeHostSocket = socket;
-  let buffer = Buffer.alloc(0);
-
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
+  hubSocket.on("data", (chunk) => {
+    hubBuffer = Buffer.concat([hubBuffer, chunk]);
     let newlineIdx;
-    while ((newlineIdx = buffer.indexOf(10)) !== -1) {
-      const line = buffer.subarray(0, newlineIdx).toString("utf-8").trim();
-      buffer = buffer.subarray(newlineIdx + 1);
+    while ((newlineIdx = hubBuffer.indexOf(10)) !== -1) {
+      const line = hubBuffer.subarray(0, newlineIdx).toString("utf-8").trim();
+      hubBuffer = hubBuffer.subarray(newlineIdx + 1);
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
-        if (msg.type === "heartbeat") continue; // Ignore heartbeats
+        if (msg.type === "registered") {
+          registered = true;
+          log(`Registered with hub as session ${msg.sessionId}`);
+          continue;
+        }
+        if (msg.type === "heartbeat") continue;
         if (msg.id && pendingRequests.has(msg.id)) {
           const { resolve, reject, timer } = pendingRequests.get(msg.id);
           clearTimeout(timer);
@@ -155,52 +131,55 @@ const tcpServer = net.createServer((socket) => {
     }
   });
 
-  socket.on("error", () => {
-    nativeHostSocket = null;
+  hubSocket.on("error", (err) => {
+    log(`Hub connection error: ${err.message}`);
   });
 
-  socket.on("close", () => {
-    if (nativeHostSocket === socket) nativeHostSocket = null;
-    // Wait briefly for a new connection before rejecting pending requests.
-    // The extension's service worker may restart and reconnect within seconds.
-    if (pendingRequests.size > 0) {
-      setTimeout(() => {
-        // If a new connection arrived and we can resend, do so
-        if (nativeHostSocket && !nativeHostSocket.destroyed) {
-          for (const [id, entry] of pendingRequests) {
-            if (entry.resent) continue;
-            entry.resent = true;
-            const msg = JSON.stringify({ id, type: "tool_request", tool: entry.tool, args: entry.args }) + "\n";
-            nativeHostSocket.write(msg);
-          }
-        } else {
-          // No reconnection — reject everything
-          for (const [id, { reject, timer }] of pendingRequests) {
-            clearTimeout(timer);
-            reject(new Error("Native host disconnected"));
-          }
-          pendingRequests.clear();
-        }
-      }, 5000);
+  hubSocket.on("close", () => {
+    log("Hub connection closed");
+    hubSocket = null;
+    registered = false;
+    // Reject all pending requests
+    for (const [id, { reject, timer }] of pendingRequests) {
+      clearTimeout(timer);
+      reject(new Error("Hub connection lost"));
     }
-  });
-});
-
-// Kill any stale server, then bind
-await killStaleServer();
-
-tcpServer.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    process.stderr.write(`Port ${TCP_PORT} still in use after killing stale server. Retrying...\n`);
+    pendingRequests.clear();
+    // Try reconnecting after a delay
     setTimeout(() => {
-      tcpServer.close();
-      tcpServer.listen(TCP_PORT, "127.0.0.1");
-    }, 1000);
-  }
-});
+      if (!hubSocket) connectToHub();
+    }, 2000);
+  });
+}
 
-tcpServer.listen(TCP_PORT, "127.0.0.1", () => {
-  writePidfile();
+function shutdown() {
+  log("Shutting down...");
+  if (hubSocket && !hubSocket.destroyed) hubSocket.destroy();
+  for (const [id, { reject, timer }] of pendingRequests) {
+    clearTimeout(timer);
+    reject(new Error("Server shutting down"));
+  }
+  pendingRequests.clear();
+  process.exit(0);
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+process.on("SIGHUP", shutdown);
+process.stdin.on("end", () => {
+  log("Stdin closed (Claude Code disconnected). Cleaning up session.");
+  shutdown();
+});
+process.stdin.resume();
+
+// Set up hub connection in the background (after MCP is already connected).
+async function setupHubConnection() {
+  await ensureHub();
+  connectToHub();
+}
+
+setupHubConnection().catch((err) => {
+  log(`Hub connection failed: ${err.message}. Browser tools will not work.`);
 });
 
 // --- Helper to wrap tool results for MCP ---
@@ -490,7 +469,11 @@ server.tool(
   async (args) => callTool("upload_image", args)
 );
 
-// --- Start MCP server ---
+// --- Start MCP server FIRST (must respond to Claude Code before TCP setup) ---
 
 const transport = new StdioServerTransport();
-await server.connect(transport);
+// Connect stdio immediately so Claude Code gets the MCP handshake
+// before any slow TCP port negotiation.
+server.connect(transport).catch((err) => {
+  log(`MCP transport error: ${err.message}`);
+});

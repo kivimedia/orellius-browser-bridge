@@ -12,6 +12,11 @@ import os from "node:os";
 
 const DEFAULT_PORT = 18765;
 
+function log(msg) {
+  const ts = new Date().toISOString().slice(11, 19);
+  process.stderr.write(`[native-host ${ts}] ${msg}\n`);
+}
+
 function getPort() {
   const configPath = path.join(
     os.homedir(),
@@ -66,18 +71,21 @@ const TCP_PORT = getPort();
 function connectTcp() {
   if (tcpSocket) return;
 
+  log(`Connecting to MCP server at 127.0.0.1:${TCP_PORT}...`);
   tcpSocket = new net.Socket();
 
   tcpSocket.connect(TCP_PORT, "127.0.0.1", () => {
+    log(`Connected to hub on port ${TCP_PORT}`);
     reconnectAttempts = 0;
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
     }
+    // Register as the native host with the hub
+    tcpSocket.write(JSON.stringify({ type: "register_native_host" }) + "\n");
   });
 
   tcpSocket.on("data", (chunk) => {
-    // newline-delimited JSON from MCP server
     tcpBuffer = Buffer.concat([tcpBuffer, chunk]);
     let newlineIdx;
     while ((newlineIdx = tcpBuffer.indexOf(10)) !== -1) {
@@ -86,7 +94,6 @@ function connectTcp() {
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
-        // Forward to extension via native messaging
         writeNativeMessage(msg);
       } catch {
         // skip malformed
@@ -94,19 +101,26 @@ function connectTcp() {
     }
   });
 
-  tcpSocket.on("error", () => {
+  tcpSocket.on("error", (err) => {
+    if (reconnectAttempts === 0) {
+      log(`Hub connection error: ${err.message}`);
+    }
     tcpSocket = null;
   });
 
   tcpSocket.on("close", () => {
+    log(`Hub connection closed`);
     tcpSocket = null;
     if (!reconnectTimer) {
       reconnectTimer = setInterval(() => {
         reconnectAttempts++;
         if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-          // MCP server is gone — exit cleanly so we don't linger as a zombie
+          log(`Hub unreachable after ${MAX_RECONNECT_ATTEMPTS} attempts (${MAX_RECONNECT_ATTEMPTS / 2}s). Exiting.`);
           clearInterval(reconnectTimer);
           process.exit(0);
+        }
+        if (reconnectAttempts % 10 === 0) {
+          log(`Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}...`);
         }
         if (!tcpSocket) connectTcp();
       }, 500);
@@ -132,10 +146,11 @@ process.stdin.on("data", (chunk) => {
 });
 
 process.stdin.on("end", () => {
-  // Extension disconnected
+  log("Extension disconnected (stdin ended). Exiting.");
   if (tcpSocket) tcpSocket.destroy();
   process.exit(0);
 });
 
-// Start TCP connection
+// Start
+log(`Native host started (PID ${process.pid}), connecting to hub on port ${TCP_PORT}`);
 connectTcp();

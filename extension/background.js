@@ -8,80 +8,167 @@ self.addEventListener("unhandledrejection", (event) => {
 
 const NATIVE_HOST_NAME = "com.orellius.browser_bridge";
 
+// --- Debug logging ---
+function log(msg) {
+  console.log(`[BrowserBridge] ${msg}`);
+}
+
+// --- Badge status indicator ---
+function setBadge(status) {
+  const config = {
+    connected: { text: "ON", color: "#22c55e" },
+    disconnected: { text: "OFF", color: "#ef4444" },
+    connecting: { text: "...", color: "#f59e0b" },
+  };
+  const { text, color } = config[status] || config.disconnected;
+  try {
+    chrome.action.setBadgeText({ text });
+    chrome.action.setBadgeBackgroundColor({ color });
+    chrome.action.setTitle({ title: `Browser Bridge: ${status}` });
+  } catch {
+    // action API may not be available during startup
+  }
+}
+
 // --- State ---
 let nativePort = null;
+
+// Multi-session support: per-session tab groups
+// Legacy single-session state kept as fallback for messages without sessionId
 let tabGroupId = null;
 let tabGroupTabs = new Set();
+const sessionGroups = new Map(); // sessionId -> { tabGroupId, tabGroupTabs: Set }
+
 const attachedTabs = new Map(); // tabId -> { enabledDomains: Set }
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp}]
 const screenshotStore = new Map(); // imageId -> base64
 
+// Track which sessionId is active for each tool request (threaded through dispatch)
+let _currentSessionId = null;
+
 // --- Keep-alive alarm ---
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive") {
-    if (!nativePort) connectNativeHost();
+    if (!nativePort) {
+      log("Keepalive: native port is null, attempting reconnect...");
+      setBadge("connecting");
+      connectNativeHost();
+    }
   }
 });
 
 // --- Native messaging ---
+let connectAttempts = 0;
+
 function connectNativeHost() {
   if (nativePort) return;
+  connectAttempts++;
+  const attempt = connectAttempts;
+  log(`Connecting to native host "${NATIVE_HOST_NAME}" (attempt #${attempt})...`);
+  setBadge("connecting");
   try {
     nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+    log(`connectNative() returned successfully (attempt #${attempt})`);
+    setBadge("connected");
+    connectAttempts = 0;
 
     nativePort.onMessage.addListener((msg) => {
+      if (msg.type === "registered") {
+        log(`Hub acknowledged: ${msg.role}`);
+        return;
+      }
       if (msg.type === "tool_request" && msg.id) {
-        handleToolRequest(msg.id, msg.tool, msg.args || {});
+        const sid = msg.sessionId || null;
+        log(`Tool request: ${msg.tool} (id: ${msg.id}, session: ${sid || "legacy"})`);
+        handleToolRequest(msg.id, msg.tool, msg.args || {}, sid);
       }
     });
 
     nativePort.onDisconnect.addListener(() => {
       const err = chrome.runtime.lastError;
+      const reason = err ? err.message : "unknown reason";
+      log(`Native host disconnected: ${reason}`);
       nativePort = null;
-      // Retry in 2 seconds
-      setTimeout(connectNativeHost, 2000);
+      setBadge("disconnected");
+      // Retry with backoff: 2s, 4s, 8s, max 30s
+      const delay = Math.min(2000 * Math.pow(2, Math.min(connectAttempts, 4)), 30000);
+      log(`Will retry in ${delay / 1000}s...`);
+      setTimeout(connectNativeHost, delay);
     });
   } catch (e) {
+    log(`connectNative() threw: ${e.message}`);
     nativePort = null;
-    setTimeout(connectNativeHost, 2000);
+    setBadge("disconnected");
+    const delay = Math.min(2000 * Math.pow(2, Math.min(connectAttempts, 4)), 30000);
+    setTimeout(connectNativeHost, delay);
   }
 }
 
 function sendResponse(id, result) {
-  if (!nativePort) return;
+  if (!nativePort) {
+    log(`Cannot send response for ${id}: native port is null`);
+    return;
+  }
   try {
-    nativePort.postMessage({ id, type: "tool_response", result });
-  } catch {
-    // Port disconnected
+    const msg = { id, type: "tool_response", result };
+    if (_currentSessionId) msg.sessionId = _currentSessionId;
+    nativePort.postMessage(msg);
+  } catch (e) {
+    log(`Failed to send response for ${id}: ${e.message}`);
   }
 }
 
 function sendError(id, error) {
-  if (!nativePort) return;
+  if (!nativePort) {
+    log(`Cannot send error for ${id}: native port is null`);
+    return;
+  }
   try {
-    nativePort.postMessage({ id, type: "tool_error", error: String(error) });
-  } catch {
-    // Port disconnected
+    log(`Sending error for ${id}: ${error}`);
+    const msg = { id, type: "tool_error", error: String(error) };
+    if (_currentSessionId) msg.sessionId = _currentSessionId;
+    nativePort.postMessage(msg);
+  } catch (e) {
+    log(`Failed to send error for ${id}: ${e.message}`);
   }
 }
 
-// --- Tab group management ---
+// --- Tab group management (multi-session aware) ---
+
+// Color palette for session tab groups
+const SESSION_COLORS = ["blue", "cyan", "green", "yellow", "red", "pink", "purple", "orange"];
+let sessionColorIdx = 0;
+
+function getSessionState(sessionId) {
+  if (!sessionId) return { tabGroupId, tabGroupTabs };
+  if (!sessionGroups.has(sessionId)) {
+    sessionGroups.set(sessionId, { tabGroupId: null, tabGroupTabs: new Set() });
+  }
+  return sessionGroups.get(sessionId);
+}
+
 async function ensureTabGroup(createIfEmpty) {
-  // Check if our tab group still exists
-  if (tabGroupId !== null) {
+  const sessionId = _currentSessionId;
+  const state = getSessionState(sessionId);
+
+  // Check if this session's tab group still exists
+  if (state.tabGroupId !== null) {
     try {
-      const group = await chrome.tabGroups.get(tabGroupId);
+      const group = await chrome.tabGroups.get(state.tabGroupId);
       if (group) {
-        // Verify tabs are still in the group
-        const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-        tabGroupTabs = new Set(tabs.map((t) => t.id));
-        if (tabGroupTabs.size > 0) return;
+        const tabs = await chrome.tabs.query({ groupId: state.tabGroupId });
+        state.tabGroupTabs = new Set(tabs.map((t) => t.id));
+        if (state.tabGroupTabs.size > 0) {
+          // Sync legacy globals for backward compat
+          if (!sessionId) { tabGroupId = state.tabGroupId; tabGroupTabs = state.tabGroupTabs; }
+          return;
+        }
       }
     } catch {
-      tabGroupId = null;
-      tabGroupTabs.clear();
+      state.tabGroupId = null;
+      state.tabGroupTabs.clear();
     }
   }
 
@@ -91,9 +178,14 @@ async function ensureTabGroup(createIfEmpty) {
   const win = await chrome.windows.create({ focused: true, url: "about:blank" });
   const tab = win.tabs[0];
   const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-  await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
-  tabGroupId = groupId;
-  tabGroupTabs = new Set([tab.id]);
+  const label = sessionId ? `MCP-${sessionId}` : "MCP";
+  const color = sessionId ? SESSION_COLORS[sessionColorIdx++ % SESSION_COLORS.length] : "blue";
+  await chrome.tabGroups.update(groupId, { title: label, color });
+  state.tabGroupId = groupId;
+  state.tabGroupTabs = new Set([tab.id]);
+
+  // Sync legacy globals
+  if (!sessionId) { tabGroupId = groupId; tabGroupTabs = state.tabGroupTabs; }
 }
 
 function formatTabContext(tabs) {
@@ -112,31 +204,36 @@ function formatTabContext(tabs) {
     content: [
       {
         type: "text",
-        text: JSON.stringify({ availableTabs: available, tabGroupId }) + "\n\n" + text,
+        text: JSON.stringify({ availableTabs: available, tabGroupId: getSessionState(_currentSessionId).tabGroupId, sessionId: _currentSessionId }) + "\n\n" + text,
       },
     ],
   };
 }
 
 async function isInGroup(tabId) {
-  // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
+  const sessionId = _currentSessionId;
+  const state = getSessionState(sessionId);
+
+  // Always check live state
   try {
     const tab = await chrome.tabs.get(tabId);
     if (tab.groupId !== -1) {
-      // Recover tabGroupId if we lost it (service worker restart)
-      if (tabGroupId === null) {
+      // Recover session tab group if we lost it (service worker restart)
+      if (state.tabGroupId === null) {
         try {
           const group = await chrome.tabGroups.get(tab.groupId);
-          if (group.title === "MCP") {
-            tabGroupId = group.id;
-            const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-            tabGroupTabs = new Set(groupTabs.map((t) => t.id));
+          const expectedTitle = sessionId ? `MCP-${sessionId}` : "MCP";
+          if (group.title === expectedTitle || group.title === "MCP") {
+            state.tabGroupId = group.id;
+            const groupTabs = await chrome.tabs.query({ groupId: state.tabGroupId });
+            state.tabGroupTabs = new Set(groupTabs.map((t) => t.id));
+            if (!sessionId) { tabGroupId = state.tabGroupId; tabGroupTabs = state.tabGroupTabs; }
           }
         } catch {}
       }
-      return tab.groupId === tabGroupId;
+      return tab.groupId === state.tabGroupId;
     }
-    return tabGroupTabs.has(tabId);
+    return state.tabGroupTabs.has(tabId);
   } catch {
     return false;
   }
@@ -175,6 +272,10 @@ async function cdp(tabId, method, params = {}) {
 // Clean up when tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabGroupTabs.delete(tabId);
+  // Also clean from all session groups
+  for (const [, state] of sessionGroups) {
+    state.tabGroupTabs.delete(tabId);
+  }
   if (attachedTabs.has(tabId)) {
     try { chrome.debugger.detach({ tabId }); } catch {}
     attachedTabs.delete(tabId);
@@ -382,21 +483,23 @@ function sleep(ms) {
 const toolHandlers = {
   async tabs_context_mcp(args) {
     await ensureTabGroup(args.createIfEmpty);
-    if (tabGroupId === null) {
+    const state = getSessionState(_currentSessionId);
+    if (state.tabGroupId === null) {
       return {
         content: [{ type: "text", text: "No MCP tab group exists. Use createIfEmpty: true to create one." }],
       };
     }
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+    const tabs = await chrome.tabs.query({ groupId: state.tabGroupId });
     return formatTabContext(tabs);
   },
 
   async tabs_create_mcp(args) {
     await ensureTabGroup(true);
+    const state = getSessionState(_currentSessionId);
     const tab = await chrome.tabs.create({ active: true });
-    await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
-    tabGroupTabs.add(tab.id);
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+    await chrome.tabs.group({ tabIds: [tab.id], groupId: state.tabGroupId });
+    state.tabGroupTabs.add(tab.id);
+    const tabs = await chrome.tabs.query({ groupId: state.tabGroupId });
     const result = formatTabContext(tabs);
     result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
     return result;
@@ -444,7 +547,9 @@ const toolHandlers = {
     });
 
     const tab = await chrome.tabs.get(tabId);
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+    const sessionState = getSessionState(_currentSessionId);
+    const groupIdForQuery = sessionState.tabGroupId || tabGroupId;
+    const tabs = groupIdForQuery ? await chrome.tabs.query({ groupId: groupIdForQuery }) : [tab];
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
@@ -903,18 +1008,24 @@ const toolHandlers = {
 };
 
 // --- Tool dispatch ---
-async function handleToolRequest(id, tool, args) {
+async function handleToolRequest(id, tool, args, sessionId) {
   const handler = toolHandlers[tool];
   if (!handler) {
+    _currentSessionId = sessionId;
     sendError(id, `Unknown tool: ${tool}`);
+    _currentSessionId = null;
     return;
   }
 
   try {
+    // Set session context for the duration of this tool call
+    _currentSessionId = sessionId;
     const result = await handler(args);
     sendResponse(id, result);
   } catch (err) {
     sendError(id, `${tool} failed: ${err.message}`);
+  } finally {
+    _currentSessionId = null;
   }
 }
 
@@ -923,16 +1034,30 @@ async function handleToolRequest(id, tool, args) {
 // Recover MCP tab group state after service worker restart
 async function recoverTabGroupState() {
   try {
-    const groups = await chrome.tabGroups.query({ title: "MCP" });
-    if (groups.length > 0) {
-      tabGroupId = groups[0].id;
-      const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-      tabGroupTabs = new Set(tabs.map((t) => t.id));
+    // Recover all MCP tab groups (legacy "MCP" and session-specific "MCP-xxx")
+    const allGroups = await chrome.tabGroups.query({});
+    for (const group of allGroups) {
+      if (!group.title?.startsWith("MCP")) continue;
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      const tabSet = new Set(tabs.map((t) => t.id));
+
+      if (group.title === "MCP") {
+        // Legacy single-session group
+        tabGroupId = group.id;
+        tabGroupTabs = tabSet;
+      } else if (group.title.startsWith("MCP-")) {
+        // Session-specific group
+        const sid = group.title.slice(4);
+        sessionGroups.set(sid, { tabGroupId: group.id, tabGroupTabs: tabSet });
+      }
     }
+    log(`Recovered ${sessionGroups.size} session groups + ${tabGroupId ? 1 : 0} legacy group`);
   } catch {
-    // Not critical — will be set on first tabs_context_mcp call
+    // Not critical - will be set on first tabs_context_mcp call
   }
 }
 
+log("Service worker started");
+setBadge("disconnected");
 recoverTabGroupState();
 connectNativeHost();
