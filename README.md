@@ -7,7 +7,7 @@
 
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-black">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue">
   <img alt="Manifest" src="https://img.shields.io/badge/manifest-v3-orange">
   <img alt="MCP" src="https://img.shields.io/badge/MCP-compatible-purple">
 </p>
@@ -16,7 +16,7 @@
 
 Orellius Browser Bridge gives [Claude Code](https://claude.ai/code) an MCP-powered bridge into your real, signed-in Chromium browser — with **no domain blocklist**. Claude can navigate, click, type, screenshot, and run JavaScript on any URL it wants: Reddit, Twitter/X, Facebook, Discord web, paywalled docs, SSO dashboards. All fair game.
 
-Works with **Chrome**, **Brave**, and **Edge** on **macOS** and **Linux**.
+Works with **Chrome**, **Brave**, and **Edge** on **macOS**, **Linux**, and **Windows**.
 
 > **Disclaimer — not affiliated with Claude Code.** This is a fan-made, unofficial community project. It is not endorsed by or connected to Claude Code in any way. It exists to give Claude unrestricted access to any Chromium browser you load it into. Use at your own risk.
 
@@ -29,11 +29,13 @@ cd host && npm install && cd ..
 
 # 1. Open chrome://extensions, enable Developer mode, Load unpacked → pick extension/
 # 2. Copy the extension ID shown on the card
-./install.sh <extension-id>
+node install.js <extension-id>
 
 # 3. Fully restart your browser, then:
 claude mcp add orellius-browser-bridge -- node "$(pwd)/host/mcp-server.js"
 ```
+
+**Windows users:** Use PowerShell or Command Prompt. You may need to run as Administrator.
 
 Then in Claude Code: *"Open reddit.com and show me the top five posts in /r/programming."*
 
@@ -129,6 +131,7 @@ Two IPC hops are needed because Chrome's native messaging API requires Chrome it
 - **Node.js 18+** ([nodejs.org](https://nodejs.org/))
 - **Claude Code** ([install instructions](https://docs.claude.com/claude-code))
 - **A Chromium browser** — Chrome, Brave, or Edge (Chromium 116 or newer)
+- **Windows only:** Administrator access (for registry writes)
 
 ### 1. Clone the repo
 
@@ -154,17 +157,26 @@ cd host && npm install && cd ..
 
 ### 4. Register the native messaging host
 
-Pass every extension ID you collected to `install.sh`:
+Pass every extension ID you collected to `install.js`:
 
 ```bash
 # One browser:
-./install.sh <chrome-extension-id>
+node install.js <chrome-extension-id>
 
 # Multiple browsers — pass all IDs:
-./install.sh <chrome-extension-id> <brave-extension-id> <edge-extension-id>
+node install.js <chrome-extension-id> <brave-extension-id> <edge-extension-id>
 ```
 
-This writes a native messaging host manifest (`com.orellius.browser_bridge.json`) into the right per-browser directory for your platform. macOS and Linux are detected automatically.
+**What this does:**
+- **macOS/Linux:** Writes manifest JSON to `~/Library/Application Support/.../NativeMessagingHosts/` or `~/.config/.../NativeMessagingHosts/`
+- **Windows:** Writes manifest to `%USERPROFILE%\.orellius-browser-bridge\` and creates registry keys under `HKCU\Software\...\NativeMessagingHosts`
+
+**Windows troubleshooting:** If you get permission errors, run Command Prompt as Administrator:
+```cmd
+Right-click Command Prompt → "Run as administrator"
+cd path\to\orellius-browser-bridge
+node install.js <extension-id>
+```
 
 ### 5. Restart your browser
 
@@ -259,7 +271,8 @@ orellius-browser-bridge/
 │   ├── native-host.js    # Chrome native messaging ↔ TCP shim
 │   ├── package.json
 │   └── package-lock.json
-├── install.sh            # Native host manifest installer (macOS/Linux)
+├── install.js            # Cross-platform installer (macOS/Linux/Windows)
+├── install.sh            # Legacy bash installer (macOS/Linux only)
 └── README.md
 ```
 
@@ -281,11 +294,11 @@ If any of that reads as "too risky for me" — that's a reasonable reaction, and
 
 ## Platform support
 
-| Platform | Status |
-|---|---|
-| macOS  | Supported |
-| Linux  | Supported |
-| Windows | Not yet — `install.sh` is bash-only. PRs welcome (the host manifest needs a Windows registry entry under `HKCU\Software\Google\Chrome\NativeMessagingHosts`). |
+| Platform | Status | Notes |
+|---|---|---|
+| macOS  | ✅ Supported | JSON manifest in `~/Library/Application Support/` |
+| Linux  | ✅ Supported | JSON manifest in `~/.config/` |
+| Windows | ✅ Supported | Registry keys in `HKCU\Software\...\NativeMessagingHosts` (requires Admin) |
 
 ---
 
