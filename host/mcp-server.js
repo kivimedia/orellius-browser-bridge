@@ -16,6 +16,7 @@ import path from "node:path";
 import os from "node:os";
 import { z } from "zod";
 import { fileURLToPath } from "node:url";
+import * as sessionStore from "./session-store.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -196,9 +197,47 @@ function mixedResult(parts) {
   return { content: parts };
 }
 
+// Auto-save session state after tool calls
+let lastAutoSave = 0;
+const AUTO_SAVE_COOLDOWN = 30000; // 30s between saves
+
+async function autoSaveSession(toolName) {
+  const now = Date.now();
+  if (now - lastAutoSave < AUTO_SAVE_COOLDOWN) return;
+  lastAutoSave = now;
+  
+  try {
+    const tabsResult = await sendToExtension("tabs_context_mcp", {});
+    const tabs = typeof tabsResult === "string" ? JSON.parse(tabsResult) : tabsResult;
+    
+    const state = {
+      created: Date.now(),
+      tabs: tabs.tabs || [],
+      context: {
+        lastTool: toolName,
+        workingOn: "Auto-saved after tool call",
+      },
+    };
+    
+    sessionStore.saveSnapshot(SESSION_ID, state);
+    log(`Auto-saved session (${tabs.tabs?.length || 0} tabs)`);
+  } catch (err) {
+    // Silent fail - don't break tool calls if auto-save fails
+    log(`Auto-save failed: ${err.message}`);
+  }
+}
+
 async function callTool(toolName, args) {
   try {
     const result = await sendToExtension(toolName, args);
+    
+    // Auto-save after successful tool calls (except read-only tools)
+    const writeTools = ["navigate", "computer", "form_input", "tabs_create_mcp", "javascript_tool"];
+    if (writeTools.includes(toolName)) {
+      // Fire and forget
+      autoSaveSession(toolName).catch(() => {});
+    }
+    
     // Result from extension can be a string, object with content array, or raw data
     if (typeof result === "string") return textResult(result);
     if (result && result.content) return result;
@@ -246,9 +285,40 @@ const server = new McpServer({
 // 1. tabs_context_mcp
 server.tool(
   "tabs_context_mcp",
-  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
+  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. Also checks for available session recovery (previous session snapshots). CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
   { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
-  async (args) => callTool("tabs_context_mcp", args)
+  async (args) => {
+    const result = await callTool("tabs_context_mcp", args);
+    
+    // Check for recovery snapshot
+    const hasRecovery = sessionStore.hasSnapshot(SESSION_ID);
+    if (hasRecovery) {
+      const snapshot = sessionStore.loadSnapshot(SESSION_ID);
+      const age = sessionStore.timeAgo(snapshot.lastSnapshot);
+      const note = snapshot.context?.workingOn || "No description";
+      
+      // Parse original result and inject recovery info
+      try {
+        const originalText = result.content?.[0]?.text || "{}";
+        const data = JSON.parse(originalText);
+        data.recovery = {
+          available: true,
+          sessionId: SESSION_ID,
+          lastSnapshot: new Date(snapshot.lastSnapshot).toISOString(),
+          age,
+          tabCount: snapshot.tabs?.length || 0,
+          note,
+        };
+        return textResult(JSON.stringify(data, null, 2));
+      } catch {
+        // If parsing fails, append recovery as text
+        const recoveryText = `\n\n🔄 Recovery available: ${snapshot.tabs?.length || 0} tabs from ${age} (${note}). Use session_restore to recover.`;
+        return textResult((result.content?.[0]?.text || "") + recoveryText);
+      }
+    }
+    
+    return result;
+  }
 );
 
 // 2. tabs_create_mcp
@@ -467,6 +537,121 @@ server.tool(
     filename: z.string().optional().describe('Optional filename for the uploaded file (default: "image.png")'),
   },
   async (args) => callTool("upload_image", args)
+);
+
+// 19. session_save
+server.tool(
+  "session_save",
+  "Manually save current session state to disk for crash recovery. Takes a snapshot of all open tabs, URLs, and context. Snapshots are automatically saved after each tool call, but you can use this to save important checkpoints with a descriptive note.",
+  {
+    note: z.string().optional().describe("Optional note about what you're working on (e.g., 'Reddit automation halfway done', 'Before submitting form')"),
+  },
+  async (args) => {
+    try {
+      // Get current tab state from extension
+      const tabsResult = await callTool("tabs_context_mcp", {});
+      const tabs = tabsResult.content?.[0]?.text ? JSON.parse(tabsResult.content[0].text) : { tabs: [] };
+      
+      const state = {
+        created: Date.now(),
+        tabs: tabs.tabs || [],
+        context: {
+          workingOn: args.note || "Manual save",
+          lastTool: "session_save",
+        },
+      };
+      
+      const success = sessionStore.saveSnapshot(SESSION_ID, state);
+      if (success) {
+        return textResult(`✅ Session saved (${tabs.tabs?.length || 0} tabs)${args.note ? ': ' + args.note : ''}`);
+      } else {
+        return textResult("⚠️ Session persistence is disabled in config");
+      }
+    } catch (err) {
+      return textResult(`❌ Failed to save session: ${err.message}`);
+    }
+  }
+);
+
+// 20. session_restore
+server.tool(
+  "session_restore",
+  "List available session snapshots or restore a specific session. When restoring, reopens all tabs from the snapshot and provides a context summary of what you were working on.",
+  {
+    sessionId: z.string().optional().describe("Session ID to restore. If omitted, lists all available sessions sorted by recency."),
+  },
+  async (args) => {
+    try {
+      if (!args.sessionId) {
+        // List available sessions
+        const sessions = sessionStore.listSessions();
+        if (sessions.length === 0) {
+          return textResult("No saved sessions found.");
+        }
+        
+        const lines = ["📂 Available sessions (newest first):\n"];
+        for (const s of sessions.slice(0, 10)) {
+          const age = sessionStore.timeAgo(s.lastSnapshot);
+          const note = s.note ? ` - ${s.note}` : "";
+          lines.push(`• ${s.sessionId} (${s.tabCount} tabs, ${age})${note}`);
+        }
+        if (sessions.length > 10) {
+          lines.push(`\n... and ${sessions.length - 10} more`);
+        }
+        lines.push("\nUse session_restore with a sessionId to restore.");
+        return textResult(lines.join("\n"));
+      }
+      
+      // Restore specific session
+      const snapshot = sessionStore.loadSnapshot(args.sessionId);
+      if (!snapshot) {
+        return textResult(`❌ Session ${args.sessionId} not found`);
+      }
+      
+      // Restore tabs
+      const restored = [];
+      for (const tab of snapshot.tabs || []) {
+        try {
+          await callTool("tabs_create_mcp", { url: tab.url });
+          restored.push(tab.url);
+        } catch (err) {
+          log(`Failed to restore tab ${tab.url}: ${err.message}`);
+        }
+      }
+      
+      const age = sessionStore.timeAgo(snapshot.lastSnapshot);
+      const context = snapshot.context?.workingOn || "No context saved";
+      
+      return textResult(
+        `✅ Restored session from ${age}\n` +
+        `📝 Context: ${context}\n` +
+        `🗂️  Restored ${restored.length}/${snapshot.tabs?.length || 0} tabs\n\n` +
+        restored.map((url, i) => `${i + 1}. ${url}`).join("\n")
+      );
+    } catch (err) {
+      return textResult(`❌ Failed to restore session: ${err.message}`);
+    }
+  }
+);
+
+// 21. session_prune
+server.tool(
+  "session_prune",
+  "Delete old session snapshots to free up disk space. By default, deletes sessions older than 7 days. Sessions are automatically pruned on startup, so you rarely need to call this manually.",
+  {
+    maxAgeDays: z.number().optional().describe("Delete sessions older than this many days (default: 7)"),
+  },
+  async (args) => {
+    try {
+      const deleted = sessionStore.pruneOldSessions(args.maxAgeDays);
+      if (deleted === 0) {
+        return textResult("No old sessions to prune.");
+      }
+      return textResult(`🗑️  Deleted ${deleted} old session${deleted === 1 ? '' : 's'}`);
+    } catch (err) {
+      return textResult(`❌ Failed to prune sessions: ${err.message}`);
+    }
+  }
 );
 
 // --- Start MCP server FIRST (must respond to Claude Code before TCP setup) ---
