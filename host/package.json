@@ -5,6 +5,7 @@
   "description": "MCP server and native messaging host for Orellius Browser Bridge",
   "type": "module",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "ws": "^8.20.0"
   }
 }

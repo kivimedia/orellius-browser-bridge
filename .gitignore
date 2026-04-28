@@ -1,5 +1,6 @@
 node_modules/
 host/native-host-wrapper.sh
+host/com.orellius.browser_bridge-win.json
 .env
 *.log
 .DS_Store

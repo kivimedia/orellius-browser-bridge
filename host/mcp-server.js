@@ -654,6 +654,73 @@ server.tool(
   }
 );
 
+// 22. browser_lock
+server.tool(
+  "browser_lock",
+  "Claim exclusive access to a tab so other Claude Code sessions sharing this Orellius extension cannot interfere. Every subsequent tool call from this session extends the lock (heartbeat). Useful when two VS Code windows are both driving the same browser and racing on CDP commands. If the tab is already locked by another session, this fails unless force:true is passed.",
+  {
+    tabId: z.number().describe("Tab ID to lock."),
+    ttl_seconds: z.number().optional().describe("How long the lock stays active without activity (30-3600, default 600). Operations by the owning session extend this automatically."),
+    force: z.boolean().optional().describe("Break an existing lock held by another session. Use only when certain the other session has crashed or finished."),
+  },
+  async (args) => callTool("browser_lock", args)
+);
+
+// 23. browser_unlock
+server.tool(
+  "browser_unlock",
+  "Release a tab lock claimed via browser_lock. Call this when done with exclusive access so other sessions can operate on the tab.",
+  {
+    tabId: z.number().describe("Tab ID to unlock."),
+    force: z.boolean().optional().describe("Break a lock held by another session. Use only when certain the other session has crashed."),
+  },
+  async (args) => callTool("browser_unlock", args)
+);
+
+// 24. browser_lock_status
+server.tool(
+  "browser_lock_status",
+  "List all active tab locks and their owning sessions. Useful for debugging cross-session conflicts.",
+  {},
+  async (args) => callTool("browser_lock_status", args)
+);
+
+// 25. browser_mode (replaces browser_focus_mode; accepts old names too)
+server.tool(
+  "browser_mode",
+  'Get or set the default mode for the calling session. "private" mode (default) operates entirely inside the session\'s owned Chrome window - the human can keep working in their own window/desktop without ever seeing Orellius interrupt them. Tab activation still happens but only inside the owned window. "public" mode also calls chrome.windows.update({focused:true}) on every input, bringing the owned window to the foreground. Use "public" only when CDP input fails because another window stole focus, or when you genuinely need the human\'s attention on every action. For one-shot "look at this" moments, prefer browser_show. Persists across extension reloads. Aliases: "silent" -> "private", "active" -> "public".',
+  {
+    mode: z.enum(["private", "public", "silent", "active"]).optional().describe('"private" for invisible operation (default), "public" to grab window focus on every input. Omit to read current mode.'),
+  },
+  async (args) => callTool("browser_mode", args)
+);
+
+// 25b. browser_focus_mode (backward-compat alias for browser_mode)
+server.tool(
+  "browser_focus_mode",
+  'DEPRECATED. Alias for browser_mode. "silent" maps to "private", "active" maps to "public".',
+  {
+    mode: z.enum(["silent", "active", "private", "public"]).optional().describe('Use browser_mode instead.'),
+  },
+  async (args) => callTool("browser_focus_mode", args)
+);
+
+// 26. browser_show
+server.tool(
+  "browser_show",
+  "One-shot: bring the calling session's owned Chrome window to the foreground. Use when you need the human's eyes - showing them a result, presenting a UI for them to act on, or asking a question that requires them to look. Does NOT change the default mode; next input op respects whatever mode is set (private/public). Pair with browser_hide to send the window back to the background after you're done.",
+  {},
+  async (args) => callTool("browser_show", args)
+);
+
+// 27. browser_hide
+server.tool(
+  "browser_hide",
+  "One-shot: minimize the calling session's owned Chrome window. Use after browser_show to return to private operation immediately, so the human can keep working without the agent's window in their way.",
+  {},
+  async (args) => callTool("browser_hide", args)
+);
+
 // --- Start MCP server FIRST (must respond to Claude Code before TCP setup) ---
 
 const transport = new StdioServerTransport();

@@ -161,6 +161,19 @@ async function ensureTabGroup(createIfEmpty) {
         const tabs = await chrome.tabs.query({ groupId: state.tabGroupId });
         state.tabGroupTabs = new Set(tabs.map((t) => t.id));
         if (state.tabGroupTabs.size > 0) {
+          // Recover window ownership from the existing tab if we lost the
+          // mapping (e.g. extension reload, service worker restart). ONLY
+          // claim the window if every tab in it belongs to this session's
+          // group - never claim a window that has the human's own tabs.
+          if (sessionId && getSessionWindowId(sessionId) === undefined && tabs[0]?.windowId !== undefined) {
+            const winTabs = await chrome.tabs.query({ windowId: tabs[0].windowId });
+            const allOurs = winTabs.every((t) => state.tabGroupTabs.has(t.id));
+            if (allOurs) {
+              setSessionWindowId(sessionId, tabs[0].windowId);
+            } else {
+              log(`session ${sessionId} skipping window claim: window ${tabs[0].windowId} has ${winTabs.length - state.tabGroupTabs.size} non-session tabs`);
+            }
+          }
           // Sync legacy globals for backward compat
           if (!sessionId) { tabGroupId = state.tabGroupId; tabGroupTabs = state.tabGroupTabs; }
           return;
@@ -174,15 +187,25 @@ async function ensureTabGroup(createIfEmpty) {
 
   if (!createIfEmpty) return;
 
-  // Create a new window with a tab, group it
-  const win = await chrome.windows.create({ focused: true, url: "about:blank" });
+  // Create a new window with a tab, group it. The window opens in the
+  // background (focused:false) by default so the human isn't interrupted -
+  // this is the foundation of "private" mode. If the session wants the
+  // window visible, it can call browser_show after.
+  const wantFocus = defaultMode === "public";
+  const win = await chrome.windows.create({ focused: wantFocus, url: "about:blank" });
   const tab = win.tabs[0];
+  markOrelliusTab(tab.id);
   const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-  const label = sessionId ? `MCP-${sessionId}` : "MCP";
+  // Label format: "🔒 Claude" + short session id. The lock emoji tells the
+  // human "this window is owned by a Claude session, don't open new tabs in
+  // it." Color stays per-session so concurrent sessions are visually distinct.
+  const shortId = sessionId ? sessionId.slice(0, 8) : "";
+  const label = sessionId ? `🔒 Claude · ${shortId}` : "MCP";
   const color = sessionId ? SESSION_COLORS[sessionColorIdx++ % SESSION_COLORS.length] : "blue";
   await chrome.tabGroups.update(groupId, { title: label, color });
   state.tabGroupId = groupId;
   state.tabGroupTabs = new Set([tab.id]);
+  setSessionWindowId(sessionId, win.id);
 
   // Sync legacy globals
   if (!sessionId) { tabGroupId = groupId; tabGroupTabs = state.tabGroupTabs; }
@@ -200,11 +223,17 @@ function formatTabContext(tabs) {
     text += `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
   }
 
+  const manifest = chrome.runtime.getManifest();
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify({ availableTabs: available, tabGroupId: getSessionState(_currentSessionId).tabGroupId, sessionId: _currentSessionId }) + "\n\n" + text,
+        text: JSON.stringify({
+          availableTabs: available,
+          tabGroupId: getSessionState(_currentSessionId).tabGroupId,
+          sessionId: _currentSessionId,
+          extensionVersion: manifest.version,
+        }) + "\n\n" + text,
       },
     ],
   };
@@ -264,9 +293,278 @@ async function ensureDomain(tabId, domain) {
   state.enabledDomains.add(domain);
 }
 
+// Track the last detach reason per tab so error messages can explain *why* a
+// command failed (user clicked cancel, target closed, etc).
+const lastDetachReason = new Map(); // tabId -> reason string
+
+// --- Per-tab session locks ---
+// Prevents two Claude Code instances sharing the same Orellius extension from
+// racing on the same tab. Each tool handler that touches a tab consults this
+// before acting; owned-tab heartbeats extend the TTL so active work keeps the
+// lock alive without explicit renew calls.
+const tabLocks = new Map(); // tabId -> { sessionId, expiresAt }
+const LOCK_STORAGE_KEY = "orellius_tab_locks_v1";
+const DEFAULT_LOCK_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const HEARTBEAT_EXTEND_MS = 2 * 60 * 1000;   // each op extends to at least 2 min remaining
+
+// Mode: "private" (default) | "public"
+//   private: input ops only activate the target tab inside the session's owned
+//     window. The OS window itself is NOT brought to the foreground. The human
+//     can keep working in their own Chrome window or another desktop without
+//     ever seeing Orellius interrupt them. Tab-activation-within-the-owned-
+//     window is still required for CDP input dispatch, but since the human
+//     isn't IN that window, they don't see it switch.
+//   public: same as private PLUS chrome.windows.update({focused:true}) on the
+//     session's owned window, so the OS window pops to the foreground. Use
+//     this when the agent genuinely needs the human's eyes (showing something,
+//     asking).
+//
+// Backward-compat aliases: "silent" -> "private", "active" -> "public".
+//
+// Persisted in chrome.storage.local. Per-call override available via the
+// browser_show MCP tool which transiently goes public for one window-raise.
+const MODE_STORAGE_KEY = "orellius_mode_v1";
+const LEGACY_MODE_STORAGE_KEY = "orellius_focus_mode_v1";
+let defaultMode = "private"; // "private" | "public"
+
+function normalizeMode(mode) {
+  if (mode === "silent") return "private";
+  if (mode === "active") return "public";
+  return mode;
+}
+
+async function loadDefaultMode() {
+  try {
+    // Prefer new key; fall back to legacy key for migration.
+    const data = await chrome.storage.local.get([MODE_STORAGE_KEY, LEGACY_MODE_STORAGE_KEY]);
+    const raw = data[MODE_STORAGE_KEY] ?? data[LEGACY_MODE_STORAGE_KEY];
+    const stored = normalizeMode(raw);
+    if (stored === "private" || stored === "public") {
+      defaultMode = stored;
+    }
+    log(`defaultMode loaded: ${defaultMode}`);
+  } catch (e) {
+    log(`loadDefaultMode failed: ${e.message}`);
+  }
+}
+
+async function setDefaultMode(mode) {
+  const m = normalizeMode(mode);
+  if (m !== "private" && m !== "public") {
+    throw new Error(`Invalid mode "${mode}". Must be "private" or "public" (or legacy "silent"/"active").`);
+  }
+  defaultMode = m;
+  await chrome.storage.local.set({ [MODE_STORAGE_KEY]: m });
+  log(`defaultMode set: ${m}`);
+}
+
+// Per-session window claim. Each Claude session that creates an MCP tab group
+// claims the Chrome window that group lives in. Other sessions cannot operate
+// on tabs in that window. The session is free to open multiple tabs inside
+// its owned window. Stored only in memory because Chrome window IDs are
+// ephemeral - they die when the user closes the window.
+const sessionWindows = new Map(); // sessionId -> windowId
+
+// Tab IDs that Orellius itself just created (not the human). Used by the
+// onCreated listener to distinguish our tabs from human-created Ctrl+T tabs
+// in a session-owned window. Entries auto-expire after 5s, by which time the
+// tab has been added to the session's tabGroupTabs and is tracked there.
+const expectedOrelliusTabs = new Set();
+function markOrelliusTab(tabId) {
+  if (!tabId) return;
+  expectedOrelliusTabs.add(tabId);
+  setTimeout(() => expectedOrelliusTabs.delete(tabId), 5000);
+}
+
+function setSessionWindowId(sessionId, windowId) {
+  if (!sessionId || windowId === undefined) return;
+  sessionWindows.set(sessionId, windowId);
+  log(`session ${sessionId} claimed window ${windowId}`);
+}
+
+function getSessionWindowId(sessionId) {
+  return sessionId ? sessionWindows.get(sessionId) : undefined;
+}
+
+// Returns the sessionId that owns this windowId, or null if unclaimed.
+function findOwnerOfWindow(windowId) {
+  for (const [sid, wid] of sessionWindows) {
+    if (wid === windowId) return sid;
+  }
+  return null;
+}
+
+// Throws if the given tab lives in a window owned by a different session.
+// Used as a guard before any tab-activation or input dispatch.
+//
+// Self-healing: if our session claims a window that no longer exists (the
+// `onRemoved` listener can miss the event in some shutdown paths - e.g. host
+// reboots, fast-quit-then-relaunch), we silently release the stale claim
+// rather than throwing a confusing "user-owned window" error forever.
+async function assertTabInOwnedWindow(tabId, tab) {
+  const sid = _currentSessionId;
+  if (!sid) return; // legacy/unscoped sessions skip the check
+  if (!tab) tab = await chrome.tabs.get(tabId);
+  let myWindow = getSessionWindowId(sid);
+  if (myWindow !== undefined) {
+    // Verify the claimed window still exists. If not, drop the stale claim.
+    let stillExists = true;
+    try {
+      await chrome.windows.get(myWindow);
+    } catch {
+      stillExists = false;
+    }
+    if (!stillExists) {
+      sessionWindows.delete(sid);
+      log(`session ${sid} released stale claim on dead window ${myWindow} (self-heal)`);
+      myWindow = undefined;
+    }
+  }
+  if (myWindow !== undefined && tab.windowId !== myWindow) {
+    const otherOwner = findOwnerOfWindow(tab.windowId);
+    const ownerStr = otherOwner ? `session "${otherOwner}"` : "no session (user-owned window)";
+    throw new Error(
+      `Tab ${tabId} is in window ${tab.windowId}, which belongs to ${ownerStr}. ` +
+      `This session ("${sid}") owns window ${myWindow}. Operate only on tabs in your own window.`
+    );
+  }
+}
+
+function nowMs() { return Date.now(); }
+
+function isLockExpired(lock) {
+  return !lock || lock.expiresAt <= nowMs();
+}
+
+async function persistLocks() {
+  try {
+    const obj = {};
+    for (const [tabId, lock] of tabLocks) obj[tabId] = lock;
+    await chrome.storage.local.set({ [LOCK_STORAGE_KEY]: obj });
+  } catch (e) {
+    log(`persistLocks failed: ${e.message}`);
+  }
+}
+
+async function loadLocks() {
+  try {
+    const data = await chrome.storage.local.get(LOCK_STORAGE_KEY);
+    const obj = data[LOCK_STORAGE_KEY] || {};
+    for (const [tabId, lock] of Object.entries(obj)) {
+      if (!isLockExpired(lock)) tabLocks.set(Number(tabId), lock);
+    }
+    log(`Loaded ${tabLocks.size} active tab locks from storage`);
+  } catch (e) {
+    log(`loadLocks failed: ${e.message}`);
+  }
+}
+
+// Throws with a clear message if another session owns this tab. Refreshes the
+// lock TTL (heartbeat) when the current session owns it, so active work keeps
+// the lock alive automatically.
+function ensureLockOwnedByCurrentSession(tabId) {
+  const lock = tabLocks.get(tabId);
+  if (!lock || isLockExpired(lock)) {
+    if (lock && isLockExpired(lock)) {
+      tabLocks.delete(tabId);
+      persistLocks();
+    }
+    return; // no active lock - anyone may operate
+  }
+  const mySessionId = _currentSessionId || "legacy";
+  if (lock.sessionId !== mySessionId) {
+    const remainingSec = Math.ceil((lock.expiresAt - nowMs()) / 1000);
+    throw new Error(
+      `Tab ${tabId} is locked by session "${lock.sessionId}" for another ${remainingSec}s. ` +
+      `The owning Claude Code session is still active. Wait for it to finish or ` +
+      `call browser_unlock with force:true to override.`
+    );
+  }
+  // Heartbeat: extend expiry if less than HEARTBEAT_EXTEND_MS remains.
+  const remaining = lock.expiresAt - nowMs();
+  if (remaining < HEARTBEAT_EXTEND_MS) {
+    lock.expiresAt = nowMs() + HEARTBEAT_EXTEND_MS;
+    persistLocks();
+  }
+}
+
+// Errors from the CDP transport that are worth retrying once after a silent
+// reattach. The debugger can transiently detach when a click triggers a
+// navigation or a popover-rendering focus shift; a single retry recovers the
+// next command (read-only ones only - see retriableCdp below).
+const TRANSIENT_CDP_ERRORS = [
+  "Detached while handling command",
+  "Debugger is not attached",
+  "No tab with given id",
+  "Cannot access contents of",
+  // CDP input events dispatch to the currently-focused tab in the window, not
+  // the targeted tabId. When another extension injects a popup that steals
+  // focus (common with password managers), the next input command fails with
+  // this message referring to the *focused* tab, not our target.
+  "Cannot access a chrome-extension:// URL of different extension",
+];
+
+function isTransientCdpError(err) {
+  const msg = err?.message || String(err || "");
+  return TRANSIENT_CDP_ERRORS.some((s) => msg.includes(s));
+}
+
+// CDP input events dispatch based on BOTH the focused window and its focused
+// tab. Activating the tab isn't enough if Chrome has multiple windows - input
+// still goes to whichever window is foregrounded.
+//
+// With per-session window claims (see sessionWindows above), the human is
+// in their own Chrome window and Orellius drives a SEPARATE owned window.
+// In private mode we activate the target tab within the owned window
+// (mandatory for CDP input routing) but never call windows.update({focused})
+// so the human's window stays foregrounded. The owned window's tab switches
+// invisibly because the human isn't looking at it.
+//
+// In public mode we additionally bring the owned window to the foreground -
+// use this when the agent needs the human's eyes (showing something, asking).
+//
+// Cross-session safety: assertTabInOwnedWindow throws if a session tries to
+// activate a tab in another session's window. Without that guard, two
+// concurrent sessions sharing a window would race tab activations and each
+// would think their click went to the wrong tab.
+async function focusTabForInput(tabId, opts = {}) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    await assertTabInOwnedWindow(tabId, tab);
+    await chrome.tabs.update(tabId, { active: true });
+    const wantPublic = opts.public ?? (defaultMode === "public");
+    if (wantPublic && tab.windowId !== undefined) {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+  } catch (e) {
+    // Ownership errors are programmer errors (caller acted on wrong window) -
+    // re-throw so the tool returns a clear message instead of silently
+    // operating on the wrong tab.
+    if (e.message && e.message.includes("belongs to")) throw e;
+    log(`focusTabForInput(${tabId}) failed: ${e.message}`);
+  }
+}
+
 async function cdp(tabId, method, params = {}) {
   await ensureAttached(tabId);
   return chrome.debugger.sendCommand({ tabId }, method, params);
+}
+
+// Retry wrapper for READ-ONLY CDP calls (screenshots, Runtime.evaluate, etc.).
+// MUST NOT be used for input dispatch - retrying a click could double-fire it.
+async function retriableCdp(tabId, method, params = {}) {
+  try {
+    return await cdp(tabId, method, params);
+  } catch (err) {
+    if (!isTransientCdpError(err)) throw err;
+    const reason = lastDetachReason.get(tabId) || "unknown";
+    log(`Transient CDP failure on ${method} (tab ${tabId}, last detach: ${reason}). Reattaching and retrying once.`);
+    attachedTabs.delete(tabId);
+    try { chrome.debugger.detach({ tabId }); } catch {}
+    await sleep(100);
+    await ensureAttached(tabId);
+    return chrome.debugger.sendCommand({ tabId }, method, params);
+  }
 }
 
 // Clean up when tab is closed
@@ -282,11 +580,72 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   consoleMessages.delete(tabId);
   networkRequests.delete(tabId);
+  lastDetachReason.delete(tabId);
+  if (tabLocks.delete(tabId)) persistLocks();
 });
 
-// Handle user dismissing debugger bar
+// Drop window ownership when the human (or a script) closes the owned window.
+// Without this, a session whose window died would still be marked as owning
+// that windowId; re-creating a tab group would skip window creation and try
+// to operate on a stale window.
+chrome.windows.onRemoved.addListener((windowId) => {
+  for (const [sid, wid] of sessionWindows) {
+    if (wid === windowId) {
+      sessionWindows.delete(sid);
+      log(`session ${sid} lost its window ${windowId} (window closed)`);
+    }
+  }
+});
+
+// Auto-move human-created tabs out of session-owned windows. The contract for
+// "private" mode: the human can peek at our window, can close it, but cannot
+// open new tabs in it - those would interfere with our work. Ctrl+T or "+"
+// click results in a new tab being detached into its own window, preserving
+// the human's intent without disrupting our session.
+//
+// We distinguish Orellius-created tabs from human-created ones via the
+// expectedOrelliusTabs set (populated by markOrelliusTab when our code
+// creates a tab). The 250ms delay below gives our own create+group flow
+// time to mark the tab; longer than the typical event ordering race window
+// (50-100ms) but short enough that the human barely notices the tab popping
+// out into a new window.
+chrome.tabs.onCreated.addListener((tab) => {
+  if (!tab.windowId || tab.id === undefined) return;
+  // Bail fast if no session owns this window.
+  const ownerSid = findOwnerOfWindow(tab.windowId);
+  if (!ownerSid) return;
+  // Bail fast if Orellius itself just created this tab.
+  if (expectedOrelliusTabs.has(tab.id)) return;
+
+  // Defer the verdict so our own create+group flow (which races with this
+  // event) has time to mark the tab. After the delay, re-check ownership
+  // markers: expectedOrelliusTabs flag, or membership in the session's
+  // tabGroupTabs set.
+  setTimeout(async () => {
+    if (expectedOrelliusTabs.has(tab.id)) return; // ours after all
+    const state = sessionGroups.get(ownerSid);
+    if (state?.tabGroupTabs.has(tab.id)) return; // already grouped as ours
+    if (defaultMode !== "private") return; // public mode - don't fight the human
+
+    // Human created a tab in our owned window. Pop it into its own window.
+    try {
+      const stillExists = await chrome.tabs.get(tab.id).catch(() => null);
+      if (!stillExists) return;
+      await chrome.windows.create({ tabId: tab.id, focused: true });
+      log(`Moved human-created tab ${tab.id} out of session "${ownerSid}"'s owned window ${tab.windowId} into a new window`);
+    } catch (e) {
+      log(`Failed to move human-created tab ${tab.id} out of owned window: ${e.message}`);
+    }
+  }, 250);
+});
+
+// Log detach reason so transient vs. user-initiated detaches are diagnosable
+// from the service worker console. Reasons: target_closed, canceled_by_user,
+// replaced_with_devtools, restored.
 chrome.debugger.onDetach.addListener((source, reason) => {
+  lastDetachReason.set(source.tabId, reason);
   attachedTabs.delete(source.tabId);
+  log(`Debugger detached from tab ${source.tabId}: ${reason}`);
 });
 
 // --- CDP event listeners for console and network ---
@@ -416,28 +775,70 @@ const MAX_SCREENSHOT_WIDTH = 1280;
 const MAX_SCREENSHOT_HEIGHT = 800;
 
 async function takeScreenshot(tabId) {
-  await ensureAttached(tabId);
+  // Always refocus the target before capture. Some pages trigger focus-
+  // stealing side effects (Radix portals, Google Sign-In iframes, etc.) that
+  // make the CDP path refuse subsequent commands.
+  await focusTabForInput(tabId);
 
-  // With deviceScaleFactor: 1 set in ensureAttached, screenshots are captured
-  // at CSS pixel dimensions (e.g., 1080x746), matching the coordinate space
-  // used by Input.dispatchMouseEvent. No scaling tricks needed.
-  const result = await cdp(tabId, "Page.captureScreenshot", {
-    format: "jpeg",
-    quality: 55,
-    optimizeForSpeed: true,
-    captureBeyondViewport: false,
-  });
-  let base64 = result.data;
+  // Try CDP first (faster, supports beyondViewport). If attach OR the command
+  // fails, drop straight through to the captureVisibleTab fallback. Wrapping
+  // both attach and sendCommand in the try is critical - on this-tab-is-
+  // another-extension errors, the attach itself throws before any command
+  // runs, so leaving ensureAttached outside the try skips the fallback.
+  let base64;
+  let cdpError = null;
+  try {
+    await ensureAttached(tabId);
+    const result = await retriableCdp(tabId, "Page.captureScreenshot", {
+      format: "jpeg",
+      quality: 55,
+      optimizeForSpeed: true,
+      captureBeyondViewport: false,
+    });
+    base64 = result.data;
+  } catch (err) {
+    cdpError = err;
+    log(`Page.captureScreenshot path failed (${err.message}); attempting tabs.captureVisibleTab fallback.`);
+  }
+
+  // Fallback path when CDP refuses this tab (typical post-popover state).
+  // tabs.captureVisibleTab uses the <all_urls> host permission instead of the
+  // debugger attachment, so it still works after a CDP detach. Retry with
+  // refocus between attempts - if another extension is stealing focus, we
+  // might need several tries to land a capture while our tab has focus.
+  if (!base64) {
+    let fallbackErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) {
+          await focusTabForInput(tabId);
+          await sleep(150);
+        }
+        const tab = await chrome.tabs.get(tabId);
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 55 });
+        base64 = dataUrl.replace(/^data:image\/jpeg;base64,/, "");
+        log(`Screenshot succeeded via captureVisibleTab fallback (attempt ${attempt + 1}).`);
+        fallbackErr = null;
+        break;
+      } catch (e) {
+        fallbackErr = e;
+        log(`captureVisibleTab attempt ${attempt + 1} failed: ${e.message}`);
+      }
+    }
+    if (!base64) {
+      throw new Error(`Screenshot failed via both paths. CDP: ${cdpError?.message || "unknown"}. Fallback (3 attempts): ${fallbackErr?.message || "unknown"}`);
+    }
+  }
 
   // If still too large (>500KB base64 ≈ ~375KB binary), reduce quality further
   if (base64.length > 500000) {
-    const smaller = await cdp(tabId, "Page.captureScreenshot", {
+    const smaller = await retriableCdp(tabId, "Page.captureScreenshot", {
       format: "jpeg",
       quality: 30,
       optimizeForSpeed: true,
       captureBeyondViewport: false,
-    });
-    base64 = smaller.data;
+    }).catch(() => null);
+    if (smaller?.data) base64 = smaller.data;
   }
 
   const imageId = `screenshot_${Date.now()}`;
@@ -468,11 +869,73 @@ async function mouseClick(tabId, x, y, opts = {}) {
   const clickCount = opts.clickCount || 1;
   const modifiers = opts.modifiers || 0;
 
-  await dispatchMouse(tabId, "mouseMoved", x, y, { modifiers });
+  // Guarantee the target tab has focus before dispatching input events.
+  // Without this, focus-stealing extensions (password managers, popups) cause
+  // input to land in the wrong tab or raise the "different extension" error.
+  await focusTabForInput(tabId);
+
+  // Stage-aware error handling: knowing which CDP call failed tells the caller
+  // whether the click had any effect on the page. A detach between press and
+  // release is the common popover/navigation-focus case - the press already
+  // fired, so the click is effectively done even though release errored.
+  try {
+    await dispatchMouse(tabId, "mouseMoved", x, y, { modifiers });
+  } catch (err) {
+    if (isTransientCdpError(err)) {
+      // move didn't fire - tab state changed since the last command. One
+      // reattach-and-retry is safe since mouseMoved has no side effects.
+      const reason = lastDetachReason.get(tabId) || "transient";
+      log(`Click at (${x}, ${y}): mouseMoved failed (${err.message}, last detach: ${reason}), refocusing + reattaching.`);
+      attachedTabs.delete(tabId);
+      try { chrome.debugger.detach({ tabId }); } catch {}
+      await sleep(100);
+      await focusTabForInput(tabId);
+      await ensureAttached(tabId);
+      await dispatchMouse(tabId, "mouseMoved", x, y, { modifiers });
+    } else {
+      throw err;
+    }
+  }
   await sleep(50);
-  await dispatchMouse(tabId, "mousePressed", x, y, { button, clickCount, modifiers });
+  try {
+    await dispatchMouse(tabId, "mousePressed", x, y, { button, clickCount, modifiers });
+  } catch (err) {
+    if (isTransientCdpError(err)) {
+      // press failed - reattach and retry once. If the press already partially
+      // fired before the detach, worst case is a duplicate press event, which
+      // browsers coalesce into a single click.
+      const reason = lastDetachReason.get(tabId) || "transient";
+      log(`Click at (${x}, ${y}): mousePressed failed (${err.message}, last detach: ${reason}), refocusing + reattaching.`);
+      attachedTabs.delete(tabId);
+      try { chrome.debugger.detach({ tabId }); } catch {}
+      await sleep(100);
+      await focusTabForInput(tabId);
+      await ensureAttached(tabId);
+      await dispatchMouse(tabId, "mouseMoved", x, y, { modifiers });
+      await sleep(50);
+      await dispatchMouse(tabId, "mousePressed", x, y, { button, clickCount, modifiers });
+    } else {
+      throw err;
+    }
+  }
   await sleep(50);
-  await dispatchMouse(tabId, "mouseReleased", x, y, { button, clickCount, modifiers });
+  try {
+    await dispatchMouse(tabId, "mouseReleased", x, y, { button, clickCount, modifiers });
+  } catch (err) {
+    // Release-phase detach: press already fired, so the click is effectively
+    // complete from the page's perspective. Log but don't treat as fatal -
+    // callers can take a fresh screenshot to see the new state.
+    if (isTransientCdpError(err)) {
+      const reason = lastDetachReason.get(tabId) || "transient";
+      log(`Click at (${x}, ${y}) released after debugger detach (${reason}). Click likely took effect; reattaching.`);
+      attachedTabs.delete(tabId);
+      try { chrome.debugger.detach({ tabId }); } catch {}
+      await sleep(150);
+      await ensureAttached(tabId);
+      return;
+    }
+    throw err;
+  }
 }
 
 function sleep(ms) {
@@ -496,7 +959,13 @@ const toolHandlers = {
   async tabs_create_mcp(args) {
     await ensureTabGroup(true);
     const state = getSessionState(_currentSessionId);
-    const tab = await chrome.tabs.create({ active: true });
+    const ownedWindowId = getSessionWindowId(_currentSessionId);
+    // Create the tab inside our owned window so the auto-move listener
+    // doesn't kick the new tab out the moment we create it.
+    const createOpts = { active: true };
+    if (ownedWindowId !== undefined) createOpts.windowId = ownedWindowId;
+    const tab = await chrome.tabs.create(createOpts);
+    markOrelliusTab(tab.id);
     await chrome.tabs.group({ tabIds: [tab.id], groupId: state.tabGroupId });
     state.tabGroupTabs.add(tab.id);
     const tabs = await chrome.tabs.query({ groupId: state.tabGroupId });
@@ -508,6 +977,7 @@ const toolHandlers = {
   async navigate(args) {
     const { url, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
@@ -560,6 +1030,7 @@ const toolHandlers = {
   async computer(args) {
     const { action, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     let coordinate = args.coordinate;
     // Resolve ref to coordinates if provided
@@ -592,8 +1063,23 @@ const toolHandlers = {
 
       case "left_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
-        await mouseClick(tabId, coordinate[0], coordinate[1], { modifiers });
-        return { content: [{ type: "text", text: `Clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+        try {
+          await mouseClick(tabId, coordinate[0], coordinate[1], { modifiers });
+          return { content: [{ type: "text", text: `Clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+        } catch (err) {
+          // When OS-level input is blocked by focus stealing across windows,
+          // fall back to synthetic JS events on the ref. Only works for ref-
+          // based clicks (not raw coordinates) since we need a DOM element.
+          if (args.ref && err?.message?.includes("chrome-extension")) {
+            log(`left_click CDP path blocked (${err.message}); falling back to synthClick via content script.`);
+            const resp = await sendContentMessage(tabId, { type: "synthClick", ref: args.ref });
+            if (resp?.result?.ok) {
+              return { content: [{ type: "text", text: `Clicked (synthetic) at (${resp.result.x}, ${resp.result.y})` }] };
+            }
+            throw new Error(`CDP click failed (${err.message}) and synthClick fallback also failed: ${resp?.result?.error || "no response"}`);
+          }
+          throw err;
+        }
       }
 
       case "right_click": {
@@ -623,6 +1109,7 @@ const toolHandlers = {
 
       case "type": {
         if (!args.text) return { content: [{ type: "text", text: "text is required for type action" }] };
+        await focusTabForInput(tabId);
         await ensureAttached(tabId);
         // Type character by character for better compatibility
         for (const char of args.text) {
@@ -634,6 +1121,7 @@ const toolHandlers = {
 
       case "key": {
         if (!args.text) return { content: [{ type: "text", text: "text is required for key action" }] };
+        await focusTabForInput(tabId);
         await ensureAttached(tabId);
         const repeat = Math.min(args.repeat || 1, 100);
         // Parse space-separated key combos
@@ -754,6 +1242,7 @@ const toolHandlers = {
   async read_page(args) {
     const { tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -780,6 +1269,7 @@ const toolHandlers = {
   async get_page_text(args) {
     const { tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
     if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
@@ -802,6 +1292,7 @@ const toolHandlers = {
   async find(args) {
     const { query, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     const results = resp?.result || [];
@@ -821,6 +1312,7 @@ const toolHandlers = {
   async form_input(args) {
     const { ref, value, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
@@ -832,10 +1324,11 @@ const toolHandlers = {
   async javascript_tool(args) {
     const { text, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     await ensureAttached(tabId);
     try {
-      const result = await cdp(tabId, "Runtime.evaluate", {
+      const result = await retriableCdp(tabId, "Runtime.evaluate", {
         expression: text,
         returnByValue: true,
         awaitPromise: true,
@@ -860,6 +1353,7 @@ const toolHandlers = {
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     // Ensure console domain is enabled
     await ensureAttached(tabId);
@@ -902,6 +1396,7 @@ const toolHandlers = {
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     // Ensure network domain is enabled
     await ensureAttached(tabId);
@@ -933,6 +1428,7 @@ const toolHandlers = {
   async resize_window(args) {
     const { width, height, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     const tab = await chrome.tabs.get(tabId);
     await chrome.windows.update(tab.windowId, { width, height });
@@ -942,6 +1438,7 @@ const toolHandlers = {
   async upload_image(args) {
     const { imageId, tabId, ref, coordinate, filename = "image.png" } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     const base64 = screenshotStore.get(imageId);
     if (!base64) {
@@ -1005,6 +1502,112 @@ const toolHandlers = {
     text += "\nPlan auto-approved (no permission restrictions in this extension).";
     return { content: [{ type: "text", text }] };
   },
+
+  async browser_lock(args) {
+    const { tabId, ttl_seconds, force } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const mySessionId = _currentSessionId || "legacy";
+    const existing = tabLocks.get(tabId);
+    const ttlMs = Math.max(30, Math.min(3600, ttl_seconds || DEFAULT_LOCK_TTL_MS / 1000)) * 1000;
+    if (existing && !isLockExpired(existing) && existing.sessionId !== mySessionId && !force) {
+      const remainingSec = Math.ceil((existing.expiresAt - nowMs()) / 1000);
+      return { content: [{ type: "text", text: `Tab ${tabId} is already locked by session "${existing.sessionId}" for another ${remainingSec}s. Pass force:true to override.` }] };
+    }
+    const lock = { sessionId: mySessionId, expiresAt: nowMs() + ttlMs };
+    tabLocks.set(tabId, lock);
+    await persistLocks();
+    return { content: [{ type: "text", text: `Locked tab ${tabId} to session "${mySessionId}" for ${Math.round(ttlMs / 1000)}s. Lock will auto-extend on each tool call from this session.` }] };
+  },
+
+  async browser_unlock(args) {
+    const { tabId, force } = args;
+    const mySessionId = _currentSessionId || "legacy";
+    const existing = tabLocks.get(tabId);
+    if (!existing) return { content: [{ type: "text", text: `Tab ${tabId} is not locked.` }] };
+    if (existing.sessionId !== mySessionId && !force) {
+      return { content: [{ type: "text", text: `Tab ${tabId} is locked by session "${existing.sessionId}", not yours. Pass force:true to break the lock.` }] };
+    }
+    tabLocks.delete(tabId);
+    await persistLocks();
+    return { content: [{ type: "text", text: `Unlocked tab ${tabId}.` }] };
+  },
+
+  async browser_lock_status(args) {
+    const mySessionId = _currentSessionId || "legacy";
+    const lines = [];
+    for (const [tabId, lock] of tabLocks) {
+      if (isLockExpired(lock)) continue;
+      const remainingSec = Math.ceil((lock.expiresAt - nowMs()) / 1000);
+      const owner = lock.sessionId === mySessionId ? `${lock.sessionId} (you)` : lock.sessionId;
+      lines.push(`Tab ${tabId}: locked by ${owner}, ${remainingSec}s remaining`);
+    }
+    const text = lines.length ? lines.join("\n") : "No active tab locks.";
+    return { content: [{ type: "text", text }] };
+  },
+
+  async browser_focus_mode(args) {
+    // Backward-compat alias for browser_mode. Accepts "silent"/"active"
+    // and translates to "private"/"public".
+    return await toolHandlers.browser_mode(args);
+  },
+
+  async browser_mode(args) {
+    const { mode } = args || {};
+    if (mode === undefined) {
+      return { content: [{ type: "text", text:
+        `Current default mode: "${defaultMode}". ` +
+        `Pass mode:"private" so Orellius operates without grabbing your window focus (default), ` +
+        `or mode:"public" to bring its window to the foreground on every input.`
+      }] };
+    }
+    try {
+      await setDefaultMode(mode);
+      const m = normalizeMode(mode);
+      const explanation = m === "private"
+        ? "Orellius will activate the target tab inside its own owned window but will NOT bring that window to the foreground. You can keep working in another window or desktop without interruption. Use browser_show when you want the agent to surface its window once."
+        : "Orellius will activate the target tab AND bring its owned window to the foreground on every input. The window will pop up over your work each time the agent acts. Switch back to private when you want quiet.";
+      return { content: [{ type: "text", text: `Mode set to "${m}". ${explanation}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Failed: ${e.message}` }] };
+    }
+  },
+
+  async browser_show(args) {
+    // One-shot: bring the calling session's owned window to the foreground.
+    // Use when the agent needs the human's eyes (showing a result, asking a
+    // question). Does not change the default mode - next input op respects
+    // whatever mode is set.
+    const sid = _currentSessionId;
+    const wid = getSessionWindowId(sid);
+    if (wid === undefined) {
+      return { content: [{ type: "text", text:
+        `No window owned by session "${sid || 'legacy'}". Create a tab group first via tabs_context_mcp(createIfEmpty:true).`
+      }] };
+    }
+    try {
+      await chrome.windows.update(wid, { focused: true, drawAttention: true });
+      return { content: [{ type: "text", text: `Brought window ${wid} (session "${sid}") to the foreground.` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Failed to show window ${wid}: ${e.message}` }] };
+    }
+  },
+
+  async browser_hide(args) {
+    // One-shot: send the calling session's owned window to the background
+    // without closing it. Useful after you've shown the human something and
+    // want to return to private operation immediately.
+    const sid = _currentSessionId;
+    const wid = getSessionWindowId(sid);
+    if (wid === undefined) {
+      return { content: [{ type: "text", text: `No window owned by session "${sid || 'legacy'}".` }] };
+    }
+    try {
+      await chrome.windows.update(wid, { state: "minimized" });
+      return { content: [{ type: "text", text: `Minimized window ${wid} (session "${sid}").` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Failed to hide window ${wid}: ${e.message}` }] };
+    }
+  },
 };
 
 // --- Tool dispatch ---
@@ -1060,4 +1663,6 @@ async function recoverTabGroupState() {
 log("Service worker started");
 setBadge("disconnected");
 recoverTabGroupState();
+loadLocks();
+loadDefaultMode();
 connectNativeHost();

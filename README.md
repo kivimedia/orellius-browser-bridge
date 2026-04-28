@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img alt="License" src="https://img.shields.io/badge/license-MIT-black">
+  <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-black">
   <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue">
   <img alt="Manifest" src="https://img.shields.io/badge/manifest-v3-orange">
   <img alt="MCP" src="https://img.shields.io/badge/MCP-compatible-purple">
@@ -18,7 +18,9 @@ Orellius Browser Bridge gives [Claude Code](https://claude.ai/code) an MCP-power
 
 Works with **Chrome**, **Brave**, and **Edge** on **macOS**, **Linux**, and **Windows**.
 
-> **Disclaimer — not affiliated with Claude Code.** This is a fan-made, unofficial community project. It is not endorsed by or connected to Claude Code in any way. It exists to give Claude unrestricted access to any Chromium browser you load it into. Use at your own risk.
+> **Fork notice.** This is a multi-session fork of the original [Orellius/orellius-browser-bridge](https://github.com/Orellius/orellius-browser-bridge) by Orellius. All credit for the original design, MCP tool surface, and extension architecture goes to the upstream author. This fork adds multi-session support (multiple Claude instances on different tabs/windows), per-session window claiming with self-heal for stale claims, cross-session tab locking (`browser_lock` / `browser_unlock` / `browser_lock_status`), private/public visibility modes (`browser_mode`), Windows native-messaging install, and session persistence/recovery. Licensed GPL-3.0, matching upstream.
+
+> **Disclaimer — not affiliated with Claude Code or Anthropic.** This is a fan-made, unofficial community project. It is not endorsed by or connected to Claude Code in any way. It exists to give Claude unrestricted access to any Chromium browser you load it into. Use at your own risk.
 
 ## TL;DR — quick start
 

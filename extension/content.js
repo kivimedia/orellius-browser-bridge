@@ -415,6 +415,47 @@
     };
   }
 
+  // --- Synthetic click fallback ---
+  // Dispatches pointer + mouse events directly on the element. Used when OS-
+  // level CDP input fails due to focus stealing by other extensions or when
+  // the debugger detaches mid-click sequence. Works on any focusable element
+  // regardless of which Chrome window or tab holds foreground focus.
+  // Waits two animation frames before resolving so React has committed and
+  // the compositor has painted - otherwise follow-up screenshots capture the
+  // pre-click frame.
+  function synthClick(refId) {
+    const el = resolveRef(refId);
+    if (!el) return Promise.resolve({ ok: false, error: `Ref ${refId} not found` });
+    const rect = el.getBoundingClientRect();
+    const x = rect.x + rect.width / 2;
+    const y = rect.y + rect.height / 2;
+    const common = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      button: 0,
+      buttons: 1,
+    };
+    // Radix and other popover UIs listen to pointer events; fire the full
+    // pointerdown -> mousedown -> pointerup -> mouseup -> click sequence so
+    // behavior matches a real click (focus changes, hover states, etc).
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...common, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mousedown", common));
+    el.dispatchEvent(new PointerEvent("pointerup", { ...common, pointerType: "mouse", buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("mouseup", { ...common, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("click", { ...common, buttons: 0 }));
+    // Use setTimeout instead of requestAnimationFrame: RAF is throttled or
+    // paused when the tab loses focus (common after a click that steals focus),
+    // which would hang the content-script response indefinitely. setTimeout
+    // runs regardless of tab visibility.
+    return new Promise((resolve) => {
+      setTimeout(() => resolve({ ok: true, x: Math.round(x), y: Math.round(y) }), 80);
+    });
+  }
+
   // --- Message handler ---
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "generateAccessibilityTree") {
@@ -445,6 +486,11 @@
       const result = getRefCoordinates(msg.ref);
       sendResponse({ result });
       return true;
+    }
+
+    if (msg.type === "synthClick") {
+      Promise.resolve(synthClick(msg.ref)).then((result) => sendResponse({ result }));
+      return true; // keep channel open for async response
     }
 
     return false;
