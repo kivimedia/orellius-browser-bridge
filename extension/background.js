@@ -1608,6 +1608,89 @@ const toolHandlers = {
       return { content: [{ type: "text", text: `Failed to hide window ${wid}: ${e.message}` }] };
     }
   },
+
+  async tabs_close_mcp(args) {
+    const { tabId, force } = args || {};
+    if (typeof tabId !== "number") {
+      return { content: [{ type: "text", text: "tabs_close_mcp requires a numeric tabId." }] };
+    }
+    if (!(await isInGroup(tabId))) {
+      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    }
+    const mySid = _currentSessionId || "legacy";
+    const lock = tabLocks.get(tabId);
+    if (lock && !isLockExpired(lock) && lock.sessionId !== mySid && !force) {
+      return { content: [{ type: "text", text:
+        `Tab ${tabId} is locked by session "${lock.sessionId}". Pass force:true to close it anyway.`
+      }] };
+    }
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (e) {
+      return { content: [{ type: "text", text: `Failed to close tab ${tabId}: ${e.message}` }] };
+    }
+    if (tabLocks.delete(tabId)) await persistLocks();
+    for (const [, state] of sessionGroups) state.tabGroupTabs.delete(tabId);
+    const myState = sessionGroups.get(mySid);
+    const remaining = myState?.tabGroupId
+      ? await chrome.tabs.query({ groupId: myState.tabGroupId }).catch(() => [])
+      : [];
+    return { content: [{ type: "text", text:
+      `Closed tab ${tabId}. ${remaining.length} tab(s) remain in this session's MCP group.`
+    }] };
+  },
+
+  async session_end(args) {
+    const { force } = args || {};
+    const sid = _currentSessionId || "legacy";
+    const wid = getSessionWindowId(sid);
+    if (wid === undefined) {
+      return { content: [{ type: "text", text:
+        `Session "${sid}" has no owned window to end. Nothing to clean up.`
+      }] };
+    }
+    let tabsInWindow = [];
+    try {
+      tabsInWindow = await chrome.tabs.query({ windowId: wid });
+    } catch (e) {
+      // Window already gone - just drop our claim and return.
+      sessionWindows.delete(sid);
+      sessionGroups.delete(sid);
+      return { content: [{ type: "text", text:
+        `Window ${wid} was already closed. Released session "${sid}" claim.`
+      }] };
+    }
+    if (!force) {
+      const blockingLocks = [];
+      for (const t of tabsInWindow) {
+        const lock = tabLocks.get(t.id);
+        if (lock && !isLockExpired(lock) && lock.sessionId !== sid) {
+          blockingLocks.push({ tabId: t.id, owner: lock.sessionId });
+        }
+      }
+      if (blockingLocks.length) {
+        const desc = blockingLocks.map((b) => `tab ${b.tabId} -> ${b.owner}`).join(", ");
+        return { content: [{ type: "text", text:
+          `Refusing to end session: ${blockingLocks.length} tab(s) are locked by other sessions (${desc}). Pass force:true to override.`
+        }] };
+      }
+    }
+    let droppedLocks = 0;
+    for (const t of tabsInWindow) {
+      if (tabLocks.delete(t.id)) droppedLocks++;
+    }
+    if (droppedLocks) await persistLocks();
+    try {
+      await chrome.windows.remove(wid);
+    } catch (e) {
+      // Window vanished between our query and the remove - that's fine.
+    }
+    sessionWindows.delete(sid);
+    sessionGroups.delete(sid);
+    return { content: [{ type: "text", text:
+      `Ended session "${sid}". Closed window ${wid} (${tabsInWindow.length} tab(s)). Released ${droppedLocks} lock(s). Session claim cleared.`
+    }] };
+  },
 };
 
 // --- Tool dispatch ---

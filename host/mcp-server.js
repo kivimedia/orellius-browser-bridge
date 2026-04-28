@@ -721,6 +721,27 @@ server.tool(
   async (args) => callTool("browser_hide", args)
 );
 
+// 28. tabs_close_mcp
+server.tool(
+  "tabs_close_mcp",
+  "Close a single tab from the calling session's MCP group. Use when you're done with a specific page mid-conversation and want to keep the workspace tidy. Refuses to close a tab held by browser_lock from another session unless force:true. Other tabs in the session's window remain open.",
+  {
+    tabId: z.number().describe("Tab ID to close. Must be inside the session's MCP tab group."),
+    force: z.boolean().optional().describe("Close even if another session holds a browser_lock on this tab."),
+  },
+  async (args) => callTool("tabs_close_mcp", args)
+);
+
+// 29. session_end
+server.tool(
+  "session_end",
+  "End the current session: close every tab in the session's owned Chrome window, close the window, drop the session's window claim. Call this proactively when the conversation is wrapping up and you know the browser work is finished - it prevents orphan windows from piling up across many Claude Code conversations. Refuses if any tab is locked by a different session unless force:true. Safe to call when no window is owned (returns a no-op message). After session_end, calling another browser tool will create a fresh window via tabs_context_mcp(createIfEmpty:true).",
+  {
+    force: z.boolean().optional().describe("End the session even if other sessions hold browser_locks on tabs in this window."),
+  },
+  async (args) => callTool("session_end", args)
+);
+
 // --- Start MCP server FIRST (must respond to Claude Code before TCP setup) ---
 
 const transport = new StdioServerTransport();
