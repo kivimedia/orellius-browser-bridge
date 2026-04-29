@@ -74,6 +74,15 @@ function connectNativeHost() {
     setBadge("connected");
     connectAttempts = 0;
 
+    // Multi-browser handshake: tell the native host which browser we're
+    // running in so the hub can route per-browser. Required for Chrome +
+    // Firefox extensions to coexist on the same hub.
+    try {
+      nativePort.postMessage({ type: "init", browser: "chromium" });
+    } catch (e) {
+      log(`Failed to send init handshake: ${e.message}`);
+    }
+
     nativePort.onMessage.addListener((msg) => {
       if (msg.type === "registered") {
         log(`Hub acknowledged: ${msg.role}`);

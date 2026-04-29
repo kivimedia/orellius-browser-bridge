@@ -77,7 +77,7 @@ let registered = false;
 function sendToExtension(tool, args) {
   return new Promise((resolve, reject) => {
     if (!hubSocket || hubSocket.destroyed) {
-      reject(new Error("Browser extension is not connected. Make sure a supported Chromium browser is running with the Orellius Browser Bridge extension installed and enabled."));
+      reject(new Error("Hub is not connected. Make sure a supported browser is running with the Orellius extension installed and enabled."));
       return;
     }
     const id = `${SESSION_ID}_${++requestIdCounter}`;
@@ -86,7 +86,16 @@ function sendToExtension(tool, args) {
       reject(new Error("Tool request timed out after 60s"));
     }, 60000);
     pendingRequests.set(id, { resolve, reject, timer });
-    const msg = JSON.stringify({ id, sessionId: SESSION_ID, type: "tool_request", tool, args }) + "\n";
+    // Tag with target browser so the hub routes to the right native_host.
+    // This is the multi-browser routing key (chromium vs firefox).
+    const msg = JSON.stringify({
+      id,
+      sessionId: SESSION_ID,
+      type: "tool_request",
+      tool,
+      args,
+      browser: currentBrowser,
+    }) + "\n";
     hubSocket.write(msg);
   });
 }

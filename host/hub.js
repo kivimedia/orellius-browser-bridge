@@ -18,6 +18,16 @@ function log(msg) {
 }
 
 function getPort() {
+  // CLI override (--port=NN) wins for tests / multi-hub setups.
+  for (const arg of process.argv.slice(2)) {
+    const m = /^--port=(\d+)$/.exec(arg);
+    if (m) return Number(m[1]);
+  }
+  // Env override (ORELLIUS_HUB_PORT) is next.
+  if (process.env.ORELLIUS_HUB_PORT) {
+    const p = Number(process.env.ORELLIUS_HUB_PORT);
+    if (Number.isFinite(p)) return p;
+  }
   const configPath = path.join(os.homedir(), ".config", "orellius-browser-bridge", "config.json");
   try {
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
@@ -31,15 +41,23 @@ const TCP_PORT = getPort();
 const pidfilePath = path.join(os.tmpdir(), `orellius-browser-bridge-hub-${TCP_PORT}.pid`);
 
 // --- State ---
+//
+// Multi-browser routing: the hub holds one native_host socket PER browser
+// ("chromium" or "firefox"), so a Chrome extension and a Firefox extension
+// can both stay connected at the same time without kicking each other out.
+// MCP clients tag each tool_request with `browser` to indicate which one
+// should serve it; if absent, the hub defaults to "chromium" (legacy).
 
-/** @type {net.Socket | null} */
-let nativeHostSocket = null;
+/** @type {Map<string, net.Socket>} browser -> native host socket */
+const nativeHostSockets = new Map();
 
 /** @type {Map<string, net.Socket>} sessionId -> MCP server socket */
 const mcpClients = new Map();
 
-/** @type {Map<string, string>} requestId -> sessionId (for routing responses) */
+/** @type {Map<string, {sessionId: string, browser: string}>} requestId -> routing info */
 const requestRouting = new Map();
+
+const DEFAULT_BROWSER = "chromium";
 
 let idleTimer = null;
 
@@ -71,28 +89,34 @@ function cleanupPidfile() {
 // --- Message routing ---
 
 function forwardToNativeHost(msg) {
-  if (!nativeHostSocket || nativeHostSocket.destroyed) {
+  const browser = msg.browser || DEFAULT_BROWSER;
+  const socket = nativeHostSockets.get(browser);
+
+  if (!socket || socket.destroyed) {
     // Send error back to the MCP client
     const sessionId = msg.sessionId;
     const client = sessionId ? mcpClients.get(sessionId) : null;
     if (client && !client.destroyed) {
+      const known = [...nativeHostSockets.keys()].join(", ") || "none";
       const errMsg = JSON.stringify({
         id: msg.id,
         sessionId,
         type: "tool_error",
-        error: "Browser extension is not connected. Make sure a supported Chromium browser is running with the Orellius Browser Bridge extension installed and enabled.",
+        error: `No ${browser} browser extension connected to hub (registered: ${known}). Open a ${browser} browser with the Orellius extension loaded.`,
       }) + "\n";
       client.write(errMsg);
     }
     return;
   }
 
-  // Track which session this request belongs to
+  // Track which session AND which browser this request belongs to so we can
+  // route the eventual response back to the right MCP client even if the
+  // response message itself loses its sessionId.
   if (msg.id && msg.sessionId) {
-    requestRouting.set(msg.id, msg.sessionId);
+    requestRouting.set(msg.id, { sessionId: msg.sessionId, browser });
   }
 
-  nativeHostSocket.write(JSON.stringify(msg) + "\n");
+  socket.write(JSON.stringify(msg) + "\n");
 }
 
 function forwardToMcpClient(msg) {
@@ -101,7 +125,8 @@ function forwardToMcpClient(msg) {
 
   // Fallback: look up sessionId by request ID
   if (!sessionId && msg.id) {
-    sessionId = requestRouting.get(msg.id);
+    const route = requestRouting.get(msg.id);
+    if (route) sessionId = route.sessionId;
   }
 
   if (msg.id) {
@@ -130,6 +155,7 @@ const server = net.createServer((socket) => {
   const remote = `${socket.remoteAddress}:${socket.remotePort}`;
   let socketType = null; // "native_host" or "mcp_client"
   let socketSessionId = null;
+  let socketBrowser = null; // for native_host sockets only
   let buffer = Buffer.alloc(0);
 
   // First message determines socket type
@@ -149,13 +175,18 @@ const server = net.createServer((socket) => {
         if (!socketType) {
           if (msg.type === "register_native_host") {
             socketType = "native_host";
-            if (nativeHostSocket && !nativeHostSocket.destroyed) {
-              log(`Replacing previous native host connection with ${remote}`);
-              nativeHostSocket.destroy();
+            socketBrowser = msg.browser || DEFAULT_BROWSER;
+            // Only replace the same-browser socket; do not kick out other
+            // browsers' native_hosts (the original bug that prevented Chrome
+            // and Firefox from coexisting).
+            const prev = nativeHostSockets.get(socketBrowser);
+            if (prev && !prev.destroyed) {
+              log(`Replacing previous ${socketBrowser} native host with ${remote}`);
+              prev.destroy();
             }
-            nativeHostSocket = socket;
-            log(`Native host registered from ${remote}`);
-            socket.write(JSON.stringify({ type: "registered", role: "native_host" }) + "\n");
+            nativeHostSockets.set(socketBrowser, socket);
+            log(`Native host registered from ${remote} (browser=${socketBrowser}, total=${nativeHostSockets.size})`);
+            socket.write(JSON.stringify({ type: "registered", role: "native_host", browser: socketBrowser }) + "\n");
             continue;
           } else if (msg.type === "register_mcp_client" && msg.sessionId) {
             socketType = "mcp_client";
@@ -174,14 +205,18 @@ const server = net.createServer((socket) => {
             socket.write(JSON.stringify({ type: "registered", role: "mcp_client", sessionId: socketSessionId }) + "\n");
             continue;
           } else {
-            // Legacy: treat as native host (backward compat with old native-host.js)
+            // Legacy: treat as native host with default browser (back-compat
+            // with pre-multi-browser native-host.js that omits the browser
+            // field on register).
             socketType = "native_host";
-            if (nativeHostSocket && !nativeHostSocket.destroyed) {
-              log(`Replacing previous native host (legacy connect) with ${remote}`);
-              nativeHostSocket.destroy();
+            socketBrowser = DEFAULT_BROWSER;
+            const prev = nativeHostSockets.get(socketBrowser);
+            if (prev && !prev.destroyed) {
+              log(`Replacing previous ${socketBrowser} native host (legacy connect) with ${remote}`);
+              prev.destroy();
             }
-            nativeHostSocket = socket;
-            log(`Native host connected (legacy) from ${remote}`);
+            nativeHostSockets.set(socketBrowser, socket);
+            log(`Native host connected (legacy, browser=${socketBrowser}) from ${remote}`);
             // Fall through to process this message
           }
         }
@@ -208,15 +243,15 @@ const server = net.createServer((socket) => {
   });
 
   socket.on("close", () => {
-    if (socketType === "native_host" && nativeHostSocket === socket) {
-      log(`Native host disconnected (${remote})`);
-      nativeHostSocket = null;
+    if (socketType === "native_host" && socketBrowser && nativeHostSockets.get(socketBrowser) === socket) {
+      log(`Native host disconnected (browser=${socketBrowser}, ${remote})`);
+      nativeHostSockets.delete(socketBrowser);
     } else if (socketType === "mcp_client" && socketSessionId) {
       log(`MCP client disconnected: session=${socketSessionId} (${remote})`);
       mcpClients.delete(socketSessionId);
       // Clean up pending request routing for this session
-      for (const [reqId, sid] of requestRouting) {
-        if (sid === socketSessionId) requestRouting.delete(reqId);
+      for (const [reqId, route] of requestRouting) {
+        if (route.sessionId === socketSessionId) requestRouting.delete(reqId);
       }
       resetIdleTimer();
     }
@@ -230,7 +265,10 @@ function shutdown() {
     if (!sock.destroyed) sock.destroy();
   }
   mcpClients.clear();
-  if (nativeHostSocket && !nativeHostSocket.destroyed) nativeHostSocket.destroy();
+  for (const [, sock] of nativeHostSockets) {
+    if (!sock.destroyed) sock.destroy();
+  }
+  nativeHostSockets.clear();
   server.close();
   process.exit(0);
 }
