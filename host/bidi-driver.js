@@ -48,36 +48,38 @@ class BidiDriver {
   }
 
   // --- Discovery + connect ---
+  //
+  // Firefox 129+ exposes the BiDi WebSocket at the well-known path /session
+  // and does NOT mirror Chrome's /json/version discovery endpoint. We try
+  // /json/version as a best-effort probe (so a Chrome-via-CDP-mux build
+  // would also work), then fall back to the well-known Firefox path.
 
   async _discoverWsUrl() {
-    return new Promise((resolve, reject) => {
-      const req = http.get(
-        { host: this.host, port: this.port, path: "/json/version", timeout: DISCOVERY_TIMEOUT_MS },
-        (res) => {
-          if (res.statusCode !== 200) {
-            reject(new Error(`/json/version returned HTTP ${res.statusCode}`));
-            return;
+    const probed = await new Promise((resolve) => {
+      try {
+        const req = http.get(
+          { host: this.host, port: this.port, path: "/json/version", timeout: 1500 },
+          (res) => {
+            if (res.statusCode !== 200) { res.resume(); resolve(null); return; }
+            let body = "";
+            res.on("data", (c) => { body += c; });
+            res.on("end", () => {
+              try {
+                const data = JSON.parse(body);
+                resolve(data.webSocketDebuggerUrl || data.webSocketUrl || null);
+              } catch { resolve(null); }
+            });
           }
-          let body = "";
-          res.on("data", (chunk) => { body += chunk; });
-          res.on("end", () => {
-            try {
-              const data = JSON.parse(body);
-              const url = data.webSocketDebuggerUrl || data.webSocketUrl;
-              if (!url) {
-                reject(new Error(`No webSocketDebuggerUrl in /json/version: ${body.slice(0, 200)}`));
-                return;
-              }
-              resolve(url);
-            } catch (e) {
-              reject(new Error(`Failed to parse /json/version: ${e.message}`));
-            }
-          });
-        }
-      );
-      req.on("error", (err) => reject(err));
-      req.on("timeout", () => { req.destroy(new Error("discovery timed out")); });
+        );
+        req.on("error", () => resolve(null));
+        req.on("timeout", () => { req.destroy(); resolve(null); });
+      } catch { resolve(null); }
     });
+
+    if (probed) return probed;
+    // Firefox / WebDriver BiDi well-known path. Verified empirically on
+    // Firefox 143.0.4: HTTP GET upgrades cleanly to WebSocket here.
+    return `ws://${this.host}:${this.port}/session`;
   }
 
   async connect() {
