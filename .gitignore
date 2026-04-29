@@ -5,3 +5,8 @@ host/com.orellius.browser_bridge-win.json
 *.log
 .DS_Store
 sqlite_mcp_server.db
+
+# Firefox build artifacts (regenerated via npm run build:firefox)
+dist/
+bidi-test-shot.png
+

@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "Orellius Browser Bridge (Firefox)",
+  "version": "1.5.0",
+  "description": "Unrestricted browser automation for Claude Code, Firefox edition. Drives clicks/keys via WebDriver BiDi sidecar.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "orellius@kivimedia.co",
+      "strict_min_version": "128.0"
+    }
+  },
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "nativeMessaging",
+    "windows",
+    "storage",
+    "alarms",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "Orellius (Firefox): checking...",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -6,34 +6,39 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const NATIVE_HOST_NAME = "com.orellius.browser_bridge";
+const FIREFOX_ADDON_ID = "orellius@kivimedia.co";
 const platform = os.platform();
 
-// Get extension IDs from command line args
-const extensionIds = process.argv.slice(2);
+// Parse args. Chromium extension IDs (32-char alphanumeric) are passed
+// positionally for backward compatibility. Firefox is opt-in via --firefox.
+const rawArgs = process.argv.slice(2);
+const wantFirefox = rawArgs.includes("--firefox");
+const extensionIds = rawArgs.filter((a) => !a.startsWith("--"));
 
-if (extensionIds.length === 0) {
+if (extensionIds.length === 0 && !wantFirefox) {
   console.error(`
 ❌ Error: No extension IDs provided.
 
 Usage:
-  node install.js <extension-id> [<extension-id-2> ...]
+  node install.js <chromium-extension-id> [<id-2> ...]   # Chrome/Brave/Edge
+  node install.js --firefox                              # Firefox only
+  node install.js <chromium-id> --firefox                # Both
 
-How to get your extension ID:
+How to get your Chromium extension ID:
 1. Open chrome://extensions (or brave://extensions, edge://extensions)
 2. Enable "Developer mode" (top-right toggle)
 3. Click "Load unpacked" and select the extension/ folder
-4. Copy the ID shown on the extension card (e.g., "abcdefghijklmnopqrstuvwxyz123456")
-5. Run: node install.js <that-id>
+4. Copy the ID shown on the extension card
 
-For multiple browsers, pass all IDs:
-  node install.js <chrome-id> <brave-id> <edge-id>
+Firefox uses a fixed addon ID (orellius@kivimedia.co), so no ID is needed.
+The XPI must be installed first via about:debugging or AMO.
 `);
   process.exit(1);
 }
@@ -50,11 +55,11 @@ if (!fs.existsSync(nativeHostPath)) {
   process.exit(1);
 }
 
-// Build allowed_origins array
+// Build allowed_origins array (Chromium uses chrome-extension:// origins)
 const allowedOrigins = extensionIds.map((id) => `chrome-extension://${id}/`);
 
-// Native messaging host manifest
-const manifest = {
+// Chromium native messaging host manifest
+const chromiumManifest = {
   name: NATIVE_HOST_NAME,
   description: "Orellius Browser Bridge - Native messaging host for browser automation",
   path: nativeHostPath,
@@ -62,13 +67,25 @@ const manifest = {
   allowed_origins: allowedOrigins,
 };
 
+// Firefox uses a different schema: allowed_extensions (addon IDs), not origins
+const firefoxManifest = {
+  name: NATIVE_HOST_NAME,
+  description: "Orellius Browser Bridge - Native messaging host (Firefox)",
+  path: nativeHostPath,
+  type: "stdio",
+  allowed_extensions: [FIREFOX_ADDON_ID],
+};
+
 // Platform-specific installation
 if (platform === "win32") {
-  installWindows(manifest);
+  if (extensionIds.length > 0) installWindows(chromiumManifest);
+  if (wantFirefox) installWindowsFirefox(firefoxManifest);
 } else if (platform === "darwin") {
-  installMacOS(manifest);
+  if (extensionIds.length > 0) installMacOS(chromiumManifest);
+  if (wantFirefox) installMacOSFirefox(firefoxManifest);
 } else if (platform === "linux") {
-  installLinux(manifest);
+  if (extensionIds.length > 0) installLinux(chromiumManifest);
+  if (wantFirefox) installLinuxFirefox(firefoxManifest);
 } else {
   console.error(`❌ Unsupported platform: ${platform}`);
   process.exit(1);
@@ -186,4 +203,50 @@ function installWindows(manifest) {
 
   console.log(`\n💡 Tip: If installation failed, you may need to run as Administrator.`);
   console.log(`   Right-click Command Prompt → "Run as administrator" → retry`);
+}
+
+// ===== Firefox - macOS =====
+function installMacOSFirefox(manifest) {
+  const dir = path.join(os.homedir(), "Library/Application Support/Mozilla/NativeMessagingHosts");
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const manifestPath = path.join(dir, NATIVE_HOST_NAME + ".json");
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
+    console.log("Firefox: " + manifestPath);
+  } catch (err) {
+    console.warn("Firefox: Failed (" + err.message + ")");
+  }
+}
+
+// ===== Firefox - Linux =====
+function installLinuxFirefox(manifest) {
+  const dir = path.join(os.homedir(), ".mozilla/native-messaging-hosts");
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const manifestPath = path.join(dir, NATIVE_HOST_NAME + ".json");
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
+    console.log("Firefox: " + manifestPath);
+  } catch (err) {
+    console.warn("Firefox: Failed (" + err.message + ")");
+  }
+}
+
+// ===== Firefox - Windows =====
+function installWindowsFirefox(manifest) {
+  const regPath = "HKCU\\Software\\Mozilla\\NativeMessagingHosts\\" + NATIVE_HOST_NAME;
+  const manifestDir = path.join(os.homedir(), ".orellius-browser-bridge");
+  fs.mkdirSync(manifestDir, { recursive: true });
+  const manifestPath = path.join(manifestDir, NATIVE_HOST_NAME + "-firefox.json");
+  const winManifest = { ...manifest, path: manifest.path.replace(/\//g, "\\") };
+  fs.writeFileSync(manifestPath, JSON.stringify(winManifest, null, 2), "utf-8");
+  console.log("Firefox manifest written to: " + manifestPath);
+
+  // execFileSync with explicit arg array - no shell, no injection surface.
+  try {
+    execFileSync("reg", ["add", regPath, "/ve", "/t", "REG_SZ", "/d", manifestPath, "/f"], { stdio: "pipe" });
+    console.log("Firefox: Registry key created at " + regPath);
+  } catch (err) {
+    console.warn("Firefox: Failed to write registry (" + err.message + ")");
+    console.warn("   Manual fix: reg add \"" + regPath + "\" /ve /t REG_SZ /d \"" + manifestPath + "\" /f");
+  }
 }

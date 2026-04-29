@@ -17,12 +17,38 @@ import os from "node:os";
 import { z } from "zod";
 import { fileURLToPath } from "node:url";
 import * as sessionStore from "./session-store.js";
+import { getBidiDriver } from "./bidi-driver.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const DEFAULT_PORT = 18765;
 const SESSION_ID = crypto.randomUUID().slice(0, 8);
+
+// Browser routing: when set to "firefox", tools in BIDI_TOOLS are routed to
+// host/bidi-driver.js (WebDriver BiDi over WebSocket) instead of forwarded to
+// the extension. Default is "chromium" (existing behavior unchanged).
+//
+// Set via ORELLIUS_BROWSER env var, config file `browser` key, or the
+// switch_browser MCP tool at runtime. mcp-server.js carries one browser per
+// session, so each Claude Code session can be pinned to a different browser.
+const BIDI_TOOLS = new Set([
+  "computer",
+  "javascript_tool",
+  "read_console_messages",
+  "read_network_requests",
+  "resize_window",
+  "gif_creator",
+  "upload_image",
+]);
+
+let currentBrowser = (process.env.ORELLIUS_BROWSER || "chromium").toLowerCase();
+try {
+  const configPath = path.join(os.homedir(), ".config", "orellius-browser-bridge", "config.json");
+  const cfg = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  if (cfg.browser && !process.env.ORELLIUS_BROWSER) currentBrowser = String(cfg.browser).toLowerCase();
+} catch {}
+if (!["chromium", "firefox"].includes(currentBrowser)) currentBrowser = "chromium";
 
 function log(msg) {
   const ts = new Date().toISOString().slice(11, 19);
@@ -229,15 +255,24 @@ async function autoSaveSession(toolName) {
 
 async function callTool(toolName, args) {
   try {
-    const result = await sendToExtension(toolName, args);
-    
+    let result;
+    if (currentBrowser === "firefox" && BIDI_TOOLS.has(toolName)) {
+      // Route directly to host/bidi-driver.js — bypasses the extension. The
+      // extension still owns tabs/navigation/content-script tools, but
+      // CDP-equivalent work goes over BiDi WebSocket to Firefox :9222.
+      const driver = getBidiDriver();
+      result = await driver.dispatch(toolName, args);
+    } else {
+      result = await sendToExtension(toolName, args);
+    }
+
     // Auto-save after successful tool calls (except read-only tools)
     const writeTools = ["navigate", "computer", "form_input", "tabs_create_mcp", "javascript_tool"];
     if (writeTools.includes(toolName)) {
       // Fire and forget
       autoSaveSession(toolName).catch(() => {});
     }
-    
+
     // Result from extension can be a string, object with content array, or raw data
     if (typeof result === "string") return textResult(result);
     if (result && result.content) return result;
@@ -509,9 +544,36 @@ server.tool(
 // 16. switch_browser
 server.tool(
   "switch_browser",
-  "Switch which Chrome browser is used for browser automation. Call this when the user wants to connect to a different Chrome browser. Broadcasts a connection request to all Chrome browsers with the extension installed \u2014 the user clicks 'Connect' in the desired browser.",
-  {},
-  async (args) => callTool("switch_browser", args)
+  "Switch which browser this MCP session drives. Pass browser:'firefox' to route CDP-equivalent tools (computer, javascript_tool, read_console_messages, read_network_requests, resize_window) through host/bidi-driver.js (WebDriver BiDi WebSocket to Firefox :9222). Pass browser:'chromium' to forward all tools to the extension over native messaging (Chrome/Brave/Edge). Calling without `browser` reports the current setting.",
+  {
+    browser: z.enum(["chromium", "firefox"]).optional().describe("Target browser. Omit to query the current setting."),
+  },
+  async (args) => {
+    const next = args?.browser;
+    if (!next) {
+      return textResult(`Current browser: ${currentBrowser}. Pass browser:'firefox' or browser:'chromium' to switch.`);
+    }
+    const before = currentBrowser;
+    currentBrowser = next;
+    if (next === "firefox") {
+      // Verify the BiDi sidecar can reach Firefox before reporting success.
+      try {
+        await getBidiDriver().connect();
+        return textResult(
+          `Switched browser: ${before} -> firefox. ` +
+          `CDP-equivalent tools now route through WebDriver BiDi (Firefox :9222). ` +
+          `Tab/navigation tools still go to the extension via native messaging.`
+        );
+      } catch (e) {
+        currentBrowser = before; // roll back
+        return textResult(
+          `Failed to switch to firefox: ${e.message}. ` +
+          `Make sure Firefox is running with --remote-debugging-port=9222 and the Orellius Firefox extension is installed.`
+        );
+      }
+    }
+    return textResult(`Switched browser: ${before} -> chromium. All tools now forward to the extension.`);
+  }
 );
 
 // 17. update_plan

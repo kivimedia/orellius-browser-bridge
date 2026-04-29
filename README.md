@@ -14,15 +14,15 @@
 
 ---
 
-Orellius Browser Bridge gives [Claude Code](https://claude.ai/code) an MCP-powered bridge into your real, signed-in Chromium browser — with **no domain blocklist**. Claude can navigate, click, type, screenshot, and run JavaScript on any URL it wants: Reddit, Twitter/X, Facebook, Discord web, paywalled docs, SSO dashboards. All fair game.
+Orellius Browser Bridge gives [Claude Code](https://claude.ai/code) an MCP-powered bridge into your real, signed-in Chromium browser - with **no domain blocklist**. Claude can navigate, click, type, screenshot, and run JavaScript on any URL it wants: Reddit, Twitter/X, Facebook, Discord web, paywalled docs, SSO dashboards. All fair game.
 
-Works with **Chrome**, **Brave**, and **Edge** on **macOS**, **Linux**, and **Windows**.
+Works with **Chrome**, **Brave**, **Edge**, and (since v1.5.0) **Firefox** on **macOS**, **Linux**, and **Windows**. Firefox uses a WebDriver BiDi sidecar for trusted input - see [Firefox edition](#firefox-edition-v150) below.
 
 > **Fork notice.** This is a multi-session fork of the original [Orellius/orellius-browser-bridge](https://github.com/Orellius/orellius-browser-bridge) by Orellius. All credit for the original design, MCP tool surface, and extension architecture goes to the upstream author. This fork adds multi-session support (multiple Claude instances on different tabs/windows), per-session window claiming with self-heal for stale claims, cross-session tab locking (`browser_lock` / `browser_unlock` / `browser_lock_status`), private/public visibility modes (`browser_mode`), Windows native-messaging install, and session persistence/recovery. Licensed GPL-3.0, matching upstream.
 
-> **Disclaimer — not affiliated with Claude Code or Anthropic.** This is a fan-made, unofficial community project. It is not endorsed by or connected to Claude Code in any way. It exists to give Claude unrestricted access to any Chromium browser you load it into. Use at your own risk.
+> **Disclaimer - not affiliated with Claude Code or Anthropic.** This is a fan-made, unofficial community project. It is not endorsed by or connected to Claude Code in any way. It exists to give Claude unrestricted access to any Chromium browser you load it into. Use at your own risk.
 
-## TL;DR — quick start
+## TL;DR - quick start
 
 ```bash
 git clone https://github.com/Orellius/orellius-browser-bridge.git
@@ -49,10 +49,10 @@ Detailed walkthrough, configuration, and security notes are below.
 
 Most browser-automation MCP tools fall into one of two camps:
 
-1. **Headless Playwright/Puppeteer wrappers** — fresh Chromium every session. No logged-in state, no cookies, no extensions, no muscle memory. Fine for scraping, useless for any site that requires an account.
-2. **Sandboxed extensions with domain allowlists/blocklists** — safer, but they slam the door on exactly the sites you'd most want Claude to help with: social media, Reddit, internal dashboards, review queues, community forums.
+1. **Headless Playwright/Puppeteer wrappers** - fresh Chromium every session. No logged-in state, no cookies, no extensions, no muscle memory. Fine for scraping, useless for any site that requires an account.
+2. **Sandboxed extensions with domain allowlists/blocklists** - safer, but they slam the door on exactly the sites you'd most want Claude to help with: social media, Reddit, internal dashboards, review queues, community forums.
 
-Orellius Browser Bridge is a third option: a real extension loaded into your real browser, with no built-in domain restrictions whatsoever. You're trusting Claude with your live browser session — that's the entire point. Claude can genuinely *use the web the way you do*, including writing and submitting posts, comments, and DMs on any site.
+Orellius Browser Bridge is a third option: a real extension loaded into your real browser, with no built-in domain restrictions whatsoever. You're trusting Claude with your live browser session - that's the entire point. Claude can genuinely *use the web the way you do*, including writing and submitting posts, comments, and DMs on any site.
 
 Use it accordingly. Load the extension into a browser profile whose cookies and saved passwords you're comfortable handing Claude.
 
@@ -119,9 +119,9 @@ Two IPC hops are needed because Chrome's native messaging API requires Chrome it
 
 - **No domain blocklist.** There is no built-in denylist of "risky" domains. Every tool (`computer`, `form_input`, `javascript_tool`, `navigate`) works on any URL Chromium will load.
 - **Tab grouping.** Claude's tabs live in a dedicated `MCP` tab group (blue) so they're visually separated from your own browsing.
-- **Single active connection.** Only one browser profile can be connected at a time — the MCP server politely tells additional connections to back off, preventing profile-vs-profile races.
+- **Single active connection.** Only one browser profile can be connected at a time - the MCP server politely tells additional connections to back off, preventing profile-vs-profile races.
 - **Reconnect-aware.** If Chrome's service worker restarts mid-request, in-flight tool requests are re-sent on reconnection instead of failing.
-- **Stale-server cleanup.** The MCP server writes a PID file and SIGTERMs orphaned predecessors before binding the port — restart Claude Code as often as you like.
+- **Stale-server cleanup.** The MCP server writes a PID file and SIGTERMs orphaned predecessors before binding the port - restart Claude Code as often as you like.
 - **Local-only, no telemetry.** Everything runs over `localhost`. No outbound network from either the host process or the extension.
 
 ---
@@ -132,7 +132,7 @@ Two IPC hops are needed because Chrome's native messaging API requires Chrome it
 
 - **Node.js 18+** ([nodejs.org](https://nodejs.org/))
 - **Claude Code** ([install instructions](https://docs.claude.com/claude-code))
-- **A Chromium browser** — Chrome, Brave, or Edge (Chromium 116 or newer)
+- **A Chromium browser** - Chrome, Brave, or Edge (Chromium 116 or newer)
 - **Windows only:** Administrator access (for registry writes)
 
 ### 1. Clone the repo
@@ -153,7 +153,7 @@ cd host && npm install && cd ..
 1. Open `chrome://extensions` (or `brave://extensions`, `edge://extensions`).
 2. Enable **Developer mode** (top-right toggle).
 3. Click **Load unpacked** and select the `extension/` folder from this repo.
-4. The extension card now shows an **ID** like `abcdefghijklmnopabcdefghijklmnop` — copy it.
+4. The extension card now shows an **ID** like `abcdefghijklmnopabcdefghijklmnop` - copy it.
 
 > **Repeat for each browser** you want Claude to drive. Each Chromium browser assigns its own ID to the same unpacked extension, so Brave and Chrome will give you two different IDs even though it's the same source folder.
 
@@ -165,7 +165,7 @@ Pass every extension ID you collected to `install.js`:
 # One browser:
 node install.js <chrome-extension-id>
 
-# Multiple browsers — pass all IDs:
+# Multiple browsers - pass all IDs:
 node install.js <chrome-extension-id> <brave-extension-id> <edge-extension-id>
 ```
 
@@ -224,24 +224,24 @@ Both the MCP server and the native host read this file at startup, so they'll al
 
 ## Troubleshooting
 
-**"Browser extension is not connected"** — The extension can't reach the MCP server.
+**"Browser extension is not connected"** - The extension can't reach the MCP server.
 - Make sure a supported browser is running and the extension is enabled (`chrome://extensions`).
 - Restart the browser after running `install.sh`.
 - Verify the host manifest exists at the platform path printed by `install.sh`.
 - Check that the extension ID inside the manifest's `allowed_origins` matches the one currently shown on the extensions page (re-loading the unpacked extension can change the ID).
 
-**"Another browser profile is already connected"** — The MCP server only accepts one extension connection at a time. Disable the extension in your other profiles, or close those browser windows.
+**"Another browser profile is already connected"** - The MCP server only accepts one extension connection at a time. Disable the extension in your other profiles, or close those browser windows.
 
-**Tool calls hang and time out at 60s** — The page might be stuck on a modal, or `chrome.debugger` was detached by you clicking the yellow warning bar at the top of the tab. Re-run the tool; the extension reattaches automatically.
+**Tool calls hang and time out at 60s** - The page might be stuck on a modal, or `chrome.debugger` was detached by you clicking the yellow warning bar at the top of the tab. Re-run the tool; the extension reattaches automatically.
 
-**MCP server won't start: `EADDRINUSE`** — A previous instance is still bound to the port. The server should kill the orphan automatically; if not, find and kill it manually:
+**MCP server won't start: `EADDRINUSE`** - A previous instance is still bound to the port. The server should kill the orphan automatically; if not, find and kill it manually:
 ```bash
 lsof -ti :18765 | xargs kill
 ```
 
-**The extension ID changed after I reloaded it** — That happens with unpacked extensions if the install path changes. Re-run `install.sh` with the new ID.
+**The extension ID changed after I reloaded it** - That happens with unpacked extensions if the install path changes. Re-run `install.sh` with the new ID.
 
-**Leftover manifest from an older install** — If you previously ran a different Chromium-automation extension, there may be stale `*.json` files in your browser's `NativeMessagingHosts` folder. They won't break this install, but you can clean them up:
+**Leftover manifest from an older install** - If you previously ran a different Chromium-automation extension, there may be stale `*.json` files in your browser's `NativeMessagingHosts` folder. They won't break this install, but you can clean them up:
 
 ```bash
 # macOS
@@ -255,7 +255,7 @@ ls "$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/"
 ls "$HOME/.config/microsoft-edge/NativeMessagingHosts/"
 ```
 
-The only file this project writes is `com.orellius.browser_bridge.json`. Anything else is from something older — delete at your discretion.
+The only file this project writes is `com.orellius.browser_bridge.json`. Anything else is from something older - delete at your discretion.
 
 ---
 
@@ -280,17 +280,17 @@ orellius-browser-bridge/
 
 ---
 
-## Security notes — read this before installing
+## Security notes - read this before installing
 
 This is an **intentionally unsafe** tool by the standards of typical browser automation. You should understand exactly what you're opting into:
 
-- **The extension requests `<all_urls>` and the `debugger` permission.** That's the cost of unrestricted automation: Claude can read, screenshot, and interact with anything you can — including pages displaying your email, your Slack, your banking, your password manager's autofill.
+- **The extension requests `<all_urls>` and the `debugger` permission.** That's the cost of unrestricted automation: Claude can read, screenshot, and interact with anything you can - including pages displaying your email, your Slack, your banking, your password manager's autofill.
 - **There is no domain blocklist.** Claude can navigate to sites that can irreversibly act on your accounts (post, reply, DM, delete, transfer, approve). Use `update_plan` to have Claude declare its target domains before it acts, and review its plan before approving.
 - **Your cookies and logged-in sessions are the access model.** If Claude opens a tab in a browser profile where you're signed into Gmail, it can send mail as you.
 - **Don't run this inside your daily-driver browser profile** unless that's a conscious choice. Consider a dedicated Chromium profile with only the accounts you're actually OK automating.
 - **Local-only communication.** The MCP server binds to `127.0.0.1` only. No port is opened to your network, and there is no outbound telemetry.
 
-If any of that reads as "too risky for me" — that's a reasonable reaction, and you should use a sandboxed alternative instead.
+If any of that reads as "too risky for me" - that's a reasonable reaction, and you should use a sandboxed alternative instead.
 
 ---
 
@@ -301,6 +301,93 @@ If any of that reads as "too risky for me" — that's a reasonable reaction, and
 | macOS  | ✅ Supported | JSON manifest in `~/Library/Application Support/` |
 | Linux  | ✅ Supported | JSON manifest in `~/.config/` |
 | Windows | ✅ Supported | Registry keys in `HKCU\Software\...\NativeMessagingHosts` (requires Admin) |
+
+---
+
+## Firefox edition (v1.5.0)
+
+Firefox extensions cannot fire trusted input events (Bugzilla 637248), so the
+Firefox build uses a **hybrid architecture**: a thin WebExtension handles tabs,
+content scripts, native messaging, and `captureVisibleTab`; a host-side
+**WebDriver BiDi** sidecar (`host/bidi-driver.js`) handles trusted clicks/keys,
+full-page screenshots, console capture, and network capture by talking to
+Firefox's Remote Agent over WebSocket on `:9222`.
+
+### Setup (Firefox)
+
+```bash
+# 1. Build the XPI
+npm run build:firefox
+# -> dist/orellius-firefox-1.5.0.xpi
+
+# 2. Install the XPI in Firefox (development):
+#    about:debugging > "This Firefox" > "Load Temporary Add-on" > select the XPI
+# For permanent install: npm run sign:firefox  (requires AMO API credentials)
+
+# 3. Register the native messaging host for Firefox:
+node install.js --firefox
+
+# 4. Launch Firefox with the BiDi remote agent enabled:
+#    Windows:  scripts\launch-firefox.bat
+#    macOS/Linux: ./scripts/launch-firefox.sh
+# Or manually:
+#    firefox -P orellius --remote-debugging-port=9222
+
+# 5. In your Claude Code session, switch to Firefox routing:
+#    Tool: switch_browser  args: { browser: "firefox" }
+# Or set the env var before starting Claude Code:
+#    ORELLIUS_BROWSER=firefox claude code
+```
+
+### Routing
+
+| Tool                       | Where it runs in Firefox mode |
+|----------------------------|-------------------------------|
+| `tabs_context_mcp`         | Extension (native messaging)  |
+| `tabs_create_mcp`          | Extension                     |
+| `tabs_close_mcp`           | Extension                     |
+| `session_end`              | Extension                     |
+| `navigate`                 | Extension                     |
+| `find`                     | Extension (content script)    |
+| `form_input`               | Extension (content script)    |
+| `get_page_text`            | Extension (content script)    |
+| `read_page`                | Extension (content script)    |
+| `browser_lock` / `unlock` / `lock_status` | Extension      |
+| `browser_mode` / `show` / `hide`          | Extension      |
+| `update_plan`              | Extension                     |
+| `computer`                 | **BiDi sidecar** (`host/bidi-driver.js`) |
+| `javascript_tool`          | **BiDi sidecar**              |
+| `read_console_messages`    | **BiDi sidecar**              |
+| `read_network_requests`    | **BiDi sidecar**              |
+| `resize_window`            | **BiDi sidecar**              |
+| `gif_creator`              | (not yet implemented)         |
+| `upload_image`             | (not yet implemented)         |
+
+### Smoke test
+
+After Firefox is running with `--remote-debugging-port=9222` and at least one tab open:
+
+```bash
+npm run test:bidi
+# or: node host/test-bidi.js https://example.com
+```
+
+The script connects via BiDi, takes a screenshot (saved to `bidi-test-shot.png`),
+runs a JS evaluate, dispatches a trusted click at viewport center, and reports
+console + network buffer counts.
+
+### Known limitations (Firefox)
+
+1. **`navigator.webdriver === true` is visible to every page.** Anti-bot sites
+   (Cloudflare, FB, LinkedIn login flows) will detect Orellius. There is no
+   workaround on stock release Firefox (Bugzilla 1719505). Use the Chromium
+   build for those sites.
+2. **No `tabGroups`** - Firefox has no tab-grouping API. Per-session isolation
+   is via dedicated windows only (one window per Claude Code session).
+3. **First launch needs `--remote-debugging-port=9222`** - set up a launcher
+   alias or use `scripts/launch-firefox.{bat,sh}`.
+4. **Background event page** instead of MV3 service worker (Firefox MV3 doesn't
+   yet support workers, Bugzilla 1573659). Functionally equivalent.
 
 ---
 

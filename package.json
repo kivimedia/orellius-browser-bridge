@@ -1,0 +1,12 @@
+{
+  "name": "orellius-browser-bridge",
+  "version": "1.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Orellius Browser Bridge - root scripts for builds and signing.",
+  "scripts": {
+    "build:firefox": "node scripts/build-firefox.js",
+    "sign:firefox": "node scripts/build-firefox.js --sign",
+    "test:bidi": "node host/test-bidi.js"
+  }
+}
