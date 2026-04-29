@@ -52,12 +52,22 @@ async function main() {
   console.log(`    ✓ ${console1.length} console messages, ${network1.length} network requests`);
 
   console.log("\n=== ALL CHECKS PASSED ===");
-  process.exit(0);
 }
 
-main().catch((err) => {
+async function shutdown(driver) {
+  try { await driver.close(); } catch {}
+}
+
+main().then(async () => {
+  // Reach into the singleton to release the BiDi session before exit.
+  const { getBidiDriver } = await import("./bidi-driver.js");
+  await shutdown(getBidiDriver({ port: 9222 }));
+  process.exit(0);
+}).catch(async (err) => {
   console.error("\n=== TEST FAILED ===");
   console.error(err.message);
   console.error(err.stack);
+  const { getBidiDriver } = await import("./bidi-driver.js");
+  await shutdown(getBidiDriver({ port: 9222 }));
   process.exit(1);
 });

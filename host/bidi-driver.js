@@ -151,7 +151,12 @@ class BidiDriver {
       if (!p) return;
       this.pending.delete(msg.id);
       if (msg.type === "success") p.resolve(msg.result || {});
-      else p.reject(new Error(msg.error || msg.message || `BiDi error ${msg.id}`));
+      else {
+        const code = msg.error || `error_${msg.id}`;
+        const desc = msg.message || "(no message)";
+        const stack = msg.stacktrace ? `\n${msg.stacktrace}` : "";
+        p.reject(new Error(`BiDi: ${code}: ${desc}${stack}`));
+      }
       return;
     }
 
@@ -239,6 +244,19 @@ class BidiDriver {
     await this._send("session.subscribe", { events: fresh });
     for (const e of fresh) this.subscribed.add(e);
     log(`Subscribed to: ${fresh.join(", ")}`);
+  }
+
+  // Best-effort tear-down: Firefox enforces "1 active BiDi session per
+  // browser instance", and a closed WS does NOT reliably free the session
+  // (verified empirically on 143.0.4: a test process that exited cleanly
+  // still pinned the session, blocking the next session.new with
+  // "Maximum number of active sessions"). Always call this before exit.
+  async close() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try { await this._send("session.end", {}); }
+    catch (e) { log(`session.end failed (ignored): ${e.message}`); }
+    try { this.ws.close(); } catch {}
+    this.ws = null;
   }
 
   // --- Context resolution ---
