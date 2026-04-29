@@ -14,7 +14,6 @@
     "activeTab",
     "scripting",
     "nativeMessaging",
-    "windows",
     "storage",
     "alarms",
     "webRequest"
