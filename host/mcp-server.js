@@ -405,9 +405,60 @@ server.tool(
     scroll_amount: z.number().min(1).max(10).optional().describe("The number of scroll wheel ticks. Optional for `scroll`, defaults to 3."),
     start_coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The starting coordinates for `left_click_drag`."),
     text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all).'),
+    savePath: z.string().optional().describe('For `screenshot` and `zoom` actions: optional absolute path to write the captured JPEG to disk (e.g. "C:/Users/raviv/Downloads/grab.png"). When set, the screenshot is also saved as a file alongside the inline image so downstream tools (PIL, ffmpeg, annotate scripts) can consume it. The action still returns the inline image to the LLM as usual. Parent directory must exist; the file is overwritten if present. Ignored for non-capture actions.'),
   },
-  async (args) => callTool("computer", args)
+  async (args) => {
+    const result = await callTool("computer", args);
+    return persistCaptureToDisk(result, args);
+  }
 );
+
+/**
+ * If args.savePath is set on a screenshot/zoom action, find the inline-image
+ * content block returned by the extension, decode the base64, and write it
+ * to disk. Returns a copy of the result with an extra text block confirming
+ * the save (or describing why we couldn't save). Non-capture actions and
+ * results without an image block fall through unchanged.
+ *
+ * Why this lives on the host: the extension already buffers the bytes in
+ * `screenshotStore` keyed by imageId, but those bytes never escape to disk.
+ * Doing the write here means we can land the JPEG on whatever absolute path
+ * the calling agent specified - the extension is sandboxed and would have
+ * to go through chrome.downloads.download which can't write to arbitrary
+ * locations without a user prompt.
+ */
+function persistCaptureToDisk(result, args) {
+  if (!args || !args.savePath) return result;
+  if (args.action !== "screenshot" && args.action !== "zoom") return result;
+  if (!result || !Array.isArray(result.content)) return result;
+
+  const imageBlock = result.content.find((b) => b && b.type === "image" && typeof b.data === "string");
+  if (!imageBlock) return result;
+
+  try {
+    const buf = Buffer.from(imageBlock.data, "base64");
+    const dir = path.dirname(args.savePath);
+    if (!fs.existsSync(dir)) {
+      throw new Error(`Parent directory does not exist: ${dir}`);
+    }
+    fs.writeFileSync(args.savePath, buf);
+    return {
+      ...result,
+      content: [
+        ...result.content,
+        { type: "text", text: `Saved to disk: ${args.savePath} (${buf.length} bytes, ${imageBlock.mimeType || "image/jpeg"}).` },
+      ],
+    };
+  } catch (err) {
+    return {
+      ...result,
+      content: [
+        ...result.content,
+        { type: "text", text: `WARNING: savePath was set but write failed: ${err.message}. Inline image is still returned above.` },
+      ],
+    };
+  }
+}
 
 // 5. find
 server.tool(
