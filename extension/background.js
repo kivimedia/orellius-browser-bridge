@@ -1444,6 +1444,30 @@ const toolHandlers = {
     return { content: [{ type: "text", text: `Resized window to ${width}x${height}` }] };
   },
 
+  async download_screenshot(args) {
+    // Look up a previously-captured screenshot by imageId and return its
+    // base64 + mime so the host can write it to disk. Useful when an agent
+    // realizes after the fact that a screenshot is worth keeping (e.g.,
+    // building a guide / tutorial from the last several captures). No tab
+    // required — the screenshotStore is session-scoped to the extension,
+    // not to a tab.
+    const { imageId } = args || {};
+    if (!imageId) {
+      return { content: [{ type: "text", text: "imageId is required." }] };
+    }
+    const base64 = screenshotStore.get(imageId);
+    if (!base64) {
+      const known = Array.from(screenshotStore.keys());
+      return { content: [{ type: "text", text: `Screenshot ${imageId} not found in cache. Last 10 imageIds in store: ${known.length ? known.join(", ") : "(empty)"}.` }] };
+    }
+    return {
+      content: [
+        { type: "text", text: `Found screenshot ${imageId} (${base64.length} base64 chars).` },
+        { type: "image", data: base64, mimeType: "image/jpeg" },
+      ],
+    };
+  },
+
   async upload_image(args) {
     const { imageId, tabId, ref, coordinate, filename = "image.png" } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };

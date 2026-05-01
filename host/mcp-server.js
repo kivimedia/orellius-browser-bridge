@@ -460,6 +460,44 @@ function persistCaptureToDisk(result, args) {
   }
 }
 
+// 4b. download_screenshot
+server.tool(
+  "download_screenshot",
+  "Save a previously-captured screenshot to disk by its imageId. Useful for retroactively persisting screenshots that you didn't realize you'd want to keep at capture time - eg building tutorials/guides from the last several screenshots in the conversation, or when an agent decides after the fact that a specific frame is worth keeping. The extension keeps the last 10 screenshots in memory keyed by imageId; any of those is fetchable here. To capture and save in one step, prefer the computer tool's `savePath` argument.",
+  {
+    imageId: z.string().describe("The screenshot ID returned by a prior `computer action=screenshot` call (e.g., 'screenshot_1777664220919'). Look in the text content block above the inline image: 'Successfully captured screenshot (... jpeg) - ID: <imageId>'."),
+    savePath: z.string().describe('Absolute path to write the JPEG to (e.g. "C:/Users/raviv/Downloads/step-3.jpg"). Parent directory must exist; the file is overwritten if present.'),
+  },
+  async (args) => {
+    const result = await callTool("download_screenshot", args);
+    if (!args || !args.savePath) return result;
+    if (!result || !Array.isArray(result.content)) return result;
+    const imageBlock = result.content.find((b) => b && b.type === "image" && typeof b.data === "string");
+    if (!imageBlock) return result; // extension reported "not found" - propagate
+    try {
+      const buf = Buffer.from(imageBlock.data, "base64");
+      const dir = path.dirname(args.savePath);
+      if (!fs.existsSync(dir)) {
+        throw new Error(`Parent directory does not exist: ${dir}`);
+      }
+      fs.writeFileSync(args.savePath, buf);
+      // Strip the redundant inline image to keep the response compact - the
+      // caller wanted the file, not another copy in their LLM context.
+      return {
+        content: [
+          { type: "text", text: `Saved screenshot ${args.imageId} to ${args.savePath} (${buf.length} bytes, ${imageBlock.mimeType || "image/jpeg"}).` },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          { type: "text", text: `WARNING: write failed: ${err.message}. Screenshot was found in cache but not saved.` },
+        ],
+      };
+    }
+  }
+);
+
 // 5. find
 server.tool(
   "find",
