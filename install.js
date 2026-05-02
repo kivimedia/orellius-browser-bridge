@@ -55,6 +55,18 @@ if (!fs.existsSync(nativeHostPath)) {
   process.exit(1);
 }
 
+// On Windows, the OS can't directly execute a .js file from a native messaging
+// manifest — it consults the .js file association, which is usually an editor
+// (VS Code) and opens the file instead of running it. Point the manifest at a
+// .bat wrapper that explicitly invokes node. macOS/Linux execute the .js via
+// its shebang and +x bit, so they keep using the .js path directly.
+const nativeHostBatPath = path.resolve(__dirname, "host", "native-host.bat");
+if (platform === "win32" && !fs.existsSync(nativeHostBatPath)) {
+  console.error(`❌ Error: native-host.bat not found at ${nativeHostBatPath}`);
+  process.exit(1);
+}
+const manifestHostPath = platform === "win32" ? nativeHostBatPath : nativeHostPath;
+
 // Build allowed_origins array (Chromium uses chrome-extension:// origins)
 const allowedOrigins = extensionIds.map((id) => `chrome-extension://${id}/`);
 
@@ -62,7 +74,7 @@ const allowedOrigins = extensionIds.map((id) => `chrome-extension://${id}/`);
 const chromiumManifest = {
   name: NATIVE_HOST_NAME,
   description: "Orellius Browser Bridge - Native messaging host for browser automation",
-  path: nativeHostPath,
+  path: manifestHostPath,
   type: "stdio",
   allowed_origins: allowedOrigins,
 };
@@ -71,7 +83,7 @@ const chromiumManifest = {
 const firefoxManifest = {
   name: NATIVE_HOST_NAME,
   description: "Orellius Browser Bridge - Native messaging host (Firefox)",
-  path: nativeHostPath,
+  path: manifestHostPath,
   type: "stdio",
   allowed_extensions: [FIREFOX_ADDON_ID],
 };

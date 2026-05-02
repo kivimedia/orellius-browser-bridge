@@ -271,6 +271,7 @@ orellius-browser-bridge/
 ├── host/                 # Node.js host process
 │   ├── mcp-server.js     # MCP stdio server + TCP bridge
 │   ├── native-host.js    # Chrome native messaging ↔ TCP shim
+│   ├── native-host.bat   # Windows wrapper: invokes node so the OS doesn't open the .js in an editor
 │   ├── package.json
 │   └── package-lock.json
 ├── install.js            # Cross-platform installer (macOS/Linux/Windows)
