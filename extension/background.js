@@ -88,6 +88,10 @@ function connectNativeHost() {
         log(`Hub acknowledged: ${msg.role}`);
         return;
       }
+      if (typeof msg.type === "string" && msg.type.startsWith("vrec_") && msg.requestId) {
+        resolveVrecRequest(msg);
+        return;
+      }
       if (msg.type === "tool_request" && msg.id) {
         const sid = msg.sessionId || null;
         log(`Tool request: ${msg.tool} (id: ${msg.id}, session: ${sid || "legacy"})`);
@@ -714,6 +718,27 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     if (reqs.length > 1000) reqs.splice(0, reqs.length - 1000);
     networkRequests.set(tabId, reqs);
   }
+
+  if (method === "Page.screencastFrame" && params && params.data) {
+    const r = recordingState.get(tabId);
+    if (r && r.status === "recording") {
+      r.frames.push({
+        relTs: Date.now() - r.startedAt,
+        base64: params.data,
+      });
+      // Capture-resolution metadata: needed to map mouseLog (CSS px) onto
+      // composited frames since the screencast may downscale.
+      if (params.metadata) {
+        r.capturedW = params.metadata.deviceWidth || r.capturedW;
+        r.capturedH = params.metadata.deviceHeight || r.capturedH;
+      }
+    }
+    // Always ack so CDP keeps streaming, even if we've stopped buffering
+    // (e.g. recording was cleared but a final frame is in flight).
+    if (params.sessionId !== undefined) {
+      chrome.debugger.sendCommand({ tabId }, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+    }
+  }
 });
 
 // --- Key code mapping ---
@@ -871,6 +896,10 @@ async function dispatchMouse(tabId, type, x, y, opts = {}) {
     clickCount: opts.clickCount || 1,
     modifiers: opts.modifiers || 0,
   });
+  // Log to active recording so we can render a synthetic cursor + click
+  // ripple later. Only mousePressed produces a ripple; mouseMoved updates
+  // the cursor track; mouseReleased just lets us close drag paths in V2.
+  logMouseEvent(tabId, { type, x, y, button: opts.button || "left", clickCount: opts.clickCount || 1 });
 }
 
 async function mouseClick(tabId, x, y, opts = {}) {
@@ -949,6 +978,363 @@ async function mouseClick(tabId, x, y, opts = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Video recording (Playwright-style)
+// ---------------------------------------------------------------------------
+// One recording per tab. Each recording owns a frame buffer (raw screencast
+// JPEGs from CDP) and a mouse-event log captured from dispatchMouse. On
+// export, frames are composited with a synthetic cursor + click ripples in
+// an OffscreenCanvas, then streamed to the native host which pipes them
+// into ffmpeg via the concat demuxer (per-frame durations preserved).
+//
+// CDP's Input.dispatchMouseEvent is page-synthetic: it never moves the OS
+// pointer, so a normal screen recorder would see no cursor. We have to draw
+// one ourselves from the same x/y values we're already dispatching.
+const recordingState = new Map(); // tabId -> recording
+
+function activeRecordingFor(tabId) {
+  const r = recordingState.get(tabId);
+  return r && r.status === "recording" ? r : null;
+}
+
+function logMouseEvent(tabId, ev) {
+  const r = activeRecordingFor(tabId);
+  if (!r) return;
+  r.mouseLog.push({ ...ev, t: Date.now() - r.startedAt });
+}
+
+async function vrecStartRecording(tabId, opts = {}) {
+  if (recordingState.has(tabId)) {
+    throw new Error(`Tab ${tabId} already has a recording (status=${recordingState.get(tabId).status})`);
+  }
+  await ensureAttached(tabId);
+  await ensureDomain(tabId, "Page");
+
+  // CDP screencast: jpeg/quality 80 is a good balance, downscaled to 1280x720
+  // by default to keep frames under ~150KB (well under the 1MB native-msg cap).
+  const maxWidth = opts.maxWidth || 1280;
+  const maxHeight = opts.maxHeight || 720;
+  const quality = opts.captureQuality || 80;
+  const everyNthFrame = opts.everyNthFrame || 2; // ~15fps from a 30fps page
+
+  await cdp(tabId, "Page.startScreencast", {
+    format: "jpeg",
+    quality,
+    maxWidth,
+    maxHeight,
+    everyNthFrame,
+  });
+
+  recordingState.set(tabId, {
+    status: "recording",
+    startedAt: Date.now(),
+    frames: [],
+    mouseLog: [],
+    keyLog: [],
+    captureQuality: quality,
+    maxWidth,
+    maxHeight,
+    everyNthFrame,
+  });
+  log(`vrec start tab=${tabId} quality=${quality} max=${maxWidth}x${maxHeight}`);
+}
+
+async function vrecStopRecording(tabId) {
+  const r = recordingState.get(tabId);
+  if (!r) throw new Error(`No recording for tab ${tabId}`);
+  if (r.status === "recording") {
+    try { await cdp(tabId, "Page.stopScreencast", {}); } catch (e) { log(`stopScreencast warn: ${e.message}`); }
+    r.status = "stopped";
+    r.stoppedAt = Date.now();
+  }
+  return {
+    frameCount: r.frames.length,
+    mouseEvents: r.mouseLog.length,
+    durationMs: (r.stoppedAt || Date.now()) - r.startedAt,
+  };
+}
+
+function vrecClear(tabId) {
+  const r = recordingState.get(tabId);
+  if (!r) return false;
+  if (r.status === "recording") {
+    cdp(tabId, "Page.stopScreencast", {}).catch(() => {});
+  }
+  recordingState.delete(tabId);
+  return true;
+}
+
+// --- Native-host request/response correlation for vrec_* messages ---
+const pendingVrecRequests = new Map(); // requestId -> {resolve, reject, timer}
+let vrecRequestCounter = 0;
+
+function nextVrecRequestId() {
+  vrecRequestCounter = (vrecRequestCounter + 1) >>> 0;
+  return `vrec-${Date.now().toString(36)}-${vrecRequestCounter}`;
+}
+
+function sendVrecToHost(payload, { timeoutMs = 30000 } = {}) {
+  if (!nativePort) return Promise.reject(new Error("Native port not connected"));
+  const requestId = nextVrecRequestId();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingVrecRequests.delete(requestId);
+      reject(new Error(`vrec timeout (${payload.type}, ${timeoutMs}ms)`));
+    }, timeoutMs);
+    pendingVrecRequests.set(requestId, { resolve, reject, timer });
+    try {
+      nativePort.postMessage({ ...payload, requestId });
+    } catch (e) {
+      clearTimeout(timer);
+      pendingVrecRequests.delete(requestId);
+      reject(e);
+    }
+  });
+}
+
+function resolveVrecRequest(msg) {
+  const pending = pendingVrecRequests.get(msg.requestId);
+  if (!pending) return;
+  pendingVrecRequests.delete(msg.requestId);
+  clearTimeout(pending.timer);
+  if (msg.type === "vrec_error") {
+    pending.reject(new Error(msg.error || "vrec_error from native host"));
+  } else {
+    pending.resolve(msg);
+  }
+}
+
+// --- Compositing ---
+
+async function blobToBase64(blob) {
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let str = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    str += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(str);
+}
+
+function base64ToBlob(b64, mime) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+// Returns the most-recent (x,y) at relative timestamp t.
+function cursorAt(mouseLog, t) {
+  let last = null;
+  for (let i = 0; i < mouseLog.length; i++) {
+    if (mouseLog[i].t > t) break;
+    last = mouseLog[i];
+  }
+  return last;
+}
+
+// Returns active click ripples (presses within last 500ms of t, plus any
+// drag in progress).
+function clicksWindow(mouseLog, t, windowMs = 500) {
+  const out = [];
+  for (let i = 0; i < mouseLog.length; i++) {
+    const ev = mouseLog[i];
+    if (ev.t > t) break;
+    if (ev.type === "mousePressed" && t - ev.t <= windowMs) {
+      out.push({ ev, age: (t - ev.t) / windowMs }); // age 0..1
+    }
+  }
+  return out;
+}
+
+function drawCursor(ctx, x, y, scale) {
+  // Stylized arrow cursor: triangle outline + filled. Drawn with a soft
+  // shadow so the cursor is readable on light AND dark backgrounds. Sized
+  // to roughly match a real OS cursor at 1280px-wide capture.
+  ctx.save();
+  ctx.translate(x, y);
+  const s = scale || 1;
+  ctx.shadowColor = "rgba(0,0,0,0.55)";
+  ctx.shadowBlur = 4 * s;
+  ctx.shadowOffsetX = 1 * s;
+  ctx.shadowOffsetY = 1 * s;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, 18 * s);
+  ctx.lineTo(5 * s, 14 * s);
+  ctx.lineTo(8 * s, 21 * s);
+  ctx.lineTo(11 * s, 20 * s);
+  ctx.lineTo(8 * s, 13 * s);
+  ctx.lineTo(14 * s, 13 * s);
+  ctx.closePath();
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.lineWidth = 1.5 * s;
+  ctx.strokeStyle = "#111111";
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawClickRipple(ctx, x, y, age, color) {
+  // age is 0 (just clicked) -> 1 (fade-out done). Two concentric rings:
+  // expanding outline ring + fading fill.
+  ctx.save();
+  const radius = 6 + 22 * age;
+  const alpha = Math.max(0, 1 - age);
+  ctx.globalAlpha = alpha * 0.85;
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = color || "#ff7a18";
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.globalAlpha = (1 - age) * 0.25;
+  ctx.fillStyle = color || "#ff7a18";
+  ctx.beginPath();
+  ctx.arc(x, y, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawProgressBar(ctx, w, h, frac, color) {
+  ctx.save();
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = "rgba(0,0,0,0.35)";
+  ctx.fillRect(0, h - 4, w, 4);
+  ctx.fillStyle = color || "#ff7a18";
+  ctx.fillRect(0, h - 4, Math.max(0, Math.min(1, frac)) * w, 4);
+  ctx.restore();
+}
+
+async function compositeFrame({
+  frameBase64,
+  capturedW,
+  capturedH,
+  outW,
+  outH,
+  cursor,
+  clicks,
+  showProgressBar,
+  progressFrac,
+  showWatermark,
+}) {
+  const blob = base64ToBlob(frameBase64, "image/jpeg");
+  const bitmap = await createImageBitmap(blob);
+  const canvas = new OffscreenCanvas(outW, outH);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(bitmap, 0, 0, outW, outH);
+  bitmap.close?.();
+
+  // CDP coords are in CSS px of the page. We capture at the page's CSS
+  // viewport, but the screencast scales to maxWidth/maxHeight. Map CSS px
+  // (which is what mouseLog uses) to capture px.
+  const sx = outW / capturedW;
+  const sy = outH / capturedH;
+
+  for (const c of clicks || []) {
+    const color = c.ev.button === "right" ? "#3b82f6" : c.ev.button === "middle" ? "#10b981" : "#ff7a18";
+    drawClickRipple(ctx, c.ev.x * sx, c.ev.y * sy, c.age, color);
+  }
+  if (cursor) {
+    drawCursor(ctx, cursor.x * sx, cursor.y * sy, 1.4);
+  }
+  if (showProgressBar) {
+    drawProgressBar(ctx, outW, outH, progressFrac, "#ff7a18");
+  }
+  if (showWatermark) {
+    ctx.save();
+    ctx.font = "12px system-ui, -apple-system, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.shadowColor = "rgba(0,0,0,0.55)";
+    ctx.shadowBlur = 3;
+    ctx.fillText("Orellius", 8, outH - 10);
+    ctx.restore();
+  }
+
+  const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.9 });
+  return await blobToBase64(outBlob);
+}
+
+async function vrecExportRecording(tabId, opts = {}) {
+  const r = recordingState.get(tabId);
+  if (!r) throw new Error(`No recording for tab ${tabId}`);
+  if (r.status === "recording") await vrecStopRecording(tabId);
+  if (r.frames.length === 0) throw new Error("No frames captured (start_recording -> wait for activity -> stop_recording)");
+
+  const format = opts.format || "webm";
+  const filename = opts.filename || `orellius-${Date.now()}.${format}`;
+  const savePath = opts.savePath || ("~/Downloads/" + filename);
+  const recordingId = `rec-${tabId}-${Date.now()}`;
+
+  const showClickIndicators = opts.showClickIndicators !== false;
+  const showProgressBar = opts.showProgressBar !== false;
+  const showWatermark = opts.showWatermark !== false;
+  // First frame defines output dimensions
+  const firstBlob = base64ToBlob(r.frames[0].base64, "image/jpeg");
+  const firstBitmap = await createImageBitmap(firstBlob);
+  const outW = firstBitmap.width;
+  const outH = firstBitmap.height;
+  firstBitmap.close?.();
+
+  const fps = Math.round(1000 / (r.everyNthFrame * 33)) || 15;
+
+  await sendVrecToHost({
+    type: "vrec_begin",
+    recordingId,
+    fps,
+    savePath,
+    format,
+  }, { timeoutMs: 10000 });
+
+  const totalDurMs = r.frames[r.frames.length - 1].relTs - r.frames[0].relTs || 1;
+  const t0 = r.frames[0].relTs;
+
+  for (let i = 0; i < r.frames.length; i++) {
+    const fr = r.frames[i];
+    const cursor = showClickIndicators ? cursorAt(r.mouseLog, fr.relTs) : null;
+    const clicks = showClickIndicators ? clicksWindow(r.mouseLog, fr.relTs) : [];
+    const progressFrac = (fr.relTs - t0) / totalDurMs;
+
+    const composited = await compositeFrame({
+      frameBase64: fr.base64,
+      capturedW: r.capturedW || outW,
+      capturedH: r.capturedH || outH,
+      outW,
+      outH,
+      cursor,
+      clicks,
+      showProgressBar,
+      progressFrac,
+      showWatermark,
+    });
+
+    await sendVrecToHost({
+      type: "vrec_frame",
+      recordingId,
+      base64: composited,
+      relTs: fr.relTs,
+    }, { timeoutMs: 15000 });
+  }
+
+  const result = await sendVrecToHost({
+    type: "vrec_end",
+    recordingId,
+  }, { timeoutMs: 60000 });
+
+  recordingState.delete(tabId);
+  return {
+    savePath: result.savePath,
+    fileSize: result.fileSize,
+    frameCount: result.frameCount,
+    durationSec: result.durationSec,
+    format,
+    fps,
+    width: outW,
+    height: outH,
+  };
 }
 
 // --- Tool handlers ---
@@ -1511,7 +1897,75 @@ const toolHandlers = {
   },
 
   async gif_creator(args) {
-    return { content: [{ type: "text", text: "GIF recording is not yet implemented in this extension." }] };
+    const { action, tabId, filename, savePath, format, options = {} } = args;
+    if (typeof tabId !== "number") {
+      return { content: [{ type: "text", text: "tabId is required" }] };
+    }
+    if (!(await isInGroup(tabId))) {
+      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    }
+
+    try {
+      switch (action) {
+        case "start_recording": {
+          await vrecStartRecording(tabId, options || {});
+          return {
+            content: [{
+              type: "text",
+              text: `Recording started on tab ${tabId}. Capture: ${options.maxWidth || 1280}x${options.maxHeight || 720} jpeg, ~${Math.round(30 / (options.everyNthFrame || 2))}fps. Call gif_creator(action='stop_recording') when done.`,
+            }],
+          };
+        }
+
+        case "stop_recording": {
+          const info = await vrecStopRecording(tabId);
+          return {
+            content: [{
+              type: "text",
+              text: `Recording stopped: ${info.frameCount} frames, ${info.mouseEvents} mouse events, ${(info.durationMs / 1000).toFixed(1)}s. Call gif_creator(action='export') to encode.`,
+            }],
+          };
+        }
+
+        case "export": {
+          // Default to webm (Playwright parity) but accept gif/mp4. The
+          // legacy schema only had 'download:true' for in-browser GIF
+          // download; the new pipeline writes to disk via the native host
+          // because (a) the encoder lives there and (b) Claude's tool
+          // result wants an actionable filesystem path, not a chrome://
+          // download URL.
+          const fmt = (format || "webm").toLowerCase();
+          const opts = {
+            format: fmt,
+            filename: filename || `orellius-${Date.now()}.${fmt}`,
+            savePath,
+            ...options,
+          };
+          const result = await vrecExportRecording(tabId, opts);
+          return {
+            content: [{
+              type: "text",
+              text: `Exported ${result.frameCount} frames to ${result.savePath} (${(result.fileSize / 1024).toFixed(1)} KiB, ${result.durationSec ? result.durationSec.toFixed(1) + "s" : "?"}, ${result.width}x${result.height} ${fmt})`,
+            }],
+          };
+        }
+
+        case "clear": {
+          const had = vrecClear(tabId);
+          return {
+            content: [{
+              type: "text",
+              text: had ? `Cleared recording for tab ${tabId}` : `No recording to clear for tab ${tabId}`,
+            }],
+          };
+        }
+
+        default:
+          return { content: [{ type: "text", text: `Unknown action: ${action}. Valid: start_recording, stop_recording, export, clear.` }] };
+      }
+    } catch (err) {
+      return { content: [{ type: "text", text: `gif_creator(${action}) failed: ${err.message}` }] };
+    }
   },
 
   async shortcuts_list(args) {

@@ -1,6 +1,6 @@
 {
   "name": "orellius-browser-bridge",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "private": true,
   "type": "module",
   "description": "Orellius Browser Bridge - root scripts for builds and signing.",

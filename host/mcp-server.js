@@ -531,23 +531,25 @@ server.tool(
   async (args) => callTool("get_page_text", args)
 );
 
-// 8. gif_creator
+// 8. gif_creator (Playwright-style video recording)
 server.tool(
   "gif_creator",
-  "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, either provide 'coordinate' to drag/drop upload to a page element, or set 'download: true' to download the GIF.",
+  "Record a browser session as video with synthetic cursor + click overlays composited onto each frame. Equivalent to Playwright's recordVideo. Workflow: 1) start_recording (begins CDP screencast + mouse-event log on the tab), 2) drive the page via other tools (click, type, navigate, etc.), 3) stop_recording (halts capture but keeps frames), 4) export (writes the encoded video to disk via the native host's ffmpeg). All operations are scoped to a tab. Default output is WebM (small, broadly compatible); MP4 and GIF are also supported. Frames are captured at ~15fps by default and downscaled to fit 1280x720; tweak via options. The cursor and click ripples are SYNTHETIC (drawn from the same x/y values dispatched via Input.dispatchMouseEvent) because CDP-trusted clicks never move the OS pointer.",
   {
-    action: z.enum(["start_recording", "stop_recording", "export", "clear"]).describe("Action to perform: 'start_recording' (begin capturing), 'stop_recording' (stop capturing but keep frames), 'export' (generate and export GIF), 'clear' (discard frames)"),
-    tabId: z.number().describe("Tab ID to identify which tab group this operation applies to"),
-    download: z.boolean().optional().describe("Always set this to true for the 'export' action only. This causes the gif to be downloaded in the browser."),
-    filename: z.string().optional().describe("Optional filename for exported GIF (default: 'recording-[timestamp].gif'). For 'export' action only."),
+    action: z.enum(["start_recording", "stop_recording", "export", "clear"]).describe("Action to perform. start_recording: begin CDP Page.startScreencast on the tab and start logging mouse events. stop_recording: halt screencast but keep frames in memory. export: composite + ffmpeg-encode + write to disk; returns savePath. clear: discard frames (also stops if still recording)."),
+    tabId: z.number().describe("Tab ID. Must be a tab in the current MCP group. Use tabs_context_mcp first if unknown."),
+    format: z.enum(["webm", "mp4", "gif"]).optional().describe("Output container/codec for action='export'. Default 'webm' (libvpx-vp9, matches Playwright). 'mp4' uses libx264 (broadest compatibility). 'gif' uses ffmpeg's gif encoder (largest files, no audio, but universal preview)."),
+    savePath: z.string().optional().describe("Absolute disk path for the output file (action='export'). If omitted, defaults to ~/Downloads/orellius-<timestamp>.<format>. Parent directories are created automatically."),
+    filename: z.string().optional().describe("Convenience: just a filename when you don't care about the directory (saved under ~/Downloads). Ignored if savePath is set."),
     options: z.object({
-      showClickIndicators: z.boolean().optional().describe("Show orange circles at click locations (default: true)"),
-      showDragPaths: z.boolean().optional().describe("Show red arrows for drag actions (default: true)"),
-      showActionLabels: z.boolean().optional().describe("Show black labels describing actions (default: true)"),
-      showProgressBar: z.boolean().optional().describe("Show orange progress bar at bottom (default: true)"),
-      showWatermark: z.boolean().optional().describe("Show Claude logo watermark (default: true)"),
-      quality: z.number().optional().describe("GIF compression quality, 1-30 (lower = better quality, slower encoding). Default: 10"),
-    }).optional().describe("Optional GIF enhancement options for 'export' action. Properties: showClickIndicators (bool), showDragPaths (bool), showActionLabels (bool), showProgressBar (bool), showWatermark (bool), quality (number 1-30). All default to true except quality (default: 10)."),
+      showClickIndicators: z.boolean().optional().describe("Draw a synthetic cursor at the most-recent dispatched (x,y) and a ripple ring on each mousePressed event for ~500ms (default: true)."),
+      showProgressBar: z.boolean().optional().describe("Thin progress bar at the bottom of every frame (default: true)."),
+      showWatermark: z.boolean().optional().describe("Small 'Orellius' watermark in the lower-left corner (default: true)."),
+      maxWidth: z.number().optional().describe("Max capture width in CSS pixels (default 1280). The tab's CSS viewport is downscaled to fit."),
+      maxHeight: z.number().optional().describe("Max capture height in CSS pixels (default 720)."),
+      everyNthFrame: z.number().optional().describe("CDP screencast everyNthFrame (default 2 = ~15fps from a 30fps page; pass 1 for ~30fps; higher for lower fps + smaller files)."),
+      captureQuality: z.number().optional().describe("CDP screencast JPEG quality, 1-100 (default 80). Affects per-frame size, not codec quality."),
+    }).optional().describe("Capture/render options for start_recording (maxWidth/maxHeight/everyNthFrame/captureQuality) and export (showClickIndicators/showProgressBar/showWatermark). All have sensible defaults."),
   },
   async (args) => callTool("gif_creator", args)
 );

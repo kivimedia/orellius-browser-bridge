@@ -9,6 +9,7 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { spawn } from "node:child_process";
 
 const DEFAULT_PORT = 18765;
 
@@ -181,6 +182,22 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
 
+    // Video-recording control plane: extension <-> host only, never
+    // forwarded to the MCP server. Each message has a `requestId` the
+    // extension uses to correlate replies.
+    if (typeof msg.type === "string" && msg.type.startsWith("vrec_")) {
+      handleVrecMessage(msg).catch((err) => {
+        log(`vrec error: ${err.message}`);
+        writeNativeMessage({
+          type: "vrec_error",
+          requestId: msg.requestId,
+          recordingId: msg.recordingId,
+          error: String(err && err.message ? err.message : err),
+        });
+      });
+      continue;
+    }
+
     // Buffer if we have not yet registered (extension may send tool
     // responses before init in some races) so the hub doesn't see a
     // stranded message before our register_native_host.
@@ -195,6 +212,218 @@ process.stdin.on("data", (chunk) => {
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// Video recording (vrec_*): out-of-band control plane between the extension
+// and this native host. The extension streams composited JPEG frames to disk
+// (tempDir/frame_NNNNN.jpg + concat manifest) so we can hand the result to
+// ffmpeg's concat demuxer with per-frame durations - matches Playwright's
+// variable-frame-rate output and is robust to idle pages where screencast
+// frames are sparse.
+// ---------------------------------------------------------------------------
+
+const recordings = new Map(); // recordingId -> { tempDir, manifestPath, manifestFd, frameIndex, savePath, format, fps, startedAt }
+
+function vrecTempRoot() {
+  return path.join(os.tmpdir(), "orellius-vrec");
+}
+
+function findFfmpeg() {
+  // Trust PATH first (works on all 3 OSes when ffmpeg is installed
+  // normally). Fall back to a small list of common Windows install paths
+  // because Chrome's native-messaging child env is the user env at launch
+  // time, but WinGet-shimmed ffmpeg sometimes lives outside that PATH.
+  const candidates = [
+    "ffmpeg",
+    process.env.FFMPEG_PATH,
+    path.join(os.homedir(), "AppData", "Local", "Microsoft", "WinGet", "Links", "ffmpeg.exe"),
+    "C:/Program Files/ffmpeg/bin/ffmpeg.exe",
+    "C:/ffmpeg/bin/ffmpeg.exe",
+    "/usr/local/bin/ffmpeg",
+    "/opt/homebrew/bin/ffmpeg",
+  ].filter(Boolean);
+  return candidates;
+}
+
+async function handleVrecMessage(msg) {
+  switch (msg.type) {
+    case "vrec_begin": return vrecBegin(msg);
+    case "vrec_frame": return vrecFrame(msg);
+    case "vrec_end":   return vrecEnd(msg);
+    case "vrec_abort": return vrecAbort(msg);
+    default:
+      throw new Error(`Unknown vrec message: ${msg.type}`);
+  }
+}
+
+async function vrecBegin(msg) {
+  const { requestId, recordingId, fps, savePath, format } = msg;
+  if (!recordingId) throw new Error("vrec_begin: recordingId required");
+  if (recordings.has(recordingId)) throw new Error(`recordingId ${recordingId} already active`);
+
+  const root = vrecTempRoot();
+  await fs.promises.mkdir(root, { recursive: true });
+  const tempDir = await fs.promises.mkdtemp(path.join(root, `${recordingId}-`));
+  const manifestPath = path.join(tempDir, "manifest.txt");
+  const manifestFd = await fs.promises.open(manifestPath, "w");
+  // ffconcat v1.0 header allows variable per-entry duration
+  await manifestFd.write("ffconcat version 1.0\n");
+
+  recordings.set(recordingId, {
+    tempDir,
+    manifestPath,
+    manifestFd,
+    frameIndex: 0,
+    lastFrameRelTs: null,
+    savePath: savePath || path.join(os.homedir(), "Downloads", `orellius-${Date.now()}.webm`),
+    format: format || "webm",
+    fps: fps || 15,
+    startedAt: Date.now(),
+  });
+
+  log(`vrec_begin ${recordingId} -> ${tempDir} (savePath=${savePath})`);
+  writeNativeMessage({ type: "vrec_begin_ok", requestId, recordingId, tempDir });
+}
+
+async function vrecFrame(msg) {
+  const { requestId, recordingId, base64, relTs } = msg;
+  const rec = recordings.get(recordingId);
+  if (!rec) throw new Error(`vrec_frame: unknown recordingId ${recordingId}`);
+  if (!base64) throw new Error("vrec_frame: base64 required");
+
+  const idx = rec.frameIndex++;
+  const fname = `frame_${String(idx).padStart(6, "0")}.jpg`;
+  const fpath = path.join(rec.tempDir, fname);
+  const buf = Buffer.from(base64, "base64");
+  await fs.promises.writeFile(fpath, buf);
+
+  // Variable-frame-rate manifest: each entry's duration is the gap to the
+  // next frame. We only know the gap once the next frame arrives, so we
+  // patch the previous entry's duration on each new frame, and finalize
+  // the last entry's duration on vrec_end.
+  if (rec.lastFrameRelTs != null) {
+    const dur = Math.max(0.01, (relTs - rec.lastFrameRelTs) / 1000);
+    await rec.manifestFd.write(`duration ${dur.toFixed(4)}\n`);
+  }
+  await rec.manifestFd.write(`file '${fname.replace(/'/g, "'\\''")}'\n`);
+  rec.lastFrameRelTs = relTs;
+
+  writeNativeMessage({ type: "vrec_frame_ok", requestId, recordingId, frameIndex: idx });
+}
+
+async function vrecEnd(msg) {
+  const { requestId, recordingId } = msg;
+  const rec = recordings.get(recordingId);
+  if (!rec) throw new Error(`vrec_end: unknown recordingId ${recordingId}`);
+
+  // Finalize manifest: give the last frame a final 1/fps duration, then
+  // re-state the last filename (concat demuxer requires duration to be
+  // followed by a file entry to take effect).
+  const tailDur = (1 / Math.max(1, rec.fps)).toFixed(4);
+  const lastFname = `frame_${String(rec.frameIndex - 1).padStart(6, "0")}.jpg`;
+  await rec.manifestFd.write(`duration ${tailDur}\n`);
+  await rec.manifestFd.write(`file '${lastFname}'\n`);
+  await rec.manifestFd.close();
+
+  if (rec.frameIndex === 0) {
+    recordings.delete(recordingId);
+    cleanupTempDir(rec.tempDir);
+    throw new Error("No frames captured");
+  }
+
+  await fs.promises.mkdir(path.dirname(rec.savePath), { recursive: true });
+
+  const args = buildFfmpegArgs(rec);
+  const ffPath = await runFfmpegAttempt(args, rec);
+
+  // Verify output exists and has bytes
+  const stat = await fs.promises.stat(rec.savePath);
+  if (stat.size === 0) throw new Error("ffmpeg produced empty file");
+
+  recordings.delete(recordingId);
+  cleanupTempDir(rec.tempDir);
+
+  log(`vrec_end ${recordingId}: ${rec.frameIndex} frames -> ${rec.savePath} (${stat.size}b) via ${ffPath}`);
+  writeNativeMessage({
+    type: "vrec_end_ok",
+    requestId,
+    recordingId,
+    savePath: rec.savePath,
+    fileSize: stat.size,
+    frameCount: rec.frameIndex,
+    durationSec: rec.lastFrameRelTs != null ? rec.lastFrameRelTs / 1000 : null,
+    ffmpegPath: ffPath,
+  });
+}
+
+async function vrecAbort(msg) {
+  const { requestId, recordingId } = msg;
+  const rec = recordings.get(recordingId);
+  if (!rec) {
+    writeNativeMessage({ type: "vrec_abort_ok", requestId, recordingId });
+    return;
+  }
+  try { await rec.manifestFd.close(); } catch {}
+  cleanupTempDir(rec.tempDir);
+  recordings.delete(recordingId);
+  writeNativeMessage({ type: "vrec_abort_ok", requestId, recordingId });
+}
+
+function buildFfmpegArgs(rec) {
+  const isWebm = rec.format === "webm";
+  const isMp4 = rec.format === "mp4";
+  const codec = isWebm
+    ? ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1"]
+    : isMp4
+      ? ["-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-movflags", "+faststart"]
+      : ["-c:v", "gif"]; // gif fallback (rec.format === 'gif')
+
+  return [
+    "-y",
+    "-f", "concat",
+    "-safe", "0",
+    "-i", rec.manifestPath,
+    "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+    ...codec,
+    "-pix_fmt", "yuv420p",
+    rec.savePath,
+  ];
+}
+
+function runFfmpegAttempt(args, rec) {
+  const candidates = findFfmpeg();
+  return new Promise(async (resolve, reject) => {
+    let lastErr = null;
+    for (const ff of candidates) {
+      try {
+        await new Promise((res, rej) => {
+          const proc = spawn(ff, args, { stdio: ["ignore", "pipe", "pipe"] });
+          let stderr = "";
+          proc.stderr.on("data", (d) => { stderr += d.toString(); });
+          proc.on("error", (err) => rej(err));
+          proc.on("close", (code) => {
+            if (code === 0) res();
+            else rej(new Error(`ffmpeg exit ${code}: ${stderr.slice(-500)}`));
+          });
+        });
+        resolve(ff);
+        return;
+      } catch (err) {
+        lastErr = err;
+        // ENOENT means this candidate doesn't exist; try the next.
+        if (err.code !== "ENOENT") {
+          // Real ffmpeg error (bad args, missing codec, etc.) - don't keep trying random binaries
+          return reject(err);
+        }
+      }
+    }
+    reject(lastErr || new Error("ffmpeg not found in PATH or known locations"));
+  });
+}
+
+function cleanupTempDir(dir) {
+  fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+}
 
 process.stdin.on("end", () => {
   log("Extension disconnected (stdin ended). Exiting.");
