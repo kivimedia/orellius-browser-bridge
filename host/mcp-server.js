@@ -39,6 +39,7 @@ const BIDI_TOOLS = new Set([
   "read_network_requests",
   "resize_window",
   "gif_creator",
+  "record_video",
   "upload_image",
 ]);
 
@@ -531,10 +532,10 @@ server.tool(
   async (args) => callTool("get_page_text", args)
 );
 
-// 8. gif_creator (Playwright-style video recording)
+// 8. record_video (Playwright-style video recording, was: gif_creator)
 server.tool(
-  "gif_creator",
-  "Record a browser session as video with synthetic cursor + click overlays composited onto each frame. Equivalent to Playwright's recordVideo. Workflow: 1) start_recording (begins CDP screencast + mouse-event log on the tab), 2) drive the page via other tools (click, type, navigate, etc.), 3) stop_recording (halts capture but keeps frames), 4) export (writes the encoded video to disk via the native host's ffmpeg). All operations are scoped to a tab. Default output is WebM (small, broadly compatible); MP4 and GIF are also supported. Frames are captured at ~15fps by default and downscaled to fit 1280x720; tweak via options. The cursor and click ripples are SYNTHETIC (drawn from the same x/y values dispatched via Input.dispatchMouseEvent) because CDP-trusted clicks never move the OS pointer.",
+  "record_video",
+  "Record a browser session as video with synthetic cursor + click overlays composited onto each frame. Equivalent to Playwright's recordVideo. Output formats: webm (default), mp4, gif. Workflow: 1) start_recording (begins CDP screencast + mouse-event log on the tab), 2) drive the page via other tools (click, type, navigate, etc.), 3) stop_recording (halts capture but keeps frames), 4) export (writes the encoded video to disk via the native host's ffmpeg). All operations are scoped to a tab. Frames are captured at ~15fps by default and downscaled to fit 1280x720; tweak via options. The cursor and click ripples are SYNTHETIC (drawn from the same x/y values dispatched via Input.dispatchMouseEvent) because CDP-trusted clicks never move the OS pointer.",
   {
     action: z.enum(["start_recording", "stop_recording", "export", "clear"]).describe("Action to perform. start_recording: begin CDP Page.startScreencast on the tab and start logging mouse events. stop_recording: halt screencast but keep frames in memory. export: composite + ffmpeg-encode + write to disk; returns savePath. clear: discard frames (also stops if still recording)."),
     tabId: z.number().describe("Tab ID. Must be a tab in the current MCP group. Use tabs_context_mcp first if unknown."),
@@ -551,7 +552,30 @@ server.tool(
       captureQuality: z.number().optional().describe("CDP screencast JPEG quality, 1-100 (default 80). Affects per-frame size, not codec quality."),
     }).optional().describe("Capture/render options for start_recording (maxWidth/maxHeight/everyNthFrame/captureQuality) and export (showClickIndicators/showProgressBar/showWatermark). All have sensible defaults."),
   },
-  async (args) => callTool("gif_creator", args)
+  async (args) => callTool("record_video", args)
+);
+
+// 8b. gif_creator (DEPRECATED alias for record_video - kept for backward compat)
+server.tool(
+  "gif_creator",
+  'DEPRECATED. Use record_video instead. Same behavior - records a browser session as video (webm/mp4/gif) with synthetic cursor overlay. The name "gif_creator" is misleading because GIF is just one of three output formats; the primary use is MP4/WebM video. This alias is kept for backward compatibility and will be removed in a future release.',
+  {
+    action: z.enum(["start_recording", "stop_recording", "export", "clear"]),
+    tabId: z.number(),
+    format: z.enum(["webm", "mp4", "gif"]).optional(),
+    savePath: z.string().optional(),
+    filename: z.string().optional(),
+    options: z.object({
+      showClickIndicators: z.boolean().optional(),
+      showProgressBar: z.boolean().optional(),
+      showWatermark: z.boolean().optional(),
+      maxWidth: z.number().optional(),
+      maxHeight: z.number().optional(),
+      everyNthFrame: z.number().optional(),
+      captureQuality: z.number().optional(),
+    }).optional(),
+  },
+  async (args) => callTool("record_video", args)
 );
 
 // 9. javascript_tool
@@ -699,6 +723,26 @@ server.tool(
     filename: z.string().optional().describe('Optional filename for the uploaded file (default: "image.png")'),
   },
   async (args) => callTool("upload_image", args)
+);
+
+// 18b. upload_file - upload a local file to any upload control (including
+// OS-native file pickers triggered by `<input type=file>.click()` or
+// `window.showOpenFilePicker`). Bridges via Page.setInterceptFileChooserDialog
+// + DOM.setFileInputFiles. Use this instead of upload_image when you have an
+// absolute path to a file on disk (e.g. an asset you generated, an image in
+// the user's filesystem).
+server.tool(
+  "upload_file",
+  "Upload a local file to any upload control on a page, including OS-native file pickers that don't expose a DOM <input type=file>. Arms Page.setInterceptFileChooserDialog, optionally clicks a trigger (selector / coordinate / ref), waits for the next Page.fileChooserOpened event, and fulfills it via DOM.setFileInputFiles. Use this for Meta Ads Manager, Google Drive, Slack, Notion, and any other app that pops the OS file dialog. filePath must be absolute on the machine running Chrome. If none of triggerSelector/triggerCoordinate/triggerRef is supplied, the tool just arms the interception and waits up to timeoutMs for you to click the upload button yourself - but supplying a trigger is strongly preferred (no race).",
+  {
+    tabId: z.number().describe("Tab ID where the upload control lives."),
+    filePath: z.string().describe("Absolute path to the file on the machine running Chrome (the user's machine for local Chrome, the remote machine for remote Chrome). Forward slashes or escaped backslashes both work on Windows."),
+    triggerSelector: z.string().optional().describe('CSS selector for the button that opens the upload dialog. Example: \'button[aria-label="Upload"]\'. Tool will document.querySelector + .click() this before waiting.'),
+    triggerCoordinate: z.array(z.number()).optional().describe("Pixel coordinates [x, y] in the viewport. Tool will dispatch a real CDP mouse press+release on these coords to trigger the upload dialog."),
+    triggerRef: z.string().optional().describe('Element reference ID from read_page or find tools (e.g. "ref_1"). Tool resolves via __orelliusBrowserBridge.resolveRef and clicks it.'),
+    timeoutMs: z.number().optional().describe("How long to wait for the file chooser dialog to open after the trigger fires (default 15000). If you arm without a trigger, raise this to give yourself time to click manually."),
+  },
+  async (args) => callTool("upload_file", args)
 );
 
 // 19. session_save

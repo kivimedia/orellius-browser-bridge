@@ -43,6 +43,11 @@ const attachedTabs = new Map(); // tabId -> { enabledDomains: Set }
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp}]
 const screenshotStore = new Map(); // imageId -> base64
+// Pending Page.fileChooserOpened interceptions, keyed by tabId. Set up by
+// upload_file before triggering an OS file picker; the global CDP onEvent
+// listener (further down) drains this map when the chooser opens, calls
+// DOM.setFileInputFiles with the supplied filePath, and resolves the tool.
+const pendingFileChoosers = new Map(); // tabId -> { resolve, reject, filePath, filename, timer }
 
 // Track which sessionId is active for each tool request (threaded through dispatch)
 let _currentSessionId = null;
@@ -658,6 +663,13 @@ chrome.tabs.onCreated.addListener((tab) => {
 chrome.debugger.onDetach.addListener((source, reason) => {
   lastDetachReason.set(source.tabId, reason);
   attachedTabs.delete(source.tabId);
+  // Cancel any pending upload_file waiting for a chooser on this tab.
+  const pendingUpload = pendingFileChoosers.get(source.tabId);
+  if (pendingUpload) {
+    pendingFileChoosers.delete(source.tabId);
+    clearTimeout(pendingUpload.timer);
+    pendingUpload.reject(new Error(`Debugger detached (${reason}) before file chooser opened.`));
+  }
   log(`Debugger detached from tab ${source.tabId}: ${reason}`);
 });
 
@@ -717,6 +729,42 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     });
     if (reqs.length > 1000) reqs.splice(0, reqs.length - 1000);
     networkRequests.set(tabId, reqs);
+  }
+
+  // Page.fileChooserOpened fires on `<input type=file>.click()` and on
+  // `window.showOpenFilePicker()` when Page.setInterceptFileChooserDialog is
+  // enabled. We use it to fulfill OS-native file pickers from the upload_file
+  // tool without touching the OS dialog.
+  if (method === "Page.fileChooserOpened") {
+    const pending = pendingFileChoosers.get(tabId);
+    if (pending) {
+      pendingFileChoosers.delete(tabId);
+      clearTimeout(pending.timer);
+      (async () => {
+        try {
+          if (params.backendNodeId) {
+            // Standard <input type=file> path - including lazy-mounted inputs
+            // that React frameworks create + click() on demand.
+            await chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", {
+              backendNodeId: params.backendNodeId,
+              files: [pending.filePath],
+            });
+            pending.resolve({ mode: "input", backendNodeId: params.backendNodeId });
+          } else {
+            // showOpenFilePicker() / File System Access API: no backendNodeId
+            // is reported. CDP can't fulfill these as of Chrome 124. Cancel
+            // and surface a clear error to the agent.
+            pending.reject(new Error("File System Access API picker (showOpenFilePicker) is not supported by CDP - the page must use a <input type=file> for upload_file to work."));
+          }
+        } catch (e) {
+          pending.reject(e);
+        } finally {
+          try {
+            await chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false });
+          } catch {}
+        }
+      })();
+    }
   }
 
   if (method === "Page.screencastFrame" && params && params.data) {
@@ -1896,6 +1944,100 @@ const toolHandlers = {
     return { content: [{ type: "text", text: `Image upload for ref=${ref}, coordinate=${coordinate} — use drag & drop or file input.` }] };
   },
 
+  async upload_file(args) {
+    const { tabId, filePath, triggerSelector, triggerCoordinate, triggerRef, timeoutMs = 15000 } = args;
+    if (typeof tabId !== "number") {
+      return { content: [{ type: "text", text: "tabId is required" }] };
+    }
+    if (typeof filePath !== "string" || !filePath) {
+      return { content: [{ type: "text", text: "filePath is required (absolute path on the machine running Chrome)" }] };
+    }
+    if (!(await isInGroup(tabId))) {
+      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    }
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
+
+    // Reject double-arming - one chooser per tab at a time.
+    if (pendingFileChoosers.has(tabId)) {
+      return { content: [{ type: "text", text: `Another upload_file is already armed on tab ${tabId}. Wait for it to complete or detach.` }] };
+    }
+
+    await ensureAttached(tabId);
+    await ensureDomain(tabId, "Page");
+    await ensureDomain(tabId, "DOM");
+
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: true });
+    } catch (e) {
+      return { content: [{ type: "text", text: `Failed to arm file chooser interception: ${e.message}` }] };
+    }
+
+    const completion = new Promise((resolve, reject) => {
+      const timer = setTimeout(async () => {
+        pendingFileChoosers.delete(tabId);
+        try {
+          await chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false });
+        } catch {}
+        reject(new Error(`File chooser did not open within ${timeoutMs}ms. Check that triggerSelector/triggerCoordinate actually opens an upload dialog, or call upload_file first then trigger the click yourself within the timeout.`));
+      }, timeoutMs);
+      pendingFileChoosers.set(tabId, { resolve, reject, filePath, timer });
+    });
+
+    // Trigger the picker. Three ways: DOM ref (via the existing
+    // __orelliusBrowserBridge ref store), a CSS selector, or pixel coords.
+    // If none provided, we just arm and wait - caller is expected to click
+    // the upload button themselves before timeoutMs.
+    try {
+      if (triggerRef) {
+        await cdp(tabId, "Runtime.evaluate", {
+          expression: `(() => { const el = window.__orelliusBrowserBridge?.resolveRef?.(${JSON.stringify(triggerRef)}); if (!el) throw new Error('ref not found: ' + ${JSON.stringify(triggerRef)}); el.click(); return true; })()`,
+          returnByValue: true,
+        });
+      } else if (triggerSelector) {
+        const r = await cdp(tabId, "Runtime.evaluate", {
+          expression: `(() => { const el = document.querySelector(${JSON.stringify(triggerSelector)}); if (!el) return { ok: false, msg: 'selector matched nothing' }; el.click(); return { ok: true }; })()`,
+          returnByValue: true,
+        });
+        const v = r.result?.value;
+        if (v && v.ok === false) {
+          // Bail: clean up arming + reject
+          pendingFileChoosers.delete(tabId);
+          try { await chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false }); } catch {}
+          return { content: [{ type: "text", text: `triggerSelector matched no element: ${triggerSelector}` }] };
+        }
+      } else if (Array.isArray(triggerCoordinate) && triggerCoordinate.length === 2) {
+        const [x, y] = triggerCoordinate;
+        await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+        await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+      }
+    } catch (e) {
+      // Trigger blew up - clean up the pending entry.
+      const pending = pendingFileChoosers.get(tabId);
+      if (pending) {
+        pendingFileChoosers.delete(tabId);
+        clearTimeout(pending.timer);
+      }
+      try { await chrome.debugger.sendCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false }); } catch {}
+      return { content: [{ type: "text", text: `Failed to trigger upload: ${e.message}` }] };
+    }
+
+    try {
+      const result = await completion;
+      return {
+        content: [{
+          type: "text",
+          text: `Uploaded ${filePath} to tab ${tabId} via ${result.mode} (backendNodeId: ${result.backendNodeId}).`,
+        }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `upload_file failed: ${e.message}` }] };
+    }
+  },
+
+  async record_video(args) {
+    return toolHandlers.gif_creator(args);
+  },
+
   async gif_creator(args) {
     const { action, tabId, filename, savePath, format, options = {} } = args;
     if (typeof tabId !== "number") {
@@ -1912,7 +2054,7 @@ const toolHandlers = {
           return {
             content: [{
               type: "text",
-              text: `Recording started on tab ${tabId}. Capture: ${options.maxWidth || 1280}x${options.maxHeight || 720} jpeg, ~${Math.round(30 / (options.everyNthFrame || 2))}fps. Call gif_creator(action='stop_recording') when done.`,
+              text: `Recording started on tab ${tabId}. Capture: ${options.maxWidth || 1280}x${options.maxHeight || 720} jpeg, ~${Math.round(30 / (options.everyNthFrame || 2))}fps. Call record_video(action='stop_recording') when done.`,
             }],
           };
         }
@@ -1922,7 +2064,7 @@ const toolHandlers = {
           return {
             content: [{
               type: "text",
-              text: `Recording stopped: ${info.frameCount} frames, ${info.mouseEvents} mouse events, ${(info.durationMs / 1000).toFixed(1)}s. Call gif_creator(action='export') to encode.`,
+              text: `Recording stopped: ${info.frameCount} frames, ${info.mouseEvents} mouse events, ${(info.durationMs / 1000).toFixed(1)}s. Call record_video(action='export') to encode.`,
             }],
           };
         }
