@@ -177,15 +177,22 @@ function installWindows(manifest) {
   const manifestDir = path.join(os.homedir(), ".orellius-browser-bridge");
   fs.mkdirSync(manifestDir, { recursive: true });
   const manifestPath = path.join(manifestDir, `${NATIVE_HOST_NAME}.json`);
-  
-  // Fix path separators for Windows
+
+  // On Windows, the .js file association may be Windows Script Host instead of
+  // node.exe (any user with WSH as the default handler will see "Microsoft
+  // JScript compilation error: Invalid character" when Chrome launches the
+  // native host). Generate a .cmd wrapper that explicitly invokes node, and
+  // point the manifest at the wrapper instead of native-host.js.
+  const wrapperPath = writeWindowsWrapper(manifest.path);
+
   const winManifest = {
     ...manifest,
-    path: manifest.path.replace(/\//g, "\\"),
+    path: wrapperPath.replace(/\//g, "\\"),
   };
-  
+
   fs.writeFileSync(manifestPath, JSON.stringify(winManifest, null, 2), "utf-8");
-  console.log(`📄 Manifest written to: ${manifestPath}\n`);
+  console.log(`📄 Wrapper:  ${wrapperPath}`);
+  console.log(`📄 Manifest: ${manifestPath}\n`);
 
   for (const browser of browsers) {
     try {
@@ -203,6 +210,18 @@ function installWindows(manifest) {
 
   console.log(`\n💡 Tip: If installation failed, you may need to run as Administrator.`);
   console.log(`   Right-click Command Prompt → "Run as administrator" → retry`);
+}
+
+// Generate a .cmd wrapper alongside native-host.js that invokes the current
+// node.exe with stdio passthrough. Returns the absolute wrapper path. Idempotent.
+function writeWindowsWrapper(nativeHostJsPath) {
+  const dir = path.dirname(nativeHostJsPath);
+  const wrapperPath = path.join(dir, "native-host-wrapper.cmd");
+  const nodeExe = process.execPath; // node.exe currently running install.js
+  // CRLF line endings + ASCII to be safe across cmd.exe versions
+  const body = `@echo off\r\n"${nodeExe}" "%~dp0native-host.js" %*\r\n`;
+  fs.writeFileSync(wrapperPath, body, "ascii");
+  return wrapperPath;
 }
 
 // ===== Firefox - macOS =====
@@ -237,9 +256,12 @@ function installWindowsFirefox(manifest) {
   const manifestDir = path.join(os.homedir(), ".orellius-browser-bridge");
   fs.mkdirSync(manifestDir, { recursive: true });
   const manifestPath = path.join(manifestDir, NATIVE_HOST_NAME + "-firefox.json");
-  const winManifest = { ...manifest, path: manifest.path.replace(/\//g, "\\") };
+  // Same WSH workaround as Chrome: point manifest at .cmd wrapper, not .js
+  const wrapperPath = writeWindowsWrapper(manifest.path);
+  const winManifest = { ...manifest, path: wrapperPath.replace(/\//g, "\\") };
   fs.writeFileSync(manifestPath, JSON.stringify(winManifest, null, 2), "utf-8");
-  console.log("Firefox manifest written to: " + manifestPath);
+  console.log("Firefox wrapper:  " + wrapperPath);
+  console.log("Firefox manifest: " + manifestPath);
 
   // execFileSync with explicit arg array - no shell, no injection surface.
   try {
