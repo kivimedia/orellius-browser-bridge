@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Orellius - Override PIN</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #131933;
+      --panel2: #181f3d;
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #e6e9f5;
+      --muted: #9aa3c7;
+      --accent: #7aa2ff;
+      --warn: #ffb86b;
+      --danger: #ff6b6b;
+      --ok: #6ee7b7;
+    }
+    body {
+      margin: 0;
+      width: 340px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 16px;
+    }
+    h1 { font-size: 13px; font-weight: 600; margin: 0 0 4px; letter-spacing: 0.2px; }
+    p.sub { font-size: 12px; color: var(--muted); margin: 0 0 14px; line-height: 1.5; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+    }
+    .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 6px; }
+    .pin-value {
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 28px;
+      font-weight: 600;
+      letter-spacing: 6px;
+      color: var(--accent);
+      user-select: all;
+    }
+    .binding-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      margin-top: 8px;
+    }
+    .binding-pill.bound { color: var(--warn); border-color: rgba(255, 184, 107, 0.35); }
+    .binding-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+    .binding-pill.bound .dot { background: var(--warn); }
+    .row { display: flex; gap: 8px; margin-top: 8px; }
+    button {
+      flex: 1;
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease;
+    }
+    button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.04); border-color: rgba(255, 255, 255, 0.18); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.danger:hover { border-color: var(--danger); color: var(--danger); }
+    button.warn:hover { border-color: var(--warn); color: var(--warn); }
+    input[type="text"] {
+      flex: 1;
+      background: var(--panel2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 14px;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      letter-spacing: 4px;
+      text-align: center;
+    }
+    input[type="text"]:focus { outline: none; border-color: var(--accent); }
+    .footer { margin-top: 4px; font-size: 11px; color: var(--muted); line-height: 1.5; }
+    .footer code { background: rgba(255, 255, 255, 0.06); padding: 1px 5px; border-radius: 3px; font-size: 10.5px; }
+    .toast {
+      position: fixed; bottom: 12px; left: 16px; right: 16px;
+      background: var(--panel); border: 1px solid var(--border);
+      padding: 8px 12px; border-radius: 8px; font-size: 12px;
+      opacity: 0; pointer-events: none; transition: opacity 0.18s;
+    }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <h1>Orellius override PIN</h1>
+  <p class="sub">Required when one Claude session needs to break another active session's tab/window lock. The first session to use a valid PIN <b>claims</b> it - other sessions are rejected until you Clear Binding or Rotate.</p>
+
+  <div class="card">
+    <div class="label">Current PIN</div>
+    <div class="pin-value" id="pin">------</div>
+    <div class="binding-pill" id="binding"><span class="dot"></span><span id="bindingText">Unbound</span></div>
+    <div class="row">
+      <button id="copy">Copy</button>
+      <button id="clearBinding" class="warn" disabled>Clear binding</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">Set custom PIN</div>
+    <div class="row">
+      <input type="text" id="newPin" inputmode="numeric" maxlength="8" placeholder="4 to 8 digits" />
+      <button id="setPin">Set</button>
+    </div>
+    <div class="row">
+      <button id="rotate" class="danger">Rotate to random 6 digits</button>
+    </div>
+  </div>
+
+  <div class="footer">
+    Pass to a destructive Orellius tool as <code>override_pin:"&lt;digits&gt;"</code>. Affected tools: <code>browser_lock</code>, <code>browser_unlock</code>, <code>tabs_close_mcp</code>, <code>session_end</code>. Setting/rotating the PIN auto-clears any existing session binding.
+  </div>
+
+  <div class="card">
+    <div class="label">Global private-mode lock</div>
+    <div class="binding-pill" id="lockPill"><span class="dot"></span><span id="lockText">Loading...</span></div>
+    <div class="row">
+      <button id="forcePrivate" class="warn">Force private + lock</button>
+      <button id="unlockPrivate" disabled>Unlock</button>
+    </div>
+    <div class="footer" style="margin-top:8px">
+      When locked, NO Claude session can flip Orellius to <code>public</code> mode and <code>browser_show</code> only draws taskbar attention (no focus steal). Set from any shell:<br>
+      <code>curl -X POST http://127.0.0.1:18766/admin/force-private</code>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const PIN_KEY = "orellius_override_pin_v1";
+    const BIND_KEY = "orellius_pin_binding_v1";
+    const LOCK_KEY = "orellius_private_lock_v1";
+    const MODE_KEY = "orellius_mode_v1";
+    const $pin = document.getElementById("pin");
+    const $binding = document.getElementById("binding");
+    const $bindingText = document.getElementById("bindingText");
+    const $clearBinding = document.getElementById("clearBinding");
+    const $newPin = document.getElementById("newPin");
+    const $toast = document.getElementById("toast");
+    const $lockPill = document.getElementById("lockPill");
+    const $lockText = document.getElementById("lockText");
+    const $forcePrivate = document.getElementById("forcePrivate");
+    const $unlockPrivate = document.getElementById("unlockPrivate");
+
+    function toast(msg) {
+      $toast.textContent = msg;
+      $toast.classList.add("show");
+      setTimeout(() => $toast.classList.remove("show"), 1400);
+    }
+
+    function generatePin() {
+      const buf = new Uint32Array(1);
+      crypto.getRandomValues(buf);
+      return String(buf[0] % 1000000).padStart(6, "0");
+    }
+
+    async function refresh() {
+      const data = await chrome.storage.local.get([PIN_KEY, BIND_KEY, LOCK_KEY, MODE_KEY]);
+      $pin.textContent = data[PIN_KEY] || "------";
+      const binding = data[BIND_KEY];
+      if (binding && binding.sessionId) {
+        const ageSec = Math.floor((Date.now() - (binding.claimedAt || 0)) / 1000);
+        $bindingText.textContent = `Claimed by "${binding.sessionId}" ${ageSec}s ago`;
+        $binding.classList.add("bound");
+        $clearBinding.disabled = false;
+      } else {
+        $bindingText.textContent = "Unbound (next valid use will claim it)";
+        $binding.classList.remove("bound");
+        $clearBinding.disabled = true;
+      }
+      const locked = data[LOCK_KEY] === true;
+      const mode = data[MODE_KEY] || "private";
+      if (locked) {
+        $lockText.textContent = `🔒 LOCKED to private (sessions cannot switch to public)`;
+        $lockPill.classList.add("bound");
+        $forcePrivate.disabled = true;
+        $unlockPrivate.disabled = false;
+      } else {
+        $lockText.textContent = `Unlocked - current default mode: "${mode}"`;
+        $lockPill.classList.remove("bound");
+        $forcePrivate.disabled = false;
+        $unlockPrivate.disabled = true;
+      }
+    }
+
+    document.getElementById("copy").addEventListener("click", async () => {
+      const pin = $pin.textContent;
+      if (!pin || pin === "------") return;
+      await navigator.clipboard.writeText(pin);
+      toast("Copied PIN");
+    });
+
+    document.getElementById("rotate").addEventListener("click", async () => {
+      if (!confirm("Rotate to a random 6-digit PIN? Any in-flight agent calls using the old PIN will fail. Existing session binding will be cleared.")) return;
+      const pin = generatePin();
+      await chrome.storage.local.set({ [PIN_KEY]: pin });
+      await chrome.storage.local.remove(BIND_KEY);
+      await refresh();
+      toast("Rotated + binding cleared");
+    });
+
+    document.getElementById("setPin").addEventListener("click", async () => {
+      const v = ($newPin.value || "").trim();
+      if (!/^\d{4,8}$/.test(v)) {
+        toast("Enter 4 to 8 digits");
+        return;
+      }
+      await chrome.storage.local.set({ [PIN_KEY]: v });
+      await chrome.storage.local.remove(BIND_KEY);
+      $newPin.value = "";
+      await refresh();
+      toast("PIN set + binding cleared");
+    });
+
+    $clearBinding.addEventListener("click", async () => {
+      if (!confirm("Clear the session binding? The next session to present the correct PIN will claim it.")) return;
+      await chrome.storage.local.remove(BIND_KEY);
+      await refresh();
+      toast("Binding cleared");
+    });
+
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && (changes[PIN_KEY] || changes[BIND_KEY] || changes[LOCK_KEY] || changes[MODE_KEY])) refresh();
+    });
+
+    $forcePrivate.addEventListener("click", async () => {
+      // Set both the lock flag and the mode at the storage layer. The
+      // background script's storage.onChanged listener will pick this up on
+      // next load; we also POST to the hub admin endpoint so any other
+      // currently-running session also gets the broadcast (covers the
+      // scenario where the popup is opened in a different browser profile
+      // than the active extension installation).
+      await chrome.storage.local.set({ [LOCK_KEY]: true, [MODE_KEY]: "private" });
+      try {
+        await fetch("http://127.0.0.1:18766/admin/force-private", { method: "POST" });
+      } catch { /* hub may not be running; storage write alone is enough for this extension */ }
+      await refresh();
+      toast("Locked to private mode");
+    });
+
+    $unlockPrivate.addEventListener("click", async () => {
+      if (!confirm("Unlock private mode? Future Claude sessions will be allowed to switch into public mode (window focus stealing) again via the browser_mode tool.")) return;
+      await chrome.storage.local.set({ [LOCK_KEY]: false });
+      try {
+        await fetch("http://127.0.0.1:18766/admin/unlock", { method: "POST" });
+      } catch { /* hub may not be running */ }
+      await refresh();
+      toast("Unlocked");
+    });
+
+    refresh();
+  </script>
+</body>
+</html>

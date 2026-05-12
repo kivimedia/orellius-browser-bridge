@@ -5,6 +5,7 @@
 // Auto-spawned by mcp-server.js if not running. Stays alive with an idle timeout.
 
 import net from "node:net";
+import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -38,6 +39,7 @@ function getPort() {
 }
 
 const TCP_PORT = getPort();
+const ADMIN_HTTP_PORT = TCP_PORT + 1; // 18766 by default
 const pidfilePath = path.join(os.tmpdir(), `orellius-browser-bridge-hub-${TCP_PORT}.pid`);
 
 // --- State ---
@@ -270,8 +272,127 @@ function shutdown() {
   }
   nativeHostSockets.clear();
   server.close();
+  try { adminServer.close(); } catch {}
   process.exit(0);
 }
+
+// ---------------------------------------------------------------------------
+// Admin HTTP server (localhost only).
+//
+// Exposes a small REST surface so the user can flip global Orellius state from
+// any shell without going through a Claude session - the primary use case is
+// "force every Orellius instance to private mode RIGHT NOW and lock it there"
+// when the user notices a session running in public mode and stealing window
+// focus from their other Chrome work.
+//
+// Endpoints (all 127.0.0.1 only, no auth - localhost-only by virtue of the
+// bind address):
+//   POST /admin/force-private  -> broadcast admin_set_mode(mode=private, lock=on)
+//   POST /admin/unlock         -> broadcast admin_set_mode(lock=off)
+//   GET  /admin/status         -> return hub state JSON
+//
+// The native host forwards admin_set_mode payloads to the extension via the
+// existing native messaging channel; background.js handles the message and
+// updates chrome.storage.local accordingly.
+// ---------------------------------------------------------------------------
+
+function broadcastAdminMessage(adminMsg) {
+  let delivered = 0;
+  for (const [browser, sock] of nativeHostSockets) {
+    if (sock && !sock.destroyed) {
+      try {
+        sock.write(JSON.stringify({ ...adminMsg, browser }) + "\n");
+        delivered++;
+      } catch (err) {
+        log(`broadcast to ${browser} failed: ${err.message}`);
+      }
+    }
+  }
+  return delivered;
+}
+
+const adminServer = http.createServer((req, res) => {
+  const cors = () => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  };
+  cors();
+  const url = new URL(req.url, `http://127.0.0.1:${ADMIN_HTTP_PORT}`);
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204).end();
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/admin/status") {
+    const body = {
+      ok: true,
+      tcpPort: TCP_PORT,
+      adminPort: ADMIN_HTTP_PORT,
+      pid: process.pid,
+      nativeHosts: [...nativeHostSockets.keys()],
+      mcpClientCount: mcpClients.size,
+      mcpSessions: [...mcpClients.keys()],
+      uptimeSec: Math.round(process.uptime()),
+    };
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body, null, 2));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/admin/force-private") {
+    const delivered = broadcastAdminMessage({
+      type: "admin_set_mode",
+      mode: "private",
+      lock: true,
+      reason: "force-private CLI",
+    });
+    log(`/admin/force-private broadcast delivered to ${delivered} native_host(s)`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      delivered,
+      message: delivered > 0
+        ? `Sent force-private + lock to ${delivered} browser native_host(s). All Orellius sessions are now in private mode and cannot switch to public until /admin/unlock.`
+        : "No browser extensions are currently connected to the hub. Open Chrome with the Orellius extension to take effect; the lock will apply once the extension connects (lock state persists in extension storage).",
+    }));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/admin/unlock") {
+    const delivered = broadcastAdminMessage({
+      type: "admin_set_mode",
+      lock: false,
+      reason: "unlock CLI",
+    });
+    log(`/admin/unlock broadcast delivered to ${delivered} native_host(s)`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      delivered,
+      message: delivered > 0
+        ? `Unlocked. ${delivered} browser native_host(s) notified. Sessions can switch to public mode again via the browser_mode tool.`
+        : "No browser extensions are currently connected to the hub. Unlock will take effect when the extension reconnects.",
+    }));
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    ok: false,
+    error: "Unknown admin endpoint",
+    available: ["GET /admin/status", "POST /admin/force-private", "POST /admin/unlock"],
+  }));
+});
+
+adminServer.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    log(`Admin HTTP port ${ADMIN_HTTP_PORT} already in use - skipping admin server (another hub may own it).`);
+  } else {
+    log(`Admin server error: ${err.message}`);
+  }
+});
 
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
@@ -291,4 +412,8 @@ server.listen(TCP_PORT, "127.0.0.1", () => {
   log(`Hub listening on 127.0.0.1:${TCP_PORT} (PID ${process.pid})`);
   writePidfile();
   resetIdleTimer();
+});
+
+adminServer.listen(ADMIN_HTTP_PORT, "127.0.0.1", () => {
+  log(`Admin HTTP listening on 127.0.0.1:${ADMIN_HTTP_PORT} (POST /admin/force-private, /admin/unlock, GET /admin/status)`);
 });

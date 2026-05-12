@@ -97,6 +97,14 @@ function connectNativeHost() {
         resolveVrecRequest(msg);
         return;
       }
+      // Hub-originated admin broadcast (e.g. force-private CLI). No sessionId,
+      // no response expected - we just mutate global state and persist.
+      if (msg.type === "admin_set_mode") {
+        handleAdminSetMode(msg).catch((err) => {
+          log(`admin_set_mode failed: ${err.message}`);
+        });
+        return;
+      }
       if (msg.type === "tool_request" && msg.id) {
         const sid = msg.sessionId || null;
         log(`Tool request: ${msg.tool} (id: ${msg.id}, session: ${sid || "legacy"})`);
@@ -343,7 +351,16 @@ const HEARTBEAT_EXTEND_MS = 2 * 60 * 1000;   // each op extends to at least 2 mi
 // browser_show MCP tool which transiently goes public for one window-raise.
 const MODE_STORAGE_KEY = "orellius_mode_v1";
 const LEGACY_MODE_STORAGE_KEY = "orellius_focus_mode_v1";
+const PRIVATE_LOCK_STORAGE_KEY = "orellius_private_lock_v1";
 let defaultMode = "private"; // "private" | "public"
+
+// Global "force private" lock. When true, NO session can switch the browser
+// into public mode and the per-session browser_show one-shot raise is also
+// suppressed. Set from outside Claude via the hub admin HTTP endpoint
+// (POST http://127.0.0.1:18766/admin/force-private). Persists in chrome.storage
+// so it survives extension reloads. Cleared via POST /admin/unlock or from
+// the extension popup.
+let lockedToPrivate = false;
 
 function normalizeMode(mode) {
   if (mode === "silent") return "private";
@@ -354,13 +371,22 @@ function normalizeMode(mode) {
 async function loadDefaultMode() {
   try {
     // Prefer new key; fall back to legacy key for migration.
-    const data = await chrome.storage.local.get([MODE_STORAGE_KEY, LEGACY_MODE_STORAGE_KEY]);
+    const data = await chrome.storage.local.get([MODE_STORAGE_KEY, LEGACY_MODE_STORAGE_KEY, PRIVATE_LOCK_STORAGE_KEY]);
     const raw = data[MODE_STORAGE_KEY] ?? data[LEGACY_MODE_STORAGE_KEY];
     const stored = normalizeMode(raw);
     if (stored === "private" || stored === "public") {
       defaultMode = stored;
     }
-    log(`defaultMode loaded: ${defaultMode}`);
+    lockedToPrivate = data[PRIVATE_LOCK_STORAGE_KEY] === true;
+    if (lockedToPrivate && defaultMode !== "private") {
+      // Lock honored on boot: if we previously had public mode and a lock was
+      // installed, force the mode back to private and re-persist. This covers
+      // the case where storage was edited out-of-band or migration left an
+      // inconsistent state.
+      defaultMode = "private";
+      await chrome.storage.local.set({ [MODE_STORAGE_KEY]: "private" });
+    }
+    log(`defaultMode loaded: ${defaultMode}${lockedToPrivate ? " (LOCKED to private)" : ""}`);
   } catch (e) {
     log(`loadDefaultMode failed: ${e.message}`);
   }
@@ -371,9 +397,71 @@ async function setDefaultMode(mode) {
   if (m !== "private" && m !== "public") {
     throw new Error(`Invalid mode "${mode}". Must be "private" or "public" (or legacy "silent"/"active").`);
   }
+  if (lockedToPrivate && m === "public") {
+    // Hard refuse - the user installed the global lock specifically to prevent
+    // any session from going public. Surface a clear error to the calling tool.
+    throw new Error('Orellius is locked to private mode (global "force-private" lock active). Run `POST http://127.0.0.1:18766/admin/unlock` or click "Unlock private mode" in the extension popup to allow public mode again.');
+  }
   defaultMode = m;
   await chrome.storage.local.set({ [MODE_STORAGE_KEY]: m });
   log(`defaultMode set: ${m}`);
+}
+
+async function setPrivateLock(value) {
+  lockedToPrivate = !!value;
+  if (lockedToPrivate && defaultMode !== "private") {
+    defaultMode = "private";
+    await chrome.storage.local.set({
+      [PRIVATE_LOCK_STORAGE_KEY]: true,
+      [MODE_STORAGE_KEY]: "private",
+    });
+  } else {
+    await chrome.storage.local.set({ [PRIVATE_LOCK_STORAGE_KEY]: lockedToPrivate });
+  }
+  log(`lockedToPrivate set: ${lockedToPrivate}`);
+}
+
+// Handler for hub-originated admin_set_mode messages (POST /admin/force-private
+// or /admin/unlock from outside any Claude session). Applies the requested
+// mode/lock combination atomically and minimises every owned window so the
+// human's foreground window stops getting interrupted by any Orellius session
+// that was already running in public mode at the moment the lock was set.
+async function handleAdminSetMode(msg) {
+  const wantMode = msg.mode ? normalizeMode(msg.mode) : null;
+  const wantLock = typeof msg.lock === "boolean" ? msg.lock : null;
+  log(`admin_set_mode received: mode=${wantMode || "(unchanged)"} lock=${wantLock === null ? "(unchanged)" : wantLock} reason="${msg.reason || ""}"`);
+
+  // Apply lock first so any subsequent mode change can be validated against it.
+  if (wantLock !== null) {
+    await setPrivateLock(wantLock);
+  }
+  if (wantMode === "private") {
+    defaultMode = "private";
+    await chrome.storage.local.set({ [MODE_STORAGE_KEY]: "private" });
+  } else if (wantMode === "public") {
+    if (lockedToPrivate) {
+      log("admin_set_mode public ignored: private lock is active");
+    } else {
+      defaultMode = "public";
+      await chrome.storage.local.set({ [MODE_STORAGE_KEY]: "public" });
+    }
+  }
+
+  // If we forced private + lock, also minimise every Orellius-owned window
+  // RIGHT NOW so a session that was mid-action with the window in the
+  // foreground gets out of the human's way immediately. We do NOT close any
+  // tabs - locks are preserved, the next CDP click still works inside the
+  // owned window. We just want it off the user's face.
+  if (lockedToPrivate) {
+    for (const [sid, wid] of sessionWindows) {
+      try {
+        await chrome.windows.update(wid, { state: "minimized" });
+        log(`admin minimized session "${sid}" window ${wid}`);
+      } catch (e) {
+        log(`admin minimize of window ${wid} failed: ${e.message}`);
+      }
+    }
+  }
 }
 
 // Per-session window claim. Each Claude session that creates an MCP tab group
@@ -550,7 +638,11 @@ async function focusTabForInput(tabId, opts = {}) {
     const tab = await chrome.tabs.get(tabId);
     await assertTabInOwnedWindow(tabId, tab);
     await chrome.tabs.update(tabId, { active: true });
-    const wantPublic = opts.public ?? (defaultMode === "public");
+    // The global private lock overrides any per-call request for public focus
+    // (e.g. browser_show's transient raise). Tab activation within the owned
+    // window still happens because CDP needs the target tab active, but the
+    // OS window never gets brought forward.
+    const wantPublic = !lockedToPrivate && (opts.public ?? (defaultMode === "public"));
     if (wantPublic && tab.windowId !== undefined) {
       await chrome.windows.update(tab.windowId, { focused: true });
     }
@@ -2212,6 +2304,20 @@ const toolHandlers = {
       return { content: [{ type: "text", text:
         `No window owned by session "${sid || 'legacy'}". Create a tab group first via tabs_context_mcp(createIfEmpty:true).`
       }] };
+    }
+    if (lockedToPrivate) {
+      // Honour the global lock. We still draw the human's attention via the
+      // taskbar/dock badge (drawAttention:true) but do NOT bring the window
+      // to the foreground - the whole point of the lock is to keep the human's
+      // current window in front.
+      try {
+        await chrome.windows.update(wid, { drawAttention: true });
+        return { content: [{ type: "text", text:
+          `Orellius is locked to private mode - flagged window ${wid} (session "${sid}") for attention in the taskbar but did NOT raise it. Run \`POST http://127.0.0.1:18766/admin/unlock\` to re-enable focus stealing.`
+        }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Locked to private; drawAttention failed: ${e.message}` }] };
+      }
     }
     try {
       await chrome.windows.update(wid, { focused: true, drawAttention: true });

@@ -124,6 +124,43 @@ Two IPC hops are needed because Chrome's native messaging API requires Chrome it
 - **Stale-server cleanup.** The MCP server writes a PID file and SIGTERMs orphaned predecessors before binding the port - restart Claude Code as often as you like.
 - **Local-only, no telemetry.** Everything runs over `localhost`. No outbound network from either the host process or the extension.
 
+### Global "force private" lock (v1.8.0+)
+
+Sometimes a Claude session ends up in **public** mode (window pops to the foreground on every input) and there's no Claude turn handy to flip it back. From any shell — even with no Claude session running — you can broadcast a lock that puts every Orellius instance into **private** mode and prevents any session from switching back to public:
+
+```bash
+# One command. POSIX shells, PowerShell, cmd.exe — all the same:
+curl -X POST http://127.0.0.1:18766/admin/force-private
+
+# Or use the wrapper scripts:
+scripts\orellius-private.cmd       # Windows (double-click works too)
+scripts\orellius-private.ps1       # PowerShell
+scripts/orellius-private.sh        # macOS / Linux
+
+# Or via npm:
+npm run force-private
+```
+
+While the lock is active:
+- `browser_mode("public")` from any session throws an error referencing the lock
+- `browser_show` only sets the taskbar drawAttention flag — no window raise
+- The new background-tab listener also minimises every owned window immediately so a session already running mid-action stops covering your foreground window
+
+Release it the same way:
+
+```bash
+curl -X POST http://127.0.0.1:18766/admin/unlock
+# or scripts/orellius-unlock.* / npm run unlock
+```
+
+Check the hub's view of the world:
+
+```bash
+curl http://127.0.0.1:18766/admin/status
+```
+
+The lock persists in `chrome.storage.local` so it survives extension reloads. The extension popup also shows the current lock state and has Force-private / Unlock buttons.
+
 ---
 
 ## Installation

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Orellius Browser Bridge",
-  "version": "1.6.2",
+  "version": "1.8.0",
   "description": "Unrestricted browser automation for Claude Code. No domain blocklist. Any Chromium browser.",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -13,10 +13,12 @@
     "tabGroups",
     "windows",
     "storage",
-    "alarms"
+    "alarms",
+    "system.display"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "http://127.0.0.1:18766/*"
   ],
   "background": {
     "service_worker": "background.js"
