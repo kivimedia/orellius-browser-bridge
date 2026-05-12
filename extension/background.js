@@ -449,27 +449,54 @@ async function handleAdminCloseTabs(msg) {
   const activeSessionIds = new Set(Array.isArray(msg.activeSessionIds) ? msg.activeSessionIds : []);
   log(`admin_close_tabs received: mode=${mode} active=${activeSessionIds.size} reason="${msg.reason || ""}"`);
 
-  // Snapshot sessionWindows because the closes mutate it via onRemoved.
-  const targets = [...sessionWindows.entries()];
+  // Authoritative source for Orellius-owned windows: tab groups labelled
+  // "🔒 Claude · {shortId}" (or legacy "MCP"). chrome.tabGroups state survives
+  // MV3 service-worker idle cycles whereas the in-memory sessionWindows Map
+  // does not. Querying by title is the only reliable way to find every owned
+  // window after a worker wake-up.
+  let groups = [];
+  try {
+    groups = await chrome.tabGroups.query({});
+  } catch (e) {
+    log(`admin_close_tabs: chrome.tabGroups.query failed: ${e.message}`);
+    return;
+  }
+  const orellGroups = groups.filter((g) => typeof g.title === "string" && (g.title.startsWith("🔒 Claude") || g.title === "MCP"));
+  log(`admin_close_tabs: found ${orellGroups.length} Orellius tab group(s)`);
+
+  // Build per-window target list. shortId is the first 8 chars of the owning
+  // sessionId (extracted from the group title) - we match it as a prefix
+  // against the hub's activeSessionIds list for mode=unused.
+  const targets = orellGroups.map((g) => {
+    const m = /Claude · ([a-f0-9]+)/.exec(g.title || "");
+    return { windowId: g.windowId, groupId: g.id, shortId: m ? m[1] : null };
+  });
+
   let closed = 0;
   let preserved = 0;
   let blockedByLock = 0;
 
-  for (const [sid, wid] of targets) {
-    // mode=unused: skip sessions that are still live.
-    if (mode === "unused" && activeSessionIds.has(sid)) {
-      preserved++;
-      continue;
+  for (const { windowId: wid, shortId } of targets) {
+    // mode=unused: skip windows whose session is still live. We only have the
+    // short prefix from the title, so check for any active sessionId starting
+    // with it.
+    if (mode === "unused" && shortId) {
+      const stillActive = [...activeSessionIds].some((sid) => sid.startsWith(shortId));
+      if (stillActive) {
+        preserved++;
+        log(`admin_close_tabs: preserving window ${wid} (session shortId=${shortId} is still active)`);
+        continue;
+      }
     }
 
-    // Honour locks from OTHER sessions - if any tab in this window is locked
-    // by a different active session, skip the close.
+    // Honour cross-session tab locks: if any tab in this window is held by an
+    // active session, skip - we don't want shutdown to nuke work in progress.
     let lockConflict = null;
     try {
       const tabs = await chrome.tabs.query({ windowId: wid });
       for (const t of tabs) {
         const lock = tabLocks.get(t.id);
-        if (lock && !isLockExpired(lock) && lock.sessionId !== sid && activeSessionIds.has(lock.sessionId)) {
+        if (lock && !isLockExpired(lock) && activeSessionIds.size > 0 && activeSessionIds.has(lock.sessionId)) {
           lockConflict = { tabId: t.id, lockedBy: lock.sessionId };
           break;
         }
@@ -479,20 +506,17 @@ async function handleAdminCloseTabs(msg) {
     }
     if (lockConflict) {
       blockedByLock++;
-      log(`admin_close_tabs: skipping window ${wid} (session ${sid}) - tab ${lockConflict.tabId} locked by active session ${lockConflict.lockedBy}`);
+      log(`admin_close_tabs: skipping window ${wid} - tab ${lockConflict.tabId} locked by active session ${lockConflict.lockedBy}`);
       continue;
     }
 
     try {
       await chrome.windows.remove(wid);
-      // onRemoved cleans sessionWindows, sessionGroups state. We also drop any
-      // stale tab locks held by this dead session.
-      for (const [tid, lock] of tabLocks) {
-        if (lock.sessionId === sid) tabLocks.delete(tid);
-      }
-      try { persistLocks(); } catch { /* tolerable */ }
       closed++;
-      log(`admin_close_tabs: closed window ${wid} (session ${sid})`);
+      log(`admin_close_tabs: closed window ${wid}`);
+      // Best-effort sessionWindows cleanup (the Map may be empty after a
+      // service-worker wake-up - that's fine, the close still happened).
+      for (const [sid, w] of sessionWindows) if (w === wid) sessionWindows.delete(sid);
     } catch (e) {
       log(`admin_close_tabs: failed to close window ${wid}: ${e.message}`);
     }
