@@ -161,6 +161,30 @@ curl http://127.0.0.1:18766/admin/status
 
 The lock persists in `chrome.storage.local` so it survives extension reloads. The extension popup also shows the current lock state and has Force-private / Unlock buttons.
 
+### Bulk window cleanup (v1.8.1+)
+
+Two more admin commands for managing accumulated Orellius windows across multiple Claude sessions:
+
+```bash
+# Close every window whose Claude session is no longer connected to the hub.
+# Currently-active sessions keep their tabs.
+curl -X POST http://127.0.0.1:18766/admin/close-unused
+
+# Close EVERY Orellius window. Connected MCP clients stay connected - their
+# next tabs_context_mcp({createIfEmpty:true}) call auto-creates a new window.
+curl -X POST http://127.0.0.1:18766/admin/shutdown
+```
+
+Wrappers:
+```
+scripts/orellius-close-unused.{cmd,ps1,sh}
+scripts/orellius-shutdown.{cmd,ps1,sh}
+npm run close-unused
+npm run shutdown
+```
+
+Locked tabs (`browser_lock`) are honoured: a window will NOT close if any tab inside is locked by a *different* active session. The extension logs `admin_close_tabs done: closed=N preserved=M blockedByLock=K` after each broadcast.
+
 ---
 
 ## Installation

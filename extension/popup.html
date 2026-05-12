@@ -140,6 +140,19 @@
     </div>
   </div>
 
+  <div class="card">
+    <div class="label">Close Orellius windows</div>
+    <div class="row">
+      <button id="closeUnused">Close unused only</button>
+      <button id="shutdownAll" class="danger">Close ALL (shutdown)</button>
+    </div>
+    <div class="footer" style="margin-top:8px">
+      <b>Close unused</b>: closes windows belonging to dead Claude sessions; live sessions keep their tabs.<br>
+      <b>Close all</b>: closes every Orellius window. Connected MCP clients stay - their next browser call auto-creates a new window.<br>
+      Shell equivalents: <code>curl -X POST :18766/admin/close-unused</code> · <code>:18766/admin/shutdown</code>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
   <script>
@@ -262,6 +275,28 @@
       } catch { /* hub may not be running */ }
       await refresh();
       toast("Unlocked");
+    });
+
+    document.getElementById("closeUnused").addEventListener("click", async () => {
+      if (!confirm("Close every Orellius window whose Claude session is no longer connected? Currently-active sessions keep their tabs.")) return;
+      try {
+        const res = await fetch("http://127.0.0.1:18766/admin/close-unused", { method: "POST" });
+        const body = await res.json();
+        toast(body.message ? body.message.slice(0, 80) : "Sent close-unused");
+      } catch (e) {
+        toast("Hub unreachable - is the hub running?");
+      }
+    });
+
+    document.getElementById("shutdownAll").addEventListener("click", async () => {
+      if (!confirm("Close every Orellius window? MCP clients stay connected - the next browser call will auto-create a new window. Continue?")) return;
+      try {
+        const res = await fetch("http://127.0.0.1:18766/admin/shutdown", { method: "POST" });
+        const body = await res.json();
+        toast(body.message ? body.message.slice(0, 80) : "Sent shutdown");
+      } catch (e) {
+        toast("Hub unreachable - is the hub running?");
+      }
     });
 
     refresh();

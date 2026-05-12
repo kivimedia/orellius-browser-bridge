@@ -105,6 +105,13 @@ function connectNativeHost() {
         });
         return;
       }
+      // Hub-originated tab/window cleanup (close-unused / shutdown CLI).
+      if (msg.type === "admin_close_tabs") {
+        handleAdminCloseTabs(msg).catch((err) => {
+          log(`admin_close_tabs failed: ${err.message}`);
+        });
+        return;
+      }
       if (msg.type === "tool_request" && msg.id) {
         const sid = msg.sessionId || null;
         log(`Tool request: ${msg.tool} (id: ${msg.id}, session: ${sid || "legacy"})`);
@@ -419,6 +426,79 @@ async function setPrivateLock(value) {
     await chrome.storage.local.set({ [PRIVATE_LOCK_STORAGE_KEY]: lockedToPrivate });
   }
   log(`lockedToPrivate set: ${lockedToPrivate}`);
+}
+
+// Handler for hub-originated admin_close_tabs messages.
+//
+// mode === "unused":
+//   The hub sends `activeSessionIds` listing every sessionId whose MCP client
+//   is currently connected. We close every owned window whose sessionId is
+//   NOT in that list - i.e. orphan windows from dead Claude sessions.
+//
+// mode === "all":
+//   Close every Orellius-owned window unconditionally. MCP clients stay
+//   connected; their next tabs_context_mcp({createIfEmpty:true}) recreates
+//   a fresh window via the existing graceful path.
+//
+// Locked tabs (browser_lock) are honoured - if a tab in a target window is
+// locked by a *different* active session than the window owner, we leave the
+// whole window alone and report the conflict in the log. This prevents
+// admin shutdown from blowing away work another session is in the middle of.
+async function handleAdminCloseTabs(msg) {
+  const mode = msg.mode === "all" ? "all" : "unused";
+  const activeSessionIds = new Set(Array.isArray(msg.activeSessionIds) ? msg.activeSessionIds : []);
+  log(`admin_close_tabs received: mode=${mode} active=${activeSessionIds.size} reason="${msg.reason || ""}"`);
+
+  // Snapshot sessionWindows because the closes mutate it via onRemoved.
+  const targets = [...sessionWindows.entries()];
+  let closed = 0;
+  let preserved = 0;
+  let blockedByLock = 0;
+
+  for (const [sid, wid] of targets) {
+    // mode=unused: skip sessions that are still live.
+    if (mode === "unused" && activeSessionIds.has(sid)) {
+      preserved++;
+      continue;
+    }
+
+    // Honour locks from OTHER sessions - if any tab in this window is locked
+    // by a different active session, skip the close.
+    let lockConflict = null;
+    try {
+      const tabs = await chrome.tabs.query({ windowId: wid });
+      for (const t of tabs) {
+        const lock = tabLocks.get(t.id);
+        if (lock && !isLockExpired(lock) && lock.sessionId !== sid && activeSessionIds.has(lock.sessionId)) {
+          lockConflict = { tabId: t.id, lockedBy: lock.sessionId };
+          break;
+        }
+      }
+    } catch (e) {
+      log(`admin_close_tabs: chrome.tabs.query failed for window ${wid}: ${e.message}`);
+    }
+    if (lockConflict) {
+      blockedByLock++;
+      log(`admin_close_tabs: skipping window ${wid} (session ${sid}) - tab ${lockConflict.tabId} locked by active session ${lockConflict.lockedBy}`);
+      continue;
+    }
+
+    try {
+      await chrome.windows.remove(wid);
+      // onRemoved cleans sessionWindows, sessionGroups state. We also drop any
+      // stale tab locks held by this dead session.
+      for (const [tid, lock] of tabLocks) {
+        if (lock.sessionId === sid) tabLocks.delete(tid);
+      }
+      try { persistLocks(); } catch { /* tolerable */ }
+      closed++;
+      log(`admin_close_tabs: closed window ${wid} (session ${sid})`);
+    } catch (e) {
+      log(`admin_close_tabs: failed to close window ${wid}: ${e.message}`);
+    }
+  }
+
+  log(`admin_close_tabs done: closed=${closed} preserved=${preserved} blockedByLock=${blockedByLock}`);
 }
 
 // Handler for hub-originated admin_set_mode messages (POST /admin/force-private

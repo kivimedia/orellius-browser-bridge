@@ -378,11 +378,70 @@ const adminServer = http.createServer((req, res) => {
     return;
   }
 
+  // POST /admin/close-unused
+  //
+  // Close every Orellius-owned window whose sessionId is NOT in the hub's
+  // active mcpClients map. Currently-active Claude sessions keep their tabs;
+  // orphan sessions get reaped. Useful when you've accumulated multiple
+  // Orellius windows over several Claude conversations and only one is still
+  // wired up.
+  if (req.method === "POST" && url.pathname === "/admin/close-unused") {
+    const activeSessionIds = [...mcpClients.keys()];
+    const delivered = broadcastAdminMessage({
+      type: "admin_close_tabs",
+      mode: "unused",
+      activeSessionIds,
+      reason: "close-unused CLI",
+    });
+    log(`/admin/close-unused broadcast delivered to ${delivered} native_host(s) (preserving ${activeSessionIds.length} active session(s))`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      delivered,
+      activeSessionCount: activeSessionIds.length,
+      message: delivered > 0
+        ? `Sent close-unused to ${delivered} browser native_host(s). ${activeSessionIds.length} active Claude session(s) keep their tabs; orphan sessions are being closed.`
+        : "No browser extensions are currently connected to the hub. No-op.",
+    }));
+    return;
+  }
+
+  // POST /admin/shutdown
+  //
+  // Close EVERY Orellius-owned window. MCP clients stay connected to the hub;
+  // their next tabs_context_mcp({createIfEmpty:true}) auto-recreates a fresh
+  // window. Useful when you want a clean slate without restarting any Claude
+  // conversation.
+  if (req.method === "POST" && url.pathname === "/admin/shutdown") {
+    const delivered = broadcastAdminMessage({
+      type: "admin_close_tabs",
+      mode: "all",
+      reason: "shutdown CLI",
+    });
+    log(`/admin/shutdown broadcast delivered to ${delivered} native_host(s)`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      delivered,
+      mcpClientCount: mcpClients.size,
+      message: delivered > 0
+        ? `Sent shutdown to ${delivered} browser native_host(s). All Orellius windows are being closed. ${mcpClients.size} MCP client(s) remain connected to the hub; the next tabs_context_mcp({createIfEmpty:true}) call will spawn a fresh window.`
+        : "No browser extensions are currently connected to the hub. No-op.",
+    }));
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
     ok: false,
     error: "Unknown admin endpoint",
-    available: ["GET /admin/status", "POST /admin/force-private", "POST /admin/unlock"],
+    available: [
+      "GET /admin/status",
+      "POST /admin/force-private",
+      "POST /admin/unlock",
+      "POST /admin/close-unused",
+      "POST /admin/shutdown",
+    ],
   }));
 });
 
@@ -415,5 +474,5 @@ server.listen(TCP_PORT, "127.0.0.1", () => {
 });
 
 adminServer.listen(ADMIN_HTTP_PORT, "127.0.0.1", () => {
-  log(`Admin HTTP listening on 127.0.0.1:${ADMIN_HTTP_PORT} (POST /admin/force-private, /admin/unlock, GET /admin/status)`);
+  log(`Admin HTTP listening on 127.0.0.1:${ADMIN_HTTP_PORT} (POST /admin/{force-private,unlock,close-unused,shutdown}, GET /admin/status)`);
 });
