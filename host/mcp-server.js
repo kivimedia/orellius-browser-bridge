@@ -82,10 +82,15 @@ function sendToExtension(tool, args) {
       return;
     }
     const id = `${SESSION_ID}_${++requestIdCounter}`;
+    // Per-tool timeout: video export (ffmpeg encoding) can take minutes for
+    // long recordings, so bump it to 5min. Default 60s for everything else.
+    const isVideoExport = (tool === "gif_creator" || tool === "record_video")
+      && args && args.action === "export";
+    const timeoutMs = isVideoExport ? 300000 : 60000;
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
-    }, 60000);
+      reject(new Error(`Tool request timed out after ${timeoutMs / 1000}s`));
+    }, timeoutMs);
     pendingRequests.set(id, { resolve, reject, timer });
     // Tag with target browser so the hub routes to the right native_host.
     // This is the multi-browser routing key (chromium vs firefox).
@@ -407,6 +412,7 @@ server.tool(
     start_coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The starting coordinates for `left_click_drag`."),
     text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all).'),
     savePath: z.string().optional().describe('For `screenshot` and `zoom` actions: optional absolute path to write the captured JPEG to disk (e.g. "C:/Users/raviv/Downloads/grab.png"). When set, the screenshot is also saved as a file alongside the inline image so downstream tools (PIL, ffmpeg, annotate scripts) can consume it. The action still returns the inline image to the LLM as usual. Parent directory must exist; the file is overwritten if present. Ignored for non-capture actions.'),
+    fullPage: z.boolean().optional().describe("For `screenshot` only: capture the entire scrollable page in one image instead of the viewport. Uses CDP Page.captureScreenshot with captureBeyondViewport. Useful on long forms (Meta Ads Manager, Stripe dashboards, Notion docs) where every action button isn't visible at once. Default false. Skips the captureVisibleTab fallback - if CDP is unavailable on the tab, the call will error rather than degrade to a viewport crop. JPEG size cap is raised from 500KB to 1.5MB before re-encoding kicks in."),
   },
   async (args) => {
     const result = await callTool("computer", args);
@@ -493,6 +499,50 @@ server.tool(
       return {
         content: [
           { type: "text", text: `WARNING: write failed: ${err.message}. Screenshot was found in cache but not saved.` },
+        ],
+      };
+    }
+  }
+);
+
+// 4c. screenshot_scroll_stitch
+server.tool(
+  "screenshot_scroll_stitch",
+  "Capture a full-page screenshot by scrolling through the document, taking one viewport-sized capture per scroll position, and stitching the slices into a single image. Use this instead of `computer({action:\"screenshot\", fullPage:true})` when the page uses lazy-loading, virtual scrolling (react-window/react-virtualized), or otherwise only renders content as it scrolls into view - those pages return mostly-blank slices when CDP captureBeyondViewport is used because the off-screen DOM never got rendered. Slower than fullPage (one CDP capture per viewport-tall slice + a stitch step), but actually correct for lazy content. Chromium-only (uses CDP).",
+  {
+    tabId: z.number().describe("Tab ID to capture. Must be a tab in the current group."),
+    format: z.enum(["jpeg", "png"]).optional().describe("Output image format. Default 'jpeg' (smaller files); use 'png' for lossless output (much larger)."),
+    quality: z.number().int().min(1).max(100).optional().describe("JPEG quality 1-100 (default 80). Ignored for PNG."),
+    max_height: z.number().int().min(500).max(60000).optional().describe("Safety cap on total document height in CSS pixels (default 30000, hard ceiling 60000). Pages taller than this are truncated at the bottom (you still get the top max_height pixels). Big numbers consume serious memory at the stitch step."),
+    hide_sticky: z.boolean().optional().describe("Default true. Hides any element with computed `position:fixed` or `position:sticky` during capture so headers/footers/CTA bars don't ghost across slices. Restored after capture."),
+    hide_selectors: z.array(z.string()).optional().describe("Extra CSS selectors to hide during capture (e.g. cookie banners, chat widgets, screen recorder pills). Hidden via `style.visibility = 'hidden'` and restored after capture."),
+    scroll_delay_ms: z.number().int().min(50).max(5000).optional().describe("Pause between scrolling and capturing each slice, to let lazy content render (default 250ms). Bump higher for slow image-heavy pages."),
+    savePath: z.string().optional().describe("Optional absolute path to write the stitched image to disk (e.g. \"C:/Users/raviv/Downloads/full-page.png\"). Parent directory must exist; file is overwritten."),
+  },
+  async (args) => {
+    const result = await callTool("screenshot_scroll_stitch", args);
+    if (!args || !args.savePath) return result;
+    if (!result || !Array.isArray(result.content)) return result;
+    const imageBlock = result.content.find((b) => b && b.type === "image" && typeof b.data === "string");
+    if (!imageBlock) return result; // extension reported failure - propagate
+    try {
+      const buf = Buffer.from(imageBlock.data, "base64");
+      const dir = path.dirname(args.savePath);
+      if (!fs.existsSync(dir)) throw new Error(`Parent directory does not exist: ${dir}`);
+      fs.writeFileSync(args.savePath, buf);
+      return {
+        ...result,
+        content: [
+          ...result.content,
+          { type: "text", text: `Saved stitched screenshot to ${args.savePath} (${buf.length} bytes, ${imageBlock.mimeType || `image/${args.format || "jpeg"}`}).` },
+        ],
+      };
+    } catch (err) {
+      return {
+        ...result,
+        content: [
+          ...result.content,
+          { type: "text", text: `WARNING: savePath was set but write failed: ${err.message}. Inline image is still returned above.` },
         ],
       };
     }
@@ -634,10 +684,13 @@ server.tool(
 // 13. resize_window
 server.tool(
   "resize_window",
-  "Resize the current browser window to specified dimensions. Useful for testing responsive designs or setting up specific screen sizes. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Resize the current browser window. Auto-repositions the window so the resulting bounds fit inside the display's work area (Chrome enforces a >=50%-on-screen rule on chrome.windows.update; without this, requesting a bigger size at the current top-left often pushes the window off-screen and Chrome rejects it). Pass `left`/`top` to position explicitly, or `maximize:true` to skip width/height and snap to the OS work area.",
   {
-    width: z.number().describe("Target window width in pixels"),
-    height: z.number().describe("Target window height in pixels"),
+    width: z.number().optional().describe("Target window width in pixels. Required unless maximize:true."),
+    height: z.number().optional().describe("Target window height in pixels. Required unless maximize:true."),
+    left: z.number().int().optional().describe("Optional new left (X) position in screen pixels. If omitted, window is auto-clamped onto its current display."),
+    top: z.number().int().optional().describe("Optional new top (Y) position in screen pixels. If omitted, window is auto-clamped onto its current display."),
+    maximize: z.boolean().optional().describe("If true, set windowState to 'maximized' (fills the OS work area) and ignore width/height/left/top."),
     tabId: z.number().describe("Tab ID to get the window for. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("resize_window", args)
@@ -863,11 +916,12 @@ server.tool(
 // 22. browser_lock
 server.tool(
   "browser_lock",
-  "Claim exclusive access to a tab so other Claude Code sessions sharing this Orellius extension cannot interfere. Every subsequent tool call from this session extends the lock (heartbeat). Useful when two VS Code windows are both driving the same browser and racing on CDP commands. If the tab is already locked by another session, this fails unless force:true is passed.",
+  "Claim exclusive access to a tab so other Claude Code sessions sharing this Orellius extension cannot interfere. Every subsequent tool call from this session extends the lock (heartbeat). Useful when two VS Code windows are both driving the same browser and racing on CDP commands. Re-claiming an EXPIRED foreign lock is free. Re-claiming an ACTIVE foreign lock requires the human-known override_pin (visible by clicking the extension icon) - force:true alone no longer bypasses, since that allowed misbehaving sessions to silently steal tabs.",
   {
     tabId: z.number().describe("Tab ID to lock."),
     ttl_seconds: z.number().optional().describe("How long the lock stays active without activity (30-3600, default 600). Operations by the owning session extend this automatically."),
-    force: z.boolean().optional().describe("Break an existing lock held by another session. Use only when certain the other session has crashed or finished."),
+    force: z.boolean().optional().describe("DEPRECATED for cross-session takeover. No longer sufficient on an active foreign lock - use override_pin instead."),
+    override_pin: z.string().optional().describe("Human-known 6-digit override PIN. Required to take over a tab actively locked by another session. The human can read the current PIN by clicking the Orellius extension icon and rotate it from the same popup."),
   },
   async (args) => callTool("browser_lock", args)
 );
@@ -875,10 +929,11 @@ server.tool(
 // 23. browser_unlock
 server.tool(
   "browser_unlock",
-  "Release a tab lock claimed via browser_lock. Call this when done with exclusive access so other sessions can operate on the tab.",
+  "Release a tab lock claimed via browser_lock. Call this when done with exclusive access so other sessions can operate on the tab. Breaking a lock held by another active session requires override_pin (force:true is no longer sufficient).",
   {
     tabId: z.number().describe("Tab ID to unlock."),
-    force: z.boolean().optional().describe("Break a lock held by another session. Use only when certain the other session has crashed."),
+    force: z.boolean().optional().describe("DEPRECATED for breaking another session's lock - use override_pin instead."),
+    override_pin: z.string().optional().describe("Human-known 6-digit override PIN. Required to break a foreign session's active lock. Visible by clicking the Orellius extension icon."),
   },
   async (args) => callTool("browser_unlock", args)
 );
@@ -930,10 +985,11 @@ server.tool(
 // 28. tabs_close_mcp
 server.tool(
   "tabs_close_mcp",
-  "Close a single tab from the calling session's MCP group. Use when you're done with a specific page mid-conversation and want to keep the workspace tidy. Refuses to close a tab held by browser_lock from another session unless force:true. Other tabs in the session's window remain open.",
+  "Close a single tab from the calling session's MCP group. Use when you're done with a specific page mid-conversation and want to keep the workspace tidy. Closing a tab held by browser_lock from a DIFFERENT active session requires override_pin (force:true alone no longer bypasses). Other tabs in the session's window remain open.",
   {
     tabId: z.number().describe("Tab ID to close. Must be inside the session's MCP tab group."),
-    force: z.boolean().optional().describe("Close even if another session holds a browser_lock on this tab."),
+    force: z.boolean().optional().describe("DEPRECATED for cross-session closes - use override_pin instead."),
+    override_pin: z.string().optional().describe("Human-known 6-digit override PIN. Required to close a tab actively locked by another session. Visible by clicking the Orellius extension icon."),
   },
   async (args) => callTool("tabs_close_mcp", args)
 );
@@ -941,9 +997,10 @@ server.tool(
 // 29. session_end
 server.tool(
   "session_end",
-  "End the current session: close every tab in the session's owned Chrome window, close the window, drop the session's window claim. Call this proactively when the conversation is wrapping up and you know the browser work is finished - it prevents orphan windows from piling up across many Claude Code conversations. Refuses if any tab is locked by a different session unless force:true. Safe to call when no window is owned (returns a no-op message). After session_end, calling another browser tool will create a fresh window via tabs_context_mcp(createIfEmpty:true).",
+  "End the current session: close every tab in the session's owned Chrome window, close the window, drop the session's window claim. Call this proactively when the conversation is wrapping up and you know the browser work is finished - it prevents orphan windows from piling up across many Claude Code conversations. If any tab in the session's window is locked by a DIFFERENT active session, the call requires override_pin (force:true alone no longer bypasses). Safe to call when no window is owned (returns a no-op message). After session_end, calling another browser tool will create a fresh window via tabs_context_mcp(createIfEmpty:true).",
   {
-    force: z.boolean().optional().describe("End the session even if other sessions hold browser_locks on tabs in this window."),
+    force: z.boolean().optional().describe("DEPRECATED for cross-session blockers - use override_pin instead."),
+    override_pin: z.string().optional().describe("Human-known 6-digit override PIN. Required when other sessions still hold locks on tabs in this window. Visible by clicking the Orellius extension icon."),
   },
   async (args) => callTool("session_end", args)
 );

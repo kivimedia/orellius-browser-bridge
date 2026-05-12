@@ -247,13 +247,72 @@ function findFfmpeg() {
 
 async function handleVrecMessage(msg) {
   switch (msg.type) {
-    case "vrec_begin": return vrecBegin(msg);
-    case "vrec_frame": return vrecFrame(msg);
-    case "vrec_end":   return vrecEnd(msg);
-    case "vrec_abort": return vrecAbort(msg);
+    case "vrec_begin":    return vrecBegin(msg);
+    case "vrec_frame":    return vrecFrame(msg);
+    case "vrec_end":      return vrecEnd(msg);       // legacy: pre-B1 export-time pipeline
+    case "vrec_finalize": return vrecFinalize(msg);  // B1: stream-during-capture closer
+    case "vrec_abort":    return vrecAbort(msg);
     default:
       throw new Error(`Unknown vrec message: ${msg.type}`);
   }
+}
+
+// vrec_finalize is the B1 streaming-pipeline closer. Frames have already been
+// streamed in via per-frame vrec_frame messages during capture. The extension
+// calls this with the real savePath/format/fps once recording stops; we
+// override what was guessed at vrec_begin time, finalize the manifest, and
+// run ffmpeg.
+async function vrecFinalize(msg) {
+  const { requestId, recordingId, fps, savePath, format } = msg;
+  const rec = recordings.get(recordingId);
+  if (!rec) throw new Error(`vrec_finalize: unknown recordingId ${recordingId}`);
+
+  if (fps) rec.fps = fps;
+  if (savePath) rec.savePath = savePath;
+  if (format) rec.format = format;
+
+  // Recompute extension from new format if savePath was generic
+  if (!savePath && format) {
+    rec.savePath = rec.savePath.replace(/\.[a-z0-9]+$/i, "." + format);
+  }
+
+  log(`vrec_finalize ${recordingId}: ${rec.frameIndex} frames, fps=${rec.fps}, format=${rec.format}, savePath=${rec.savePath}`);
+
+  // Reuse vrec_end's path - same finalize logic, just emit a different reply
+  // type so the extension's correlation knows which message resolved.
+  const tailDur = (1 / Math.max(1, rec.fps)).toFixed(4);
+  if (rec.frameIndex === 0) {
+    recordings.delete(recordingId);
+    cleanupTempDir(rec.tempDir);
+    throw new Error("No frames received during capture - the extension never sent vrec_frame messages");
+  }
+  const lastFname = `frame_${String(rec.frameIndex - 1).padStart(6, "0")}.jpg`;
+  await rec.manifestFd.write(`duration ${tailDur}\n`);
+  await rec.manifestFd.write(`file '${lastFname}'\n`);
+  await rec.manifestFd.close();
+
+  await fs.promises.mkdir(path.dirname(rec.savePath), { recursive: true });
+
+  const args = buildFfmpegArgs(rec);
+  const ffPath = await runFfmpegAttempt(args, rec);
+
+  const stat = await fs.promises.stat(rec.savePath);
+  if (stat.size === 0) throw new Error("ffmpeg produced empty file");
+
+  recordings.delete(recordingId);
+  cleanupTempDir(rec.tempDir);
+
+  log(`vrec_finalize ${recordingId} OK: ${rec.frameIndex} frames -> ${rec.savePath} (${stat.size}b) via ${ffPath}`);
+  writeNativeMessage({
+    type: "vrec_finalize_ok",
+    requestId,
+    recordingId,
+    savePath: rec.savePath,
+    fileSize: stat.size,
+    frameCount: rec.frameIndex,
+    durationSec: rec.lastFrameRelTs != null ? rec.lastFrameRelTs / 1000 : null,
+    ffmpegPath: ffPath,
+  });
 }
 
 async function vrecBegin(msg) {

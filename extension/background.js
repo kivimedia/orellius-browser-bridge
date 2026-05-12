@@ -542,6 +542,124 @@ function isLockExpired(lock) {
   return !lock || lock.expiresAt <= nowMs();
 }
 
+// Override PIN: a short numeric secret the human can read/set from the extension
+// popup. Required (instead of force:true) when one Claude session needs to break
+// a lock owned by *another* still-live session.
+//
+// Two-layer protection so a malicious or stale session can't free-ride on the
+// PIN even if it somehow learns the value:
+//   Layer 1: secrecy. PIN lives only in chrome.storage; agents have no tool to
+//            read it. Human types it into chat once they've read it from the popup.
+//   Layer 2: per-session binding. The FIRST session to successfully use the PIN
+//            claims it. Other sessions presenting the same correct PIN are
+//            REJECTED until the human clears the binding (or rotates the PIN)
+//            via the popup. This is the protection against another VS Code
+//            "trying" the PIN behind your back.
+//
+// Default seed is "123456" so the human always knows the starting value. They
+// can change it (or rotate to a random 6 digits) via the popup. The migration
+// flag ensures we only force-seed once - subsequent restarts respect whatever
+// the human has set.
+const OVERRIDE_PIN_STORAGE_KEY = "orellius_override_pin_v1";
+const PIN_MIGRATION_KEY = "orellius_pin_migration_v2"; // bump key to re-seed
+const PIN_BINDING_STORAGE_KEY = "orellius_pin_binding_v1";
+const DEFAULT_OVERRIDE_PIN = "123456";
+let OVERRIDE_PIN = null;
+let pinSessionBinding = null; // { sessionId, claimedAt } or null
+
+function generatePin() {
+  // 6 digits, zero-padded. Cryptographically random.
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return String(buf[0] % 1000000).padStart(6, "0");
+}
+
+async function loadOrInitOverridePin() {
+  try {
+    const data = await chrome.storage.local.get([OVERRIDE_PIN_STORAGE_KEY, PIN_MIGRATION_KEY, PIN_BINDING_STORAGE_KEY]);
+    let pin = data[OVERRIDE_PIN_STORAGE_KEY];
+    const migrated = !!data[PIN_MIGRATION_KEY];
+    if (!migrated) {
+      // First run on this version: seed PIN to a known default value the human
+      // can predict. Subsequent runs respect whatever the human has set.
+      pin = DEFAULT_OVERRIDE_PIN;
+      await chrome.storage.local.set({
+        [OVERRIDE_PIN_STORAGE_KEY]: pin,
+        [PIN_MIGRATION_KEY]: true,
+      });
+      // Also clear any stale binding from before this migration.
+      await chrome.storage.local.remove(PIN_BINDING_STORAGE_KEY);
+      log(`Seeded override PIN to default. Change it from the extension popup.`);
+    } else if (!pin || !/^\d{4,8}$/.test(String(pin))) {
+      pin = DEFAULT_OVERRIDE_PIN;
+      await chrome.storage.local.set({ [OVERRIDE_PIN_STORAGE_KEY]: pin });
+    }
+    OVERRIDE_PIN = String(pin);
+    pinSessionBinding = data[PIN_BINDING_STORAGE_KEY] || null;
+    log(`Override PIN loaded. Binding: ${pinSessionBinding ? `claimed by "${pinSessionBinding.sessionId}"` : "unbound"}.`);
+  } catch (e) {
+    log(`loadOrInitOverridePin failed: ${e.message}`);
+  }
+}
+
+async function persistPinBinding() {
+  try {
+    if (pinSessionBinding) {
+      await chrome.storage.local.set({ [PIN_BINDING_STORAGE_KEY]: pinSessionBinding });
+    } else {
+      await chrome.storage.local.remove(PIN_BINDING_STORAGE_KEY);
+    }
+  } catch (e) {
+    log(`persistPinBinding failed: ${e.message}`);
+  }
+}
+
+// Listen for popup-driven changes (PIN rotated/customized, binding cleared) so
+// the in-memory state stays in sync without requiring a service worker reload.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes[OVERRIDE_PIN_STORAGE_KEY]) {
+    OVERRIDE_PIN = String(changes[OVERRIDE_PIN_STORAGE_KEY].newValue || "");
+    log(`Override PIN updated via popup (length=${OVERRIDE_PIN.length}).`);
+    // PIN change always invalidates any prior binding.
+    pinSessionBinding = null;
+    chrome.storage.local.remove(PIN_BINDING_STORAGE_KEY);
+  }
+  if (changes[PIN_BINDING_STORAGE_KEY]) {
+    pinSessionBinding = changes[PIN_BINDING_STORAGE_KEY].newValue || null;
+    log(`PIN binding updated: ${pinSessionBinding ? `claimed by "${pinSessionBinding.sessionId}"` : "cleared"}.`);
+  }
+});
+
+// Validate a supplied override_pin AND enforce per-session binding.
+// Returns { ok: true } on success (and silently claims the binding for this
+// session if no prior binding existed). Returns { ok: false, reason: "..." }
+// on any failure - the reason is surfaced to the agent's response so the
+// human knows what went wrong.
+function isOverridePinValid(supplied, sessionId) {
+  if (!OVERRIDE_PIN) return { ok: false, reason: "Override PIN is not initialized in the extension." };
+  if (typeof supplied !== "string" && typeof supplied !== "number") {
+    return { ok: false, reason: "override_pin missing - the human can read the current PIN by clicking the extension icon." };
+  }
+  if (String(supplied) !== OVERRIDE_PIN) {
+    return { ok: false, reason: "override_pin does not match the value stored in the extension. The human can read the current value by clicking the extension icon." };
+  }
+  const sid = sessionId || "legacy";
+  if (!pinSessionBinding) {
+    pinSessionBinding = { sessionId: sid, claimedAt: nowMs() };
+    persistPinBinding();
+    log(`PIN claimed by session "${sid}".`);
+    return { ok: true, claimed: true };
+  }
+  if (pinSessionBinding.sessionId !== sid) {
+    return { ok: false, reason:
+      `Override PIN was already claimed by session "${pinSessionBinding.sessionId}" and cannot be reused by another session. ` +
+      `To release, the human must click the extension icon and either Clear Binding or Rotate PIN.`
+    };
+  }
+  return { ok: true };
+}
+
 async function persistLocks() {
   try {
     const obj = {};
@@ -582,8 +700,9 @@ function ensureLockOwnedByCurrentSession(tabId) {
     const remainingSec = Math.ceil((lock.expiresAt - nowMs()) / 1000);
     throw new Error(
       `Tab ${tabId} is locked by session "${lock.sessionId}" for another ${remainingSec}s. ` +
-      `The owning Claude Code session is still active. Wait for it to finish or ` +
-      `call browser_unlock with force:true to override.`
+      `The owning Claude Code session is still active. Wait for it to finish, or ` +
+      `call browser_unlock with override_pin:"<6-digit PIN>" to break it (the human ` +
+      `can read the PIN by clicking the Orellius extension icon).`
     );
   }
   // Heartbeat: extend expiry if less than HEARTBEAT_EXTEND_MS remains.
@@ -862,16 +981,30 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (method === "Page.screencastFrame" && params && params.data) {
     const r = recordingState.get(tabId);
     if (r && r.status === "recording") {
-      r.frames.push({
-        relTs: Date.now() - r.startedAt,
-        base64: params.data,
-      });
+      const relTs = Date.now() - r.startedAt;
       // Capture-resolution metadata: needed to map mouseLog (CSS px) onto
       // composited frames since the screencast may downscale.
       if (params.metadata) {
         r.capturedW = params.metadata.deviceWidth || r.capturedW;
         r.capturedH = params.metadata.deviceHeight || r.capturedH;
       }
+      const idx = r.streamFrameIndex++;
+      if (idx < 3 || idx % 25 === 0) log(`vrec frame ${idx} arrived: cap=${r.capturedW}x${r.capturedH} relTs=${relTs}`);
+
+      // B1: stream-during-capture, SERIALIZED. Each frame is enqueued and
+      // drained by a single worker so we never have 30 parallel composite+
+      // send chains saturating the SW. The worker chain uses fire-and-forget
+      // semantics relative to this listener (we don't await it here) so the
+      // listener returns immediately and CDP keeps acking promptly.
+      r.frameQueue = r.frameQueue || [];
+      r.frameQueue.push({
+        idx,
+        relTs,
+        base64: params.data,
+        cursor: r.showClickIndicators ? cursorAt(r.mouseLog, relTs) : null,
+        clicks: r.showClickIndicators ? clicksWindow(r.mouseLog, relTs) : [],
+      });
+      vrecKickWorker(tabId);
     }
     // Always ack so CDP keeps streaming, even if we've stopped buffering
     // (e.g. recording was cleared but a final frame is in flight).
@@ -948,31 +1081,92 @@ async function resolveRefToCoordinates(tabId, ref) {
 const MAX_SCREENSHOT_WIDTH = 1280;
 const MAX_SCREENSHOT_HEIGHT = 800;
 
-async function takeScreenshot(tabId) {
+async function takeScreenshot(tabId, opts = {}) {
   // Always refocus the target before capture. Some pages trigger focus-
   // stealing side effects (Radix portals, Google Sign-In iframes, etc.) that
   // make the CDP path refuse subsequent commands.
   await focusTabForInput(tabId);
 
-  // Try CDP first (faster, supports beyondViewport). If attach OR the command
-  // fails, drop straight through to the captureVisibleTab fallback. Wrapping
-  // both attach and sendCommand in the try is critical - on this-tab-is-
-  // another-extension errors, the attach itself throws before any command
-  // runs, so leaving ensureAttached outside the try skips the fallback.
+  const fullPage = !!opts.fullPage;
+
+  // Full-page mode: CDP-only (captureVisibleTab can't go beyond viewport).
+  // If CDP fails here, surface the error rather than degrading to a viewport
+  // crop, since the caller specifically asked for the whole page.
   let base64;
   let cdpError = null;
+  let metricsOverridden = false;
   try {
     await ensureAttached(tabId);
+
+    if (fullPage) {
+      // Apps like Meta Ads Manager keep the document body locked to viewport
+      // height and put their own scroll inside a flex container, so plain
+      // captureBeyondViewport returns just the visible window. The fix is to
+      // detect the tallest scrollable container, then resize the layout
+      // viewport to match — which forces React to lay out the entire area
+      // before we capture. Restored in the finally block.
+      const probe = await retriableCdp(tabId, "Runtime.evaluate", {
+        expression: `(() => {
+          const docH = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+          const docW = Math.max(document.body.scrollWidth, document.documentElement.scrollWidth, window.innerWidth);
+          let maxInnerH = 0;
+          for (const el of document.querySelectorAll('*')) {
+            const s = getComputedStyle(el);
+            if ((s.overflowY === 'auto' || s.overflowY === 'scroll') &&
+                el.scrollHeight > el.clientHeight && el.clientHeight > 100) {
+              if (el.scrollHeight > maxInnerH) maxInnerH = el.scrollHeight;
+            }
+          }
+          return JSON.stringify({ docH, docW, maxInnerH, vh: window.innerHeight, vw: window.innerWidth });
+        })()`,
+        returnByValue: true,
+      });
+      const dims = JSON.parse(probe?.result?.value || "{}");
+      const targetH = Math.max(dims.docH || 0, dims.maxInnerH || 0, dims.vh || 0);
+      const targetW = Math.max(dims.docW || 0, dims.vw || 0);
+      // Cap at 16384 (CDP/Skia limit). If a page is taller than that, we capture
+      // the top portion and accept the truncation rather than fail.
+      const safeH = Math.min(targetH, 16384);
+      const safeW = Math.min(targetW, 4096);
+      log(`fullPage: probed inner=${dims.maxInnerH} doc=${dims.docH} → forcing ${safeW}x${safeH}`);
+      try {
+        await retriableCdp(tabId, "Emulation.setDeviceMetricsOverride", {
+          width: safeW,
+          height: safeH,
+          deviceScaleFactor: 1,
+          mobile: false,
+        });
+        metricsOverridden = true;
+        // Brief settle so React reflows the now-giant viewport.
+        await sleep(300);
+      } catch (e) {
+        log(`Emulation.setDeviceMetricsOverride failed: ${e.message}; falling back to plain captureBeyondViewport`);
+      }
+    }
+
     const result = await retriableCdp(tabId, "Page.captureScreenshot", {
       format: "jpeg",
-      quality: 55,
+      quality: fullPage ? 50 : 55,
       optimizeForSpeed: true,
-      captureBeyondViewport: false,
+      captureBeyondViewport: fullPage,
     });
     base64 = result.data;
   } catch (err) {
     cdpError = err;
+    if (fullPage) {
+      // Try to restore even on error before surfacing.
+      if (metricsOverridden) {
+        try { await cdp(tabId, "Emulation.clearDeviceMetricsOverride", {}); } catch {}
+      }
+      throw new Error(`Full-page screenshot requires CDP and it failed: ${err.message}. Try fullPage:false.`);
+    }
     log(`Page.captureScreenshot path failed (${err.message}); attempting tabs.captureVisibleTab fallback.`);
+  } finally {
+    if (metricsOverridden) {
+      try { await cdp(tabId, "Emulation.clearDeviceMetricsOverride", {}); } catch (e) {
+        log(`clearDeviceMetricsOverride failed: ${e.message}`);
+      }
+    }
   }
 
   // Fallback path when CDP refuses this tab (typical post-popover state).
@@ -980,7 +1174,8 @@ async function takeScreenshot(tabId) {
   // debugger attachment, so it still works after a CDP detach. Retry with
   // refocus between attempts - if another extension is stealing focus, we
   // might need several tries to land a capture while our tab has focus.
-  if (!base64) {
+  // Skipped in fullPage mode (the API doesn't support beyond-viewport).
+  if (!base64 && !fullPage) {
     let fallbackErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -1004,13 +1199,16 @@ async function takeScreenshot(tabId) {
     }
   }
 
-  // If still too large (>500KB base64 ≈ ~375KB binary), reduce quality further
-  if (base64.length > 500000) {
+  // If still too large (>500KB base64 ≈ ~375KB binary), reduce quality further.
+  // Full-page captures of long pages routinely blow past this; allow up to
+  // 1.5MB before re-encoding so we don't quality-crush them needlessly.
+  const sizeLimit = fullPage ? 1_500_000 : 500_000;
+  if (base64.length > sizeLimit) {
     const smaller = await retriableCdp(tabId, "Page.captureScreenshot", {
       format: "jpeg",
-      quality: 30,
+      quality: fullPage ? 35 : 30,
       optimizeForSpeed: true,
-      captureBeyondViewport: false,
+      captureBeyondViewport: fullPage,
     }).catch(() => null);
     if (smaller?.data) base64 = smaller.data;
   }
@@ -1145,6 +1343,55 @@ function logMouseEvent(tabId, ev) {
   r.mouseLog.push({ ...ev, t: Date.now() - r.startedAt });
 }
 
+// Per-tab serialized frame worker. Drains r.frameQueue one at a time so we
+// never have multiple compositeFrame() + sendVrecToHost() chains running in
+// parallel (which would saturate the SW and cause stop_recording to hang).
+function vrecKickWorker(tabId) {
+  const r = recordingState.get(tabId);
+  if (!r || r._workerRunning) return;
+  r._workerRunning = true;
+  (async () => {
+    try {
+      while (r.frameQueue && r.frameQueue.length > 0) {
+        const fr = r.frameQueue.shift();
+        try {
+          const composited = await compositeFrame({
+            frameBase64: fr.base64,
+            capturedW: r.capturedW || r.outW,
+            capturedH: r.capturedH || r.outH,
+            outW: r.outW,
+            outH: r.outH,
+            cursor: fr.cursor,
+            clicks: fr.clicks,
+            showProgressBar: false,
+            progressFrac: 0,
+            showWatermark: r.showWatermark,
+          });
+          await sendVrecToHost({
+            type: "vrec_frame",
+            recordingId: r.recordingId,
+            base64: composited,
+            relTs: fr.relTs,
+          }, { timeoutMs: 30000 });
+          r.streamSentCount = (r.streamSentCount || 0) + 1;
+          if (fr.idx < 3 || fr.idx % 25 === 0) {
+            log(`vrec frame ${fr.idx} written (sent=${r.streamSentCount}, queue=${r.frameQueue.length})`);
+          }
+        } catch (e) {
+          r.streamSendErrors = (r.streamSendErrors || 0) + 1;
+          if (r.streamSendErrors <= 3 || r.streamSendErrors % 25 === 0) {
+            log(`vrec frame ${fr.idx} FAILED: ${e.message}`);
+          }
+        }
+      }
+    } finally {
+      r._workerRunning = false;
+      // If new frames arrived while we were finishing the last drain, kick again
+      if (r.frameQueue && r.frameQueue.length > 0) vrecKickWorker(tabId);
+    }
+  })();
+}
+
 async function vrecStartRecording(tabId, opts = {}) {
   if (recordingState.has(tabId)) {
     throw new Error(`Tab ${tabId} already has a recording (status=${recordingState.get(tabId).status})`);
@@ -1159,25 +1406,92 @@ async function vrecStartRecording(tabId, opts = {}) {
   const quality = opts.captureQuality || 80;
   const everyNthFrame = opts.everyNthFrame || 2; // ~15fps from a 30fps page
 
-  await cdp(tabId, "Page.startScreencast", {
-    format: "jpeg",
-    quality,
-    maxWidth,
-    maxHeight,
-    everyNthFrame,
-  });
+  // Output dimensions: cap to 1280x720 so each composited frame fits in
+  // Chrome's 1MB native-messaging window.
+  const MAX_OUT_W = 1280;
+  const MAX_OUT_H = 720;
+  let outW = Math.min(maxWidth, MAX_OUT_W);
+  let outH = Math.min(maxHeight, MAX_OUT_H);
 
+  const recordingId = `rec-${tabId}-${Date.now()}`;
+  // Streaming-during-capture pipeline: tell host to set up tempDir + manifest
+  // BEFORE the first frame arrives, so each screencastFrame can be sent on the
+  // wire and persisted as it lands.
+  await sendVrecToHost({
+    type: "vrec_begin",
+    recordingId,
+    fps: Math.round(1000 / (everyNthFrame * 33)) || 15,
+    savePath: null, // host fills with placeholder; real path comes at finalize
+    format: "mp4",
+  }, { timeoutMs: 10000 });
+
+  // CRITICAL: register state BEFORE startScreencast so the screencastFrame
+  // listener has somewhere to append. Otherwise frames arriving in the race
+  // window between startScreencast resolving and recordingState.set() are
+  // silently dropped (root cause of the 0/30/84/1047 frame intermittency).
   recordingState.set(tabId, {
     status: "recording",
     startedAt: Date.now(),
-    frames: [],
+    recordingId,
+    frames: [], // raw screencast frames (kept in memory only for legacy export path; B1 streams directly)
     mouseLog: [],
     keyLog: [],
     captureQuality: quality,
     maxWidth,
     maxHeight,
     everyNthFrame,
+    // Streaming options - frozen at start time, used in screencastFrame handler
+    outW,
+    outH,
+    showClickIndicators: opts.showClickIndicators !== false,
+    showProgressBar: opts.showProgressBar !== false,
+    showWatermark: opts.showWatermark !== false,
+    streamFrameIndex: 0,
+    streamSendErrors: 0,
   });
+
+  // Keep-alive arms NOW (capture phase) so the SW survives the
+  // start_recording -> drive_demo -> stop_recording -> export window. Without
+  // this, a 3min demo drive can kill the SW and lose all in-memory frames.
+  _exportKeepaliveStart();
+
+  // CRITICAL: Chrome's compositor pauses painting hidden tabs. If the tab is
+  // in a background window (Orellius private mode, occluded, minimized,
+  // different virtual desktop), document.visibilityState === "hidden" and
+  // Page.startScreencast delivers ZERO frames. We MUST surface the window
+  // before starting screencast. This is the deterministic root cause behind
+  // the historical "0 frames" outcomes.
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId !== undefined) {
+      await chrome.windows.update(tab.windowId, { focused: true, state: "normal", drawAttention: false });
+    }
+    await chrome.tabs.update(tabId, { active: true });
+    // Use CDP Page.bringToFront for double-belt-and-suspenders: tells the
+    // compositor to paint this specific target.
+    try { await cdp(tabId, "Page.bringToFront", {}); } catch {}
+    log(`vrec brought tab+window to front before startScreencast`);
+  } catch (e) {
+    log(`vrec front-window WARN: ${e.message}`);
+  }
+
+  log(`vrec startScreencast: tab=${tabId} rid=${recordingId} q=${quality} max=${maxWidth}x${maxHeight} out=${outW}x${outH} every=${everyNthFrame}`);
+  try {
+    const sc = await cdp(tabId, "Page.startScreencast", {
+      format: "jpeg",
+      quality,
+      maxWidth,
+      maxHeight,
+      everyNthFrame,
+    });
+    log(`vrec startScreencast OK: ${JSON.stringify(sc)}`);
+  } catch (e) {
+    log(`vrec startScreencast FAILED: ${e.message}`);
+    recordingState.delete(tabId);
+    _exportKeepaliveStop();
+    try { await sendVrecToHost({ type: "vrec_abort", recordingId }, { timeoutMs: 5000 }); } catch {}
+    throw e;
+  }
   log(`vrec start tab=${tabId} quality=${quality} max=${maxWidth}x${maxHeight}`);
 }
 
@@ -1188,11 +1502,22 @@ async function vrecStopRecording(tabId) {
     try { await cdp(tabId, "Page.stopScreencast", {}); } catch (e) { log(`stopScreencast warn: ${e.message}`); }
     r.status = "stopped";
     r.stoppedAt = Date.now();
+    // Drain the per-tab frame worker queue before returning. Frames are
+    // streamed to disk during capture but the queue can have several frames
+    // in flight at the moment stopScreencast resolves. Wait up to 30s for
+    // it to drain (worst case at 30+ frames * ~500ms each).
+    const drainStart = Date.now();
+    while (((r.frameQueue && r.frameQueue.length > 0) || r._workerRunning) && Date.now() - drainStart < 30000) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    log(`vrec stop drained: queue=${r.frameQueue?.length || 0} sent=${r.streamSentCount || 0} errors=${r.streamSendErrors || 0} drainMs=${Date.now() - drainStart}`);
   }
   return {
-    frameCount: r.frames.length,
+    frameCount: r.streamFrameIndex || 0,
+    framesWritten: r.streamSentCount || 0,
     mouseEvents: r.mouseLog.length,
     durationMs: (r.stoppedAt || Date.now()) - r.startedAt,
+    streamSendErrors: r.streamSendErrors || 0,
   };
 }
 
@@ -1202,7 +1527,12 @@ function vrecClear(tabId) {
   if (r.status === "recording") {
     cdp(tabId, "Page.stopScreencast", {}).catch(() => {});
   }
+  // Tell host to drop the temp dir so we don't leak frames on disk
+  if (r.recordingId) {
+    sendVrecToHost({ type: "vrec_abort", recordingId: r.recordingId }, { timeoutMs: 5000 }).catch(() => {});
+  }
   recordingState.delete(tabId);
+  _exportKeepaliveStop();
   return true;
 }
 
@@ -1218,6 +1548,18 @@ function nextVrecRequestId() {
 function sendVrecToHost(payload, { timeoutMs = 30000 } = {}) {
   if (!nativePort) return Promise.reject(new Error("Native port not connected"));
   const requestId = nextVrecRequestId();
+  // Chrome native messaging caps each message at 1MB. If we exceed it,
+  // Chrome silently drops the message and the host never sees it - which
+  // historically caused export to hang at vrec_frame with only manifest.txt
+  // on disk. Fail loudly here instead of silently waiting for a timeout.
+  const NATIVE_MSG_LIMIT = 1024 * 1024;
+  const wire = JSON.stringify({ ...payload, requestId });
+  if (wire.length >= NATIVE_MSG_LIMIT) {
+    return Promise.reject(new Error(
+      `vrec ${payload.type} message is ${wire.length} bytes, exceeds Chrome native messaging limit (${NATIVE_MSG_LIMIT}). ` +
+      `If this is a vrec_frame, lower captureQuality or maxWidth/maxHeight.`
+    ));
+  }
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingVrecRequests.delete(requestId);
@@ -1394,75 +1736,99 @@ async function compositeFrame({
     ctx.restore();
   }
 
-  const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.9 });
+  // Chrome native messaging caps each message at 1MB. A composited base64-JPEG
+  // payload routinely exceeds that at 1920x1080, q=0.9, so the host silently
+  // drops the message and the export hangs (only manifest.txt makes it to disk).
+  // Strategy: try q=0.85 first; if base64 string > 750KB, step down through
+  // q=0.7 -> q=0.5 -> q=0.3 until it fits. Below 0.3 we accept whatever we get
+  // (the message will still likely succeed up to ~1MB).
+  const SAFE_BYTES = 750 * 1024; // base64 string-length budget
+  const QUALITIES = [0.85, 0.7, 0.5, 0.3];
+  for (const q of QUALITIES) {
+    const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: q });
+    const b64 = await blobToBase64(outBlob);
+    if (b64.length <= SAFE_BYTES) return b64;
+  }
+  // Final fallback: q=0.2 (still likely fits in 1MB).
+  const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.2 });
   return await blobToBase64(outBlob);
 }
 
+// MV3 service worker termination during long export loops abandons pending
+// Promises with no rejection. We arm an alarm that pings every ~20s during
+// export to keep the worker alive (alarm events count as activity).
+let _exportKeepaliveActive = false;
+function _exportKeepaliveStart() {
+  if (_exportKeepaliveActive) return;
+  _exportKeepaliveActive = true;
+  try { chrome.alarms.create("vrec-keepalive", { periodInMinutes: 0.1 }); } catch {} // 6s tick
+  log("vrec keepalive alarm armed");
+}
+function _exportKeepaliveStop() {
+  if (!_exportKeepaliveActive) return;
+  _exportKeepaliveActive = false;
+  try { chrome.alarms.clear("vrec-keepalive"); } catch {}
+  log("vrec keepalive alarm cleared");
+}
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === "vrec-keepalive") {
+    log("vrec keepalive tick");
+    // Re-foreground every active recording's tab. Chrome's compositor pauses
+    // painting hidden tabs so screencastFrame events go to zero. The user's
+    // own window activity can steal focus mid-capture; re-asserting on each
+    // 21s tick keeps frames flowing.
+    for (const [tabId, r] of recordingState) {
+      if (r.status === "recording") {
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (tab.windowId !== undefined) {
+            await chrome.windows.update(tab.windowId, { focused: true, drawAttention: false });
+          }
+          await chrome.tabs.update(tabId, { active: true });
+          try { await cdp(tabId, "Page.bringToFront", {}); } catch {}
+        } catch (e) {
+          log(`vrec keepalive refocus tab=${tabId} WARN: ${e.message}`);
+        }
+      }
+    }
+  }
+});
+
 async function vrecExportRecording(tabId, opts = {}) {
+  _exportKeepaliveStart();
+  try {
+    return await _vrecExportRecordingInner(tabId, opts);
+  } finally {
+    _exportKeepaliveStop();
+  }
+}
+
+async function _vrecExportRecordingInner(tabId, opts = {}) {
+  log(`vrec export ENTERED tab=${tabId}`);
   const r = recordingState.get(tabId);
   if (!r) throw new Error(`No recording for tab ${tabId}`);
   if (r.status === "recording") await vrecStopRecording(tabId);
-  if (r.frames.length === 0) throw new Error("No frames captured (start_recording -> wait for activity -> stop_recording)");
+  const sentCount = r.streamFrameIndex || 0;
+  if (sentCount === 0) {
+    throw new Error("No frames captured (start_recording -> drive UI changes -> stop_recording before export)");
+  }
 
   const format = opts.format || "webm";
   const filename = opts.filename || `orellius-${Date.now()}.${format}`;
   const savePath = opts.savePath || ("~/Downloads/" + filename);
-  const recordingId = `rec-${tabId}-${Date.now()}`;
-
-  const showClickIndicators = opts.showClickIndicators !== false;
-  const showProgressBar = opts.showProgressBar !== false;
-  const showWatermark = opts.showWatermark !== false;
-  // First frame defines output dimensions
-  const firstBlob = base64ToBlob(r.frames[0].base64, "image/jpeg");
-  const firstBitmap = await createImageBitmap(firstBlob);
-  const outW = firstBitmap.width;
-  const outH = firstBitmap.height;
-  firstBitmap.close?.();
-
   const fps = Math.round(1000 / (r.everyNthFrame * 33)) || 15;
 
-  await sendVrecToHost({
-    type: "vrec_begin",
-    recordingId,
+  log(`vrec finalize: rid=${r.recordingId} sentFrames=${sentCount} sendErrors=${r.streamSendErrors} format=${format} savePath=${savePath}`);
+
+  // B1 streaming: frames are already on disk (per-frame sends during capture).
+  // The host just needs to close its manifest and run ffmpeg.
+  const result = await sendVrecToHost({
+    type: "vrec_finalize",
+    recordingId: r.recordingId,
     fps,
     savePath,
     format,
-  }, { timeoutMs: 10000 });
-
-  const totalDurMs = r.frames[r.frames.length - 1].relTs - r.frames[0].relTs || 1;
-  const t0 = r.frames[0].relTs;
-
-  for (let i = 0; i < r.frames.length; i++) {
-    const fr = r.frames[i];
-    const cursor = showClickIndicators ? cursorAt(r.mouseLog, fr.relTs) : null;
-    const clicks = showClickIndicators ? clicksWindow(r.mouseLog, fr.relTs) : [];
-    const progressFrac = (fr.relTs - t0) / totalDurMs;
-
-    const composited = await compositeFrame({
-      frameBase64: fr.base64,
-      capturedW: r.capturedW || outW,
-      capturedH: r.capturedH || outH,
-      outW,
-      outH,
-      cursor,
-      clicks,
-      showProgressBar,
-      progressFrac,
-      showWatermark,
-    });
-
-    await sendVrecToHost({
-      type: "vrec_frame",
-      recordingId,
-      base64: composited,
-      relTs: fr.relTs,
-    }, { timeoutMs: 15000 });
-  }
-
-  const result = await sendVrecToHost({
-    type: "vrec_end",
-    recordingId,
-  }, { timeoutMs: 60000 });
+  }, { timeoutMs: 120000 });
 
   recordingState.delete(tabId);
   return {
@@ -1472,8 +1838,8 @@ async function vrecExportRecording(tabId, opts = {}) {
     durationSec: result.durationSec,
     format,
     fps,
-    width: outW,
-    height: outH,
+    width: r.outW,
+    height: r.outH,
   };
 }
 
@@ -1579,18 +1945,22 @@ const toolHandlers = {
 
     switch (action) {
       case "screenshot": {
-        const { base64, imageId } = await takeScreenshot(tabId);
-        // Get viewport dimensions for the response message
+        const fullPage = !!args.fullPage;
+        const { base64, imageId } = await takeScreenshot(tabId, { fullPage });
+        // Report the captured dimensions. For full-page, prefer scroll size
+        // (what the user actually got); for viewport, inner size.
         let dims = "";
         try {
-          const vp = await cdp(tabId, "Runtime.evaluate", {
-            expression: "window.innerWidth + 'x' + window.innerHeight",
-          });
+          const expr = fullPage
+            ? "document.documentElement.scrollWidth + 'x' + document.documentElement.scrollHeight"
+            : "window.innerWidth + 'x' + window.innerHeight";
+          const vp = await cdp(tabId, "Runtime.evaluate", { expression: expr });
           if (vp?.result?.value) dims = vp.result.value;
         } catch {}
+        const label = fullPage ? "full-page screenshot" : "screenshot";
         return {
           content: [
-            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}` },
+            { type: "text", text: `Successfully captured ${label} (${dims}, jpeg) - ID: ${imageId}` },
             { type: "image", data: base64, mimeType: "image/jpeg" },
           ],
         };
@@ -1961,13 +2331,247 @@ const toolHandlers = {
   },
 
   async resize_window(args) {
-    const { width, height, tabId } = args;
+    const { width, height, tabId, left, top, maximize } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
     try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
 
     const tab = await chrome.tabs.get(tabId);
-    await chrome.windows.update(tab.windowId, { width, height });
-    return { content: [{ type: "text", text: `Resized window to ${width}x${height}` }] };
+
+    if (maximize) {
+      await chrome.windows.update(tab.windowId, { state: "maximized" });
+      const w = await chrome.windows.get(tab.windowId);
+      return { content: [{ type: "text", text: `Maximized window to ${w.width}x${w.height}` }] };
+    }
+
+    // Chrome enforces "window must stay >=50% on-screen" on chrome.windows.update.
+    // Naively passing only {width,height} fails when the existing top-left would
+    // push the resized window off the right/bottom of the display. Auto-reposition
+    // so the final bounds fit inside the work area of whichever display the
+    // window currently lives on.
+    let displayWorkArea = null;
+    try {
+      const win = await chrome.windows.get(tab.windowId);
+      const displays = await chrome.system.display.getInfo();
+      const winCx = (win.left ?? 0) + (win.width ?? 0) / 2;
+      const winCy = (win.top ?? 0) + (win.height ?? 0) / 2;
+      const onDisplay =
+        displays.find((d) => {
+          const w = d.workArea;
+          return winCx >= w.left && winCx < w.left + w.width && winCy >= w.top && winCy < w.top + w.height;
+        }) || displays[0];
+      if (onDisplay) displayWorkArea = onDisplay.workArea;
+    } catch (_) {
+      // chrome.system.display might not be available in all contexts; fall through
+    }
+
+    const update = { width, height };
+    if (typeof left === "number") update.left = Math.round(left);
+    if (typeof top === "number") update.top = Math.round(top);
+
+    if (displayWorkArea && (update.left === undefined || update.top === undefined)) {
+      const wa = displayWorkArea;
+      const win = await chrome.windows.get(tab.windowId);
+      const curLeft = update.left ?? win.left ?? wa.left;
+      const curTop = update.top ?? win.top ?? wa.top;
+      // Clamp so the new bounds fit fully (or as fully as possible) inside the work area.
+      const maxLeft = wa.left + Math.max(0, wa.width - width);
+      const maxTop = wa.top + Math.max(0, wa.height - height);
+      update.left = Math.max(wa.left, Math.min(curLeft, maxLeft));
+      update.top = Math.max(wa.top, Math.min(curTop, maxTop));
+    }
+
+    await chrome.windows.update(tab.windowId, update);
+    const detail = update.left !== undefined ? ` at (${update.left},${update.top})` : "";
+    return { content: [{ type: "text", text: `Resized window to ${width}x${height}${detail}` }] };
+  },
+
+  async screenshot_scroll_stitch(args) {
+    // Capture a full-page screenshot by scrolling through the document, taking
+    // a viewport-sized CDP capture at each step, and stitching the slices
+    // together with OffscreenCanvas. Use this instead of computer({action:
+    // "screenshot", fullPage:true}) when the page uses lazy-loading, virtual
+    // scrolling (react-window/react-virtualized), or otherwise only renders
+    // content as it scrolls into view - those pages return mostly-blank slices
+    // when CDP captureBeyondViewport is used because the off-screen DOM never
+    // got rendered.
+    //
+    // Knobs the caller can tune:
+    //   - format: 'jpeg' (default, smaller) or 'png' (lossless, big)
+    //   - quality: 1..100 (jpeg only, default 80)
+    //   - max_height: safety cap on total document height (default 30000,
+    //     hard ceiling 60000). Pages taller than this are truncated at the top.
+    //   - hide_sticky: true (default) hides any element with computed
+    //     position:fixed or position:sticky during capture so headers/footers
+    //     don't ghost across slices. Restored after capture.
+    //   - hide_selectors: extra CSS selectors to hide during capture (e.g.
+    //     cookie banners, chat widgets).
+    //   - scroll_delay_ms: pause between scroll and capture for lazy content
+    //     to render (50..5000, default 250).
+    const { tabId } = args || {};
+    const fmt = (args?.format || "jpeg").toLowerCase();
+    if (fmt !== "jpeg" && fmt !== "png") {
+      return { content: [{ type: "text", text: "format must be 'jpeg' or 'png'." }] };
+    }
+    const q = typeof args?.quality === "number" ? Math.max(1, Math.min(100, args.quality)) : 80;
+    const maxH = Math.min(typeof args?.max_height === "number" ? args.max_height : 30000, 60000);
+    const delayMs = Math.max(50, Math.min(5000, typeof args?.scroll_delay_ms === "number" ? args.scroll_delay_ms : 250));
+    const hideSticky = args?.hide_sticky !== false;
+    const hideSelectors = Array.isArray(args?.hide_selectors) ? args.hide_selectors.filter((s) => typeof s === "string") : [];
+
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
+
+    await ensureAttached(tabId);
+    await focusTabForInput(tabId);
+
+    // 1. Save current scroll + measure document.
+    const measureExpr = `(() => ({
+      sx: window.scrollX, sy: window.scrollY,
+      h: Math.max(document.documentElement.scrollHeight, (document.body && document.body.scrollHeight) || 0),
+      w: Math.max(document.documentElement.scrollWidth, (document.body && document.body.scrollWidth) || 0),
+      ih: window.innerHeight, iw: window.innerWidth,
+      dpr: window.devicePixelRatio || 1
+    }))()`;
+    const m = await cdp(tabId, "Runtime.evaluate", { expression: measureExpr, returnByValue: true });
+    const meta = m?.result?.value;
+    if (!meta || !meta.iw || !meta.ih) {
+      return { content: [{ type: "text", text: `Could not measure document dimensions (got ${JSON.stringify(meta)}).` }] };
+    }
+    const totalH = Math.min(meta.h, maxH);
+    const truncated = meta.h > maxH;
+
+    // 2. Hide sticky/fixed elements + any extra selectors. Keep the marker on
+    //    window so the restore step finds them even if our reference list is
+    //    lost (e.g., extension SW restart mid-capture).
+    const hideExpr = `(() => {
+      const hidden = window.__orelliusStitchHidden = [];
+      const sel = ${JSON.stringify(hideSelectors)};
+      const wantSticky = ${hideSticky ? "true" : "false"};
+      if (wantSticky) {
+        const all = document.body ? document.body.getElementsByTagName('*') : [];
+        for (let i = 0; i < all.length; i++) {
+          const el = all[i];
+          let cs;
+          try { cs = getComputedStyle(el); } catch (e) { continue; }
+          if (cs.position === 'fixed' || cs.position === 'sticky') {
+            hidden.push([el, el.style.visibility]);
+            el.style.visibility = 'hidden';
+          }
+        }
+      }
+      for (const s of sel) {
+        try {
+          document.querySelectorAll(s).forEach((el) => {
+            hidden.push([el, el.style.visibility]);
+            el.style.visibility = 'hidden';
+          });
+        } catch (e) { /* bad selector, skip */ }
+      }
+      return hidden.length;
+    })()`;
+    let hiddenCount = 0;
+    try {
+      const r = await cdp(tabId, "Runtime.evaluate", { expression: hideExpr, returnByValue: true });
+      hiddenCount = r?.result?.value || 0;
+    } catch (_) { /* non-fatal */ }
+
+    // 3. Build slice positions. Bottom slice clamps to (totalH - vpHeight) so
+    //    the page bottom aligns with the viewport bottom; the canvas drawImage
+    //    will overwrite any overlap with the prior slice (same content) so
+    //    duplicates don't matter.
+    const slicePositions = [];
+    let pos = 0;
+    while (pos + meta.ih < totalH) {
+      slicePositions.push(pos);
+      pos += meta.ih;
+    }
+    const lastY = Math.max(0, totalH - meta.ih);
+    if (slicePositions[slicePositions.length - 1] !== lastY) slicePositions.push(lastY);
+
+    // 4. Capture each slice via CDP (no rate limit, unlike captureVisibleTab).
+    const slices = [];
+    let captureErr = null;
+    try {
+      for (const sliceY of slicePositions) {
+        await cdp(tabId, "Runtime.evaluate", {
+          expression: `window.scrollTo({top:${sliceY}, left:0, behavior:'instant'})`,
+        });
+        await sleep(delayMs);
+        const shotArgs = { format: fmt, optimizeForSpeed: true };
+        if (fmt === "jpeg") shotArgs.quality = q;
+        const result = await retriableCdp(tabId, "Page.captureScreenshot", shotArgs);
+        slices.push({ y: sliceY, b64: result.data });
+      }
+    } catch (err) {
+      captureErr = err;
+    } finally {
+      // Always restore scroll + un-hide elements.
+      const restoreExpr = `(() => {
+        try { window.scrollTo({top:${meta.sy}, left:${meta.sx}, behavior:'instant'}); } catch(e) {}
+        const hidden = window.__orelliusStitchHidden || [];
+        for (const item of hidden) {
+          try { item[0].style.visibility = item[1] || ''; } catch (e) {}
+        }
+        try { delete window.__orelliusStitchHidden; } catch (e) {}
+        return hidden.length;
+      })()`;
+      try { await cdp(tabId, "Runtime.evaluate", { expression: restoreExpr }); } catch (_) {}
+    }
+    if (captureErr) {
+      return { content: [{ type: "text", text: `Capture failed mid-stitch after ${slices.length}/${slicePositions.length} slices: ${captureErr.message}` }] };
+    }
+
+    // 5. Stitch with OffscreenCanvas.
+    const canvasW = Math.round(meta.iw * meta.dpr);
+    const canvasH = Math.round(totalH * meta.dpr);
+    let outB64;
+    let outBytes = 0;
+    try {
+      const canvas = new OffscreenCanvas(canvasW, canvasH);
+      const ctx = canvas.getContext("2d");
+      if (fmt === "jpeg") {
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvasW, canvasH);
+      }
+      for (const { y, b64 } of slices) {
+        const blob = await (await fetch(`data:image/${fmt};base64,${b64}`)).blob();
+        const bmp = await createImageBitmap(blob);
+        ctx.drawImage(bmp, 0, Math.round(y * meta.dpr));
+        bmp.close();
+      }
+      const outBlob = await canvas.convertToBlob({
+        type: `image/${fmt}`,
+        quality: fmt === "jpeg" ? q / 100 : undefined,
+      });
+      const buf = await outBlob.arrayBuffer();
+      outBytes = buf.byteLength;
+      // Chunked base64 to avoid call-stack overflow on large pages.
+      const bytes = new Uint8Array(buf);
+      const chunkSize = 0x8000;
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+      }
+      outB64 = btoa(bin);
+    } catch (err) {
+      return { content: [{ type: "text", text: `Stitch failed (${slices.length} slices captured): ${err.message}` }] };
+    }
+
+    const imageId = `stitched_${Date.now()}`;
+    screenshotStore.set(imageId, outB64);
+    while (screenshotStore.size > 10) {
+      const k = screenshotStore.keys().next().value;
+      screenshotStore.delete(k);
+    }
+
+    const truncatedNote = truncated ? ` (TRUNCATED at max_height=${maxH}, doc was ${meta.h}px)` : "";
+    const stickyNote = hiddenCount ? `, hid ${hiddenCount} sticky/extra el${hiddenCount === 1 ? "" : "s"}` : "";
+    return {
+      content: [
+        { type: "text", text: `Stitched full-page screenshot: ${meta.iw}x${totalH}${truncatedNote} (dpr ${meta.dpr}, ${slices.length} slices, ${(outBytes / 1024).toFixed(1)} KiB ${fmt}${stickyNote}) - ID: ${imageId}` },
+        { type: "image", data: outB64, mimeType: `image/${fmt}` },
+      ],
+    };
   },
 
   async download_screenshot(args) {
@@ -2225,14 +2829,22 @@ const toolHandlers = {
   },
 
   async browser_lock(args) {
-    const { tabId, ttl_seconds, force } = args;
+    const { tabId, ttl_seconds, force, override_pin } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
     const mySessionId = _currentSessionId || "legacy";
     const existing = tabLocks.get(tabId);
     const ttlMs = Math.max(30, Math.min(3600, ttl_seconds || DEFAULT_LOCK_TTL_MS / 1000)) * 1000;
-    if (existing && !isLockExpired(existing) && existing.sessionId !== mySessionId && !force) {
-      const remainingSec = Math.ceil((existing.expiresAt - nowMs()) / 1000);
-      return { content: [{ type: "text", text: `Tab ${tabId} is already locked by session "${existing.sessionId}" for another ${remainingSec}s. Pass force:true to override.` }] };
+    if (existing && !isLockExpired(existing) && existing.sessionId !== mySessionId) {
+      // Foreign active lock: require human-known PIN. force:true alone no
+      // longer bypasses (it could let a misbehaving session steal another
+      // session's tab silently). Self-owned locks and expired locks fall
+      // through and may be (re)claimed without a PIN.
+      const pinCheck = isOverridePinValid(override_pin, mySessionId);
+      if (!pinCheck.ok) {
+        const remainingSec = Math.ceil((existing.expiresAt - nowMs()) / 1000);
+        const forceNote = force ? " (force:true alone is no longer sufficient.)" : "";
+        return { content: [{ type: "text", text: `Tab ${tabId} is already locked by session "${existing.sessionId}" for another ${remainingSec}s.${forceNote} ${pinCheck.reason}` }] };
+      }
     }
     const lock = { sessionId: mySessionId, expiresAt: nowMs() + ttlMs };
     tabLocks.set(tabId, lock);
@@ -2241,12 +2853,16 @@ const toolHandlers = {
   },
 
   async browser_unlock(args) {
-    const { tabId, force } = args;
+    const { tabId, force, override_pin } = args;
     const mySessionId = _currentSessionId || "legacy";
     const existing = tabLocks.get(tabId);
     if (!existing) return { content: [{ type: "text", text: `Tab ${tabId} is not locked.` }] };
-    if (existing.sessionId !== mySessionId && !force) {
-      return { content: [{ type: "text", text: `Tab ${tabId} is locked by session "${existing.sessionId}", not yours. Pass force:true to break the lock.` }] };
+    if (existing.sessionId !== mySessionId && !isLockExpired(existing)) {
+      const pinCheck = isOverridePinValid(override_pin, mySessionId);
+      if (!pinCheck.ok) {
+        const forceNote = force ? " (force:true alone is no longer sufficient.)" : "";
+        return { content: [{ type: "text", text: `Tab ${tabId} is locked by session "${existing.sessionId}", not yours.${forceNote} ${pinCheck.reason}` }] };
+      }
     }
     tabLocks.delete(tabId);
     await persistLocks();
@@ -2345,7 +2961,7 @@ const toolHandlers = {
   },
 
   async tabs_close_mcp(args) {
-    const { tabId, force } = args || {};
+    const { tabId, force, override_pin } = args || {};
     if (typeof tabId !== "number") {
       return { content: [{ type: "text", text: "tabs_close_mcp requires a numeric tabId." }] };
     }
@@ -2354,10 +2970,14 @@ const toolHandlers = {
     }
     const mySid = _currentSessionId || "legacy";
     const lock = tabLocks.get(tabId);
-    if (lock && !isLockExpired(lock) && lock.sessionId !== mySid && !force) {
-      return { content: [{ type: "text", text:
-        `Tab ${tabId} is locked by session "${lock.sessionId}". Pass force:true to close it anyway.`
-      }] };
+    if (lock && !isLockExpired(lock) && lock.sessionId !== mySid) {
+      const pinCheck = isOverridePinValid(override_pin, mySid);
+      if (!pinCheck.ok) {
+        const forceNote = force ? " (force:true alone is no longer sufficient for cross-session closes.)" : "";
+        return { content: [{ type: "text", text:
+          `Tab ${tabId} is locked by session "${lock.sessionId}".${forceNote} ${pinCheck.reason}`
+        }] };
+      }
     }
     try {
       await chrome.tabs.remove(tabId);
@@ -2376,7 +2996,7 @@ const toolHandlers = {
   },
 
   async session_end(args) {
-    const { force } = args || {};
+    const { force, override_pin } = args || {};
     const sid = _currentSessionId || "legacy";
     const wid = getSessionWindowId(sid);
     if (wid === undefined) {
@@ -2395,7 +3015,7 @@ const toolHandlers = {
         `Window ${wid} was already closed. Released session "${sid}" claim.`
       }] };
     }
-    if (!force) {
+    {
       const blockingLocks = [];
       for (const t of tabsInWindow) {
         const lock = tabLocks.get(t.id);
@@ -2404,10 +3024,14 @@ const toolHandlers = {
         }
       }
       if (blockingLocks.length) {
-        const desc = blockingLocks.map((b) => `tab ${b.tabId} -> ${b.owner}`).join(", ");
-        return { content: [{ type: "text", text:
-          `Refusing to end session: ${blockingLocks.length} tab(s) are locked by other sessions (${desc}). Pass force:true to override.`
-        }] };
+        const pinCheck = isOverridePinValid(override_pin, sid);
+        if (!pinCheck.ok) {
+          const desc = blockingLocks.map((b) => `tab ${b.tabId} -> ${b.owner}`).join(", ");
+          const forceNote = force ? " (force:true alone is no longer sufficient.)" : "";
+          return { content: [{ type: "text", text:
+            `Refusing to end session: ${blockingLocks.length} tab(s) are locked by other sessions (${desc}).${forceNote} ${pinCheck.reason}`
+          }] };
+        }
       }
     }
     let droppedLocks = 0;
@@ -2483,4 +3107,5 @@ setBadge("disconnected");
 recoverTabGroupState();
 loadLocks();
 loadDefaultMode();
+loadOrInitOverridePin();
 connectNativeHost();
