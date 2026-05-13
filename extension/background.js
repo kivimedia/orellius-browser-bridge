@@ -1739,22 +1739,34 @@ async function mrStartRecording(tabId, opts = {}) {
     log(`mr front-tab WARN: ${e.message}`);
   }
 
-  // Mint a tab MediaStream ID. This is the gating call - it requires the
-  // tab to be the active tab in its window and (some Chrome versions) a
-  // recent user gesture. Inside an MCP-driven session we have neither, so
-  // we use the callback variant that pulls from activeTab permission.
-  let streamId;
-  try {
-    streamId = await new Promise((resolve, reject) => {
-      chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
-        const err = chrome.runtime.lastError;
-        if (err) return reject(new Error(err.message));
-        if (!id) return reject(new Error("getMediaStreamId returned empty"));
-        resolve(id);
+  // Try to mint a tab MediaStream ID via chrome.tabCapture.getMediaStreamId.
+  // This is silent (no picker) but requires that the extension was recently
+  // "invoked" on the tab (user clicked the toolbar icon, used a keyboard
+  // shortcut, etc.) - Chrome's activeTab security model. In a pure MCP
+  // automation context, this typically fails with "Extension has not been
+  // invoked for the current page". Fall through to display-media mode if so.
+  let streamId = null;
+  let captureMode = (opts.captureMode || "auto").toLowerCase(); // "auto" | "tab-capture" | "display-media"
+  if (captureMode === "tab-capture" || captureMode === "auto") {
+    try {
+      streamId = await new Promise((resolve, reject) => {
+        chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
+          const err = chrome.runtime.lastError;
+          if (err) return reject(new Error(err.message));
+          if (!id) return reject(new Error("getMediaStreamId returned empty"));
+          resolve(id);
+        });
       });
-    });
-  } catch (e) {
-    throw new Error(`tabCapture.getMediaStreamId failed: ${e.message}. Tab ${tabId} must be the active tab in its window; if running in private/locked mode, the tab can still be captured but must be focused inside its owned window.`);
+      captureMode = "tab-capture";
+      log(`mr tab-capture streamId acquired for tab ${tabId}`);
+    } catch (e) {
+      if (captureMode === "tab-capture") {
+        throw new Error(`tabCapture.getMediaStreamId failed: ${e.message}. To use silent tab-capture mode, click the Orellius extension toolbar icon on this tab once before starting recording (Chrome's activeTab security gate).`);
+      }
+      // auto mode - fall through to display-media path
+      log(`mr tab-capture failed (${e.message}), falling back to display-media (user picker)`);
+      captureMode = "display-media";
+    }
   }
 
   await ensureOffscreenDoc();
@@ -1767,16 +1779,20 @@ async function mrStartRecording(tabId, opts = {}) {
     mimeTypeHint: "video/webm",
   }, { timeoutMs: 10000 });
 
-  // Start the offscreen recorder
+  // For display-media mode, the screen-picker UI is modal and blocks until
+  // the user clicks Share / Cancel. Give it 60 seconds to allow the user
+  // time to select the tab.
+  const offscreenTimeout = captureMode === "display-media" ? 90000 : 15000;
   const startResp = await sendToOffscreen({
     cmd: "start",
     recordingId,
+    mode: captureMode,
     streamId,
     frameRate,
     videoBitsPerSecond,
     captureAudio,
     chunkMs: opts.chunkMs || 1000,
-  }, { timeoutMs: 15000 });
+  }, { timeoutMs: offscreenTimeout });
 
   const state = {
     recordingId,

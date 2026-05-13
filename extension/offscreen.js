@@ -43,31 +43,56 @@ async function blobToBase64(blob) {
 }
 
 async function startSession(msg) {
-  const { recordingId, streamId, frameRate = 30, videoBitsPerSecond = 2_500_000, captureAudio = false, chunkMs = 1000 } = msg;
-  if (!recordingId || !streamId) throw new Error("recordingId and streamId required");
+  const {
+    recordingId,
+    streamId,
+    mode = streamId ? "tab-capture" : "display-media",
+    frameRate = 30,
+    videoBitsPerSecond = 2_500_000,
+    captureAudio = false,
+    chunkMs = 1000,
+  } = msg;
+  if (!recordingId) throw new Error("recordingId required");
   if (sessions.has(recordingId)) throw new Error(`recordingId ${recordingId} already active`);
 
-  const constraints = {
-    audio: captureAudio
-      ? { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } }
-      : false,
-    video: {
-      mandatory: {
-        chromeMediaSource: "tab",
-        chromeMediaSourceId: streamId,
-        maxFrameRate: frameRate,
-        minFrameRate: Math.max(1, Math.floor(frameRate / 2)),
-        maxWidth: 1920,
-        maxHeight: 1080,
-      },
-    },
-  };
-
   let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia(constraints);
-  } catch (e) {
-    throw new Error(`getUserMedia failed: ${e.message}`);
+
+  if (mode === "tab-capture") {
+    // chrome.tabCapture path - silent but requires extension to be invoked on tab
+    if (!streamId) throw new Error("tab-capture mode requires streamId");
+    const constraints = {
+      audio: captureAudio
+        ? { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } }
+        : false,
+      video: {
+        mandatory: {
+          chromeMediaSource: "tab",
+          chromeMediaSourceId: streamId,
+          maxFrameRate: frameRate,
+          minFrameRate: Math.max(1, Math.floor(frameRate / 2)),
+          maxWidth: 1920,
+          maxHeight: 1080,
+        },
+      },
+    };
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (e) {
+      throw new Error(`tab-capture getUserMedia failed: ${e.message}`);
+    }
+  } else if (mode === "display-media") {
+    // getDisplayMedia path - shows screen-picker, user chooses tab/window/screen
+    // This is the path Loom, MarizAI's TrainingRecorder, and Screenity use as their default.
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate, width: { max: 1920 }, height: { max: 1080 } },
+        audio: captureAudio,
+      });
+    } catch (e) {
+      throw new Error(`getDisplayMedia failed (user may have cancelled the picker): ${e.message}`);
+    }
+  } else {
+    throw new Error(`unknown capture mode: ${mode}`);
   }
 
   // Important: if we got an audio track but the user wanted no audio, drop it.
