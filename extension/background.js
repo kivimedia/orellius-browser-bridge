@@ -1900,6 +1900,129 @@ function mrPrivateLockActive() {
   return globalThis._forcePrivate === true || globalThis._privateModeLocked === true || true;
 }
 
+// ============================================================================
+// ffmpeg-native engine. Recording happens entirely in the native host - no
+// extension involvement except to coordinate window state (the captured
+// Chrome window must be visible on screen for gdigrab/x11grab to see it).
+// ============================================================================
+
+const ffRecordingState = new Map(); // tabId -> { recordingId, startedAt, savePath, format, priorWinState }
+
+async function ffStartRecording(tabId, opts = {}) {
+  if (ffRecordingState.has(tabId)) {
+    throw new Error(`Tab ${tabId} already has an ffmpeg-native recording`);
+  }
+  if (recordingState.has(tabId)) throw new Error(`Tab ${tabId} already has a CDP recording`);
+  if (mrRecordingState.has(tabId)) throw new Error(`Tab ${tabId} already has an MR recording`);
+
+  const format = (opts.format || "mp4").toLowerCase();
+  const frameRate = Math.max(5, Math.min(60, opts.frameRate || 30));
+  const videoBitsPerSecond = opts.videoBitsPerSecond || 0; // ffmpeg picks via crf if 0
+  const drawCursor = opts.drawCursor !== false;
+
+  // Bring the captured window to a visible state. gdigrab reads from the
+  // display compositor, so a minimized window paints nothing and the recording
+  // would be blank. Save the prior window state so we can restore on stop.
+  let tab, priorWinState = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+    if (tab.windowId !== undefined) {
+      const win = await chrome.windows.get(tab.windowId);
+      priorWinState = win.state;
+      if (win.state === "minimized" || win.state === "fullscreen") {
+        await chrome.windows.update(tab.windowId, { state: "normal" });
+      }
+    }
+    await chrome.tabs.update(tabId, { active: true });
+    // Brief paint settle - gdigrab can read garbage on the first frame if
+    // the window just appeared this tick.
+    await new Promise((r) => setTimeout(r, 600));
+    // Refresh tab info to get the title that Chrome is currently showing
+    tab = await chrome.tabs.get(tabId);
+  } catch (e) {
+    log(`ff window prep WARN: ${e.message}`);
+  }
+
+  // Window title heuristic. Chrome's window title is "<tab title> - Google Chrome"
+  // on stock Chrome, "- Brave" / "- Microsoft Edge" on variants. Pass the tab
+  // title; ffmpeg gdigrab does substring matching, so the variant suffix
+  // doesn't usually break it. If multiple windows match the substring, the
+  // first one Windows returns wins (typically the foreground one).
+  const windowTitle = opts.windowTitle || tab?.title || null;
+  const recordingId = `ff-${tabId}-${Date.now()}`;
+
+  // savePath: callers can pass it explicitly; otherwise native_host fills
+  // in ~/Downloads/orellius-<ts>.<format>
+  const startResp = await sendVrecToHost({
+    type: "vrec_ff_start",
+    recordingId,
+    windowTitle,
+    region: opts.region || null,
+    savePath: opts.savePath || null,
+    format,
+    frameRate,
+    videoBitsPerSecond,
+    drawCursor,
+  }, { timeoutMs: 20000 });
+
+  ffRecordingState.set(tabId, {
+    recordingId,
+    startedAt: Date.now(),
+    savePath: startResp.savePath,
+    format,
+    frameRate,
+    priorWinState,
+    windowId: tab?.windowId,
+    pid: startResp.pid,
+  });
+  _exportKeepaliveStart();
+  log(`ff start tab=${tabId} rid=${recordingId} pid=${startResp.pid} title="${windowTitle}" -> ${startResp.savePath}`);
+  return ffRecordingState.get(tabId);
+}
+
+async function ffStopRecording(tabId) {
+  const state = ffRecordingState.get(tabId);
+  if (!state) throw new Error(`No ffmpeg-native recording for tab ${tabId}`);
+
+  const resp = await sendVrecToHost({
+    type: "vrec_ff_stop",
+    recordingId: state.recordingId,
+  }, { timeoutMs: 60000 });
+
+  // Restore prior window state (e.g. re-minimize if it was minimized)
+  if (state.windowId !== undefined && state.priorWinState === "minimized") {
+    try { await chrome.windows.update(state.windowId, { state: "minimized" }); } catch {}
+  }
+  ffRecordingState.delete(tabId);
+  _exportKeepaliveStop();
+
+  return {
+    recordingId: state.recordingId,
+    savePath: resp.savePath,
+    fileSize: resp.fileSize,
+    durationMs: resp.durationMs,
+    cleanExit: resp.cleanExit,
+    exitCode: resp.exitCode,
+    format: state.format,
+    fps: state.frameRate,
+    stderrTail: resp.stderrTail,
+  };
+}
+
+async function ffClear(tabId) {
+  const state = ffRecordingState.get(tabId);
+  if (!state) return false;
+  try {
+    await sendVrecToHost({ type: "vrec_ff_abort", recordingId: state.recordingId }, { timeoutMs: 5000 });
+  } catch {}
+  if (state.windowId !== undefined && state.priorWinState === "minimized") {
+    try { await chrome.windows.update(state.windowId, { state: "minimized" }); } catch {}
+  }
+  ffRecordingState.delete(tabId);
+  _exportKeepaliveStop();
+  return true;
+}
+
 // Listen for chunks coming back from the offscreen document
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || (msg.type !== "orellius_mr_chunk" && msg.type !== "orellius_mr_stopped" && msg.type !== "orellius_mr_error")) {
@@ -3148,26 +3271,83 @@ const toolHandlers = {
       return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
     }
 
-    // Engine selection. "media-recorder" (default) uses chrome.tabCapture +
-    // MediaRecorder via an offscreen document - frame-paced, Loom/Camtasia
-    // quality. "cdp-legacy" uses Page.startScreencast - paint-event-driven,
-    // good for compositing synthetic cursor overlays but produces choppy
-    // video on static pages. For an active recording, the engine is locked
-    // by the start_recording call; stop/export/clear auto-detect.
-    const requestedEngine = (options.engine || (action === "start_recording" ? "media-recorder" : null) || "").toLowerCase();
+    // Engine selection. Three engines available:
+    //   "ffmpeg-native" (DEFAULT): OS-level screen capture via ffmpeg in the
+    //     native host. No Chrome involvement for capture. No user gesture
+    //     required. Window must be visible on screen during recording.
+    //   "media-recorder": chrome.tabCapture + MediaRecorder via offscreen doc.
+    //     Frame-paced webm. Requires user gesture (toolbar icon click) to
+    //     grant activeTab unless captureMode falls back to display-media picker.
+    //   "cdp-legacy": Page.startScreencast paint-event-driven. Sparse frames
+    //     on static pages but includes synthetic cursor + click overlay.
+    // For an active recording, the engine is locked by start_recording;
+    // stop/export/clear auto-detect from which state map has the tab.
+    const requestedEngine = (options.engine || (action === "start_recording" ? "ffmpeg-native" : null) || "").toLowerCase();
+    const isFfActive = ffRecordingState.has(tabId);
     const isMrActive = mrRecordingState.has(tabId);
     const isCdpActive = recordingState.has(tabId);
     let engine;
     if (action === "start_recording") {
-      engine = requestedEngine || "media-recorder";
+      engine = requestedEngine || "ffmpeg-native";
     } else {
       // For stop/export/clear, follow whichever engine is actually running
-      if (isMrActive) engine = "media-recorder";
+      if (isFfActive) engine = "ffmpeg-native";
+      else if (isMrActive) engine = "media-recorder";
       else if (isCdpActive) engine = "cdp-legacy";
-      else engine = requestedEngine || "media-recorder";
+      else engine = requestedEngine || "ffmpeg-native";
     }
 
     try {
+      if (engine === "ffmpeg-native") {
+        switch (action) {
+          case "start_recording": {
+            const state = await ffStartRecording(tabId, { ...options, format: (format || "mp4").toLowerCase(), savePath });
+            return {
+              content: [{
+                type: "text",
+                text: `Recording started on tab ${tabId} (ffmpeg-native engine). ${state.frameRate}fps, ${state.format}. ffmpeg PID ${state.pid}. Output: ${state.savePath}. Call record_video(action='stop_recording') when done. Window must stay visible (un-minimized) during recording.`,
+              }],
+            };
+          }
+          case "stop_recording": {
+            const info = await ffStopRecording(tabId);
+            return {
+              content: [{
+                type: "text",
+                text: `Recording stopped (ffmpeg-native): ${info.savePath} (${(info.fileSize/1024).toFixed(1)} KiB, ${(info.durationMs/1000).toFixed(1)}s, ${info.format}, cleanExit=${info.cleanExit}). File is fully encoded and ready to use - no separate export step needed.`,
+              }],
+            };
+          }
+          case "export": {
+            // ffmpeg-native writes the final file during capture, so export is
+            // either a no-op (already done by stop_recording) or a rename.
+            const state = ffRecordingState.get(tabId);
+            if (state) {
+              // Recording still active - stop it first
+              const info = await ffStopRecording(tabId);
+              return {
+                content: [{
+                  type: "text",
+                  text: `ffmpeg-native auto-stopped on export: ${info.savePath} (${(info.fileSize/1024).toFixed(1)} KiB, ${(info.durationMs/1000).toFixed(1)}s, ${info.format}).`,
+                }],
+              };
+            }
+            return { content: [{ type: "text", text: "No active ffmpeg-native recording. ffmpeg-native writes the file in real time; stop_recording produces the final output. If you wanted a different savePath, pass it to start_recording." }] };
+          }
+          case "clear": {
+            const had = await ffClear(tabId);
+            return {
+              content: [{
+                type: "text",
+                text: had ? `Cleared ffmpeg-native recording for tab ${tabId}` : `No ffmpeg-native recording to clear for tab ${tabId}`,
+              }],
+            };
+          }
+          default:
+            return { content: [{ type: "text", text: `Unknown action: ${action}. Valid: start_recording, stop_recording, export, clear.` }] };
+        }
+      }
+
       if (engine === "media-recorder") {
         switch (action) {
           case "start_recording": {

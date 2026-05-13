@@ -258,9 +258,267 @@ async function handleVrecMessage(msg) {
     case "vrec_mr_finalize":  return vrecMrFinalize(msg);
     case "vrec_mr_export":    return vrecMrExport(msg);
     case "vrec_mr_abort":     return vrecMrAbort(msg);
+    // ffmpeg-native engine - OS-level screen capture via gdigrab/avfoundation/x11grab
+    case "vrec_ff_start":     return vrecFfStart(msg);
+    case "vrec_ff_stop":      return vrecFfStop(msg);
+    case "vrec_ff_abort":     return vrecFfAbort(msg);
+    case "vrec_ff_status":    return vrecFfStatus(msg);
     default:
       throw new Error(`Unknown vrec message: ${msg.type}`);
   }
+}
+
+// ===========================================================================
+// ffmpeg-native engine.
+//
+// This engine lives entirely in the native host - it doesn't go through the
+// Chrome extension's MediaRecorder pipeline at all. The native host spawns
+// ffmpeg with a platform-specific screen-capture input device and pipes the
+// encoded video straight to disk.
+//
+// Why: Chrome's tab/desktop capture APIs require a user gesture (activeTab
+// for tabCapture, transient user activation for getDisplayMedia). Pure
+// automation can't fake those. ffmpeg has no such restriction - it reads
+// the OS framebuffer directly.
+//
+// Trade-off: the captured window must be visible on screen. Minimized windows
+// don't paint to the display, so gdigrab/x11grab/avfoundation see nothing.
+// The extension is responsible for un-minimizing the window before recording
+// and restoring state after. For full off-screen private recording, see
+// Option B (Electron BrowserWindow with paintWhenInitiallyHidden) or Option C
+// (headless Chromium iso-mode + CDP screencast).
+//
+// Graceful stop: ffmpeg needs to write the mp4 moov atom (trailer) on exit.
+// SIGTERM/SIGKILL mid-encode produces a corrupt unreadable mp4. We send 'q'
+// to ffmpeg's stdin instead - that's ffmpeg's built-in graceful-exit signal.
+// ===========================================================================
+
+const ffmpegRecordings = new Map(); // recordingId -> { proc, savePath, startedAt, format, stderr, exitPromise, exited, exitCode }
+
+async function findFirstFfmpeg() {
+  // Try each ffmpeg candidate with -version. First one that succeeds wins.
+  for (const ff of findFfmpeg()) {
+    try {
+      await new Promise((resolve, reject) => {
+        const p = spawn(ff, ["-version"], { stdio: ["ignore", "pipe", "pipe"] });
+        p.on("error", reject);
+        p.on("close", (code) => code === 0 ? resolve() : reject(new Error(`${ff} -version exit ${code}`)));
+      });
+      return ff;
+    } catch (e) {
+      if (e.code !== "ENOENT") log(`ffmpeg probe failed at ${ff}: ${e.message}`);
+    }
+  }
+  throw new Error(`ffmpeg not found. Tried: ${findFfmpeg().join(", ")}. Install ffmpeg or set FFMPEG_PATH env var.`);
+}
+
+function buildFfmpegCaptureArgs({ windowTitle, region, frameRate, videoBitsPerSecond, savePath, format, drawCursor }) {
+  const args = ["-y"];
+  const plat = process.platform;
+  const fps = frameRate || 30;
+  if (plat === "win32") {
+    args.push("-f", "gdigrab", "-framerate", String(fps), "-draw_mouse", drawCursor ? "1" : "0");
+    if (region) {
+      args.push("-offset_x", String(region.x), "-offset_y", String(region.y));
+      args.push("-video_size", `${region.width}x${region.height}`);
+      args.push("-i", "desktop");
+    } else if (windowTitle) {
+      args.push("-i", `title=${windowTitle}`);
+    } else {
+      args.push("-i", "desktop");
+    }
+  } else if (plat === "darwin") {
+    // macOS: avfoundation. Screen index varies by machine; "1:none" is
+    // typically the primary screen with no audio. Capture cursor is on by default.
+    args.push("-f", "avfoundation", "-framerate", String(fps), "-capture_cursor", drawCursor ? "1" : "0");
+    if (region) {
+      // avfoundation doesn't crop natively; pass region to vf later
+      args.push("-i", "1:none");
+      args.push("-vf", `crop=${region.width}:${region.height}:${region.x}:${region.y}`);
+    } else {
+      args.push("-i", "1:none");
+    }
+  } else {
+    // Linux: x11grab
+    const display = process.env.DISPLAY || ":0.0";
+    args.push("-f", "x11grab", "-framerate", String(fps), "-draw_mouse", drawCursor ? "1" : "0");
+    if (region) {
+      args.push("-video_size", `${region.width}x${region.height}`);
+      args.push("-i", `${display}+${region.x},${region.y}`);
+    } else {
+      args.push("-i", display);
+    }
+  }
+  // Encoding
+  const fmt = (format || "mp4").toLowerCase();
+  if (fmt === "mp4") {
+    args.push("-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart");
+    if (videoBitsPerSecond) args.push("-b:v", String(videoBitsPerSecond));
+  } else if (fmt === "webm") {
+    args.push("-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0", "-row-mt", "1");
+  } else if (fmt === "gif") {
+    args.push("-c:v", "gif");
+  }
+  args.push(savePath);
+  return args;
+}
+
+async function vrecFfStart(msg) {
+  const { requestId, recordingId, windowTitle, region, savePath, format, frameRate, videoBitsPerSecond, drawCursor = true } = msg;
+  if (!recordingId) throw new Error("vrec_ff_start: recordingId required");
+  if (ffmpegRecordings.has(recordingId)) throw new Error(`ffmpeg recordingId ${recordingId} already active`);
+  const fmt = (format || "mp4").toLowerCase();
+  const targetPath = savePath || path.join(os.homedir(), "Downloads", `orellius-${Date.now()}.${fmt}`);
+  await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+
+  const args = buildFfmpegCaptureArgs({ windowTitle, region, frameRate, videoBitsPerSecond, savePath: targetPath, format: fmt, drawCursor });
+  const ff = await findFirstFfmpeg();
+  log(`vrec_ff_start ${recordingId} via ${ff}: ${args.join(" ")}`);
+
+  const proc = spawn(ff, args, { stdio: ["pipe", "ignore", "pipe"] });
+  let stderrTail = "";
+  proc.stderr.on("data", (d) => {
+    const s = d.toString();
+    stderrTail = (stderrTail + s).slice(-2000);
+  });
+
+  const exitPromise = new Promise((resolve) => {
+    proc.once("exit", (code, signal) => {
+      const rec = ffmpegRecordings.get(recordingId);
+      if (rec) {
+        rec.exited = true;
+        rec.exitCode = code;
+        rec.exitSignal = signal;
+      }
+      log(`vrec_ff exit ${recordingId} code=${code} signal=${signal} stderrTail=${stderrTail.slice(-300)}`);
+      resolve({ code, signal });
+    });
+  });
+
+  // ffmpeg can fail immediately if window title not found or device unavailable.
+  // Give it 1.5s to confirm it started, then check if still alive.
+  await new Promise((r) => setTimeout(r, 1500));
+  if (proc.exitCode !== null) {
+    throw new Error(`ffmpeg exited immediately (code=${proc.exitCode}): ${stderrTail.slice(-500)}`);
+  }
+
+  ffmpegRecordings.set(recordingId, {
+    proc,
+    savePath: targetPath,
+    startedAt: Date.now(),
+    format: fmt,
+    get stderr() { return stderrTail; },
+    exitPromise,
+    exited: false,
+    exitCode: null,
+    ffmpegPath: ff,
+  });
+  writeNativeMessage({
+    type: "vrec_ff_start_ok",
+    requestId,
+    recordingId,
+    pid: proc.pid,
+    savePath: targetPath,
+    ffmpegPath: ff,
+  });
+}
+
+async function vrecFfStop(msg) {
+  const { requestId, recordingId } = msg;
+  const rec = ffmpegRecordings.get(recordingId);
+  if (!rec) throw new Error(`vrec_ff_stop: unknown recordingId ${recordingId}`);
+  if (rec.exited) {
+    // Already exited (e.g. ffmpeg crashed). Just report current state.
+    let size = 0;
+    try { size = (await fs.promises.stat(rec.savePath)).size; } catch {}
+    ffmpegRecordings.delete(recordingId);
+    writeNativeMessage({
+      type: "vrec_ff_stop_ok",
+      requestId,
+      recordingId,
+      savePath: rec.savePath,
+      fileSize: size,
+      durationMs: Date.now() - rec.startedAt,
+      cleanExit: false,
+      exitCode: rec.exitCode,
+      stderrTail: rec.stderr.slice(-500),
+    });
+    return;
+  }
+  // Send 'q' to stdin for graceful exit. ffmpeg writes the moov atom and
+  // closes the file. SIGTERM/SIGKILL would corrupt the mp4.
+  try { rec.proc.stdin.write("q"); } catch (e) { log(`vrec_ff stdin write failed: ${e.message}`); }
+  try { rec.proc.stdin.end(); } catch {}
+
+  // Wait up to 15s for graceful exit. If it overruns, force kill (file may
+  // be corrupt but we don't want to hang forever).
+  let cleanExit = true;
+  const exitWatchdog = new Promise((resolve) => {
+    setTimeout(() => {
+      if (!rec.exited) {
+        log(`vrec_ff ${recordingId} did not exit after 15s of 'q' signal, sending SIGTERM`);
+        try { rec.proc.kill("SIGTERM"); } catch {}
+        cleanExit = false;
+      }
+      resolve();
+    }, 15000);
+  });
+  await Promise.race([rec.exitPromise, exitWatchdog]);
+  // If still not exited (SIGTERM didn't work), SIGKILL
+  if (!rec.exited) {
+    try { rec.proc.kill("SIGKILL"); } catch {}
+    cleanExit = false;
+    // Wait a tick for the exit event to fire
+    await Promise.race([rec.exitPromise, new Promise((r) => setTimeout(r, 2000))]);
+  }
+
+  const stat = await fs.promises.stat(rec.savePath).catch(() => ({ size: 0 }));
+  ffmpegRecordings.delete(recordingId);
+  writeNativeMessage({
+    type: "vrec_ff_stop_ok",
+    requestId,
+    recordingId,
+    savePath: rec.savePath,
+    fileSize: stat.size,
+    durationMs: Date.now() - rec.startedAt,
+    cleanExit,
+    exitCode: rec.exitCode,
+    stderrTail: rec.stderr.slice(-500),
+  });
+}
+
+async function vrecFfAbort(msg) {
+  const { requestId, recordingId } = msg;
+  const rec = ffmpegRecordings.get(recordingId);
+  if (!rec) {
+    writeNativeMessage({ type: "vrec_ff_abort_ok", requestId, recordingId });
+    return;
+  }
+  try { rec.proc.kill("SIGKILL"); } catch {}
+  try { await fs.promises.unlink(rec.savePath); } catch {}
+  ffmpegRecordings.delete(recordingId);
+  writeNativeMessage({ type: "vrec_ff_abort_ok", requestId, recordingId });
+}
+
+async function vrecFfStatus(msg) {
+  const { requestId, recordingId } = msg;
+  const rec = ffmpegRecordings.get(recordingId);
+  if (!rec) {
+    writeNativeMessage({ type: "vrec_ff_status_ok", requestId, recordingId, active: false });
+    return;
+  }
+  let size = 0;
+  try { size = (await fs.promises.stat(rec.savePath)).size; } catch {}
+  writeNativeMessage({
+    type: "vrec_ff_status_ok",
+    requestId,
+    recordingId,
+    active: !rec.exited,
+    savePath: rec.savePath,
+    fileSize: size,
+    durationMs: Date.now() - rec.startedAt,
+    stderrTail: rec.stderr.slice(-300),
+  });
 }
 
 // ===========================================================================
