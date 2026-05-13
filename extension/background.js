@@ -1640,6 +1640,291 @@ function vrecClear(tabId) {
   return true;
 }
 
+// ============================================================================
+// MediaRecorder engine (the "real video" path).
+//
+// Why this exists: the CDP engine above uses Page.startScreencast, which is
+// paint-event-driven. On static pages (waiting for an AI response, idle
+// dashboards) it emits sparse frames and the exported video looks like a
+// slideshow. The MediaRecorder engine sits on chrome.tabCapture +
+// getUserMedia + MediaRecorder, which is frame-paced regardless of page
+// activity. This is the same API stack Loom, Screenity and Camtasia use.
+//
+// MV3 service workers can't host MediaRecorder (no DOM). So we route the
+// stream through an offscreen document (extension/offscreen.html +
+// offscreen.js). The SW only handles control-plane (start/stop) and forwards
+// blob chunks from the offscreen doc to the native host via WebSocket.
+// ============================================================================
+
+const mrRecordingState = new Map(); // tabId -> { recordingId, status, startedAt, mimeType, format, savePath, chunkCount, bytesSent, frameRate, captureAudio, videoBitsPerSecond, _stopWaiters, _finalizedResolve, _finalizedPromise }
+const mrByRecordingId = new Map(); // recordingId -> tabId (chunk callbacks come from offscreen with recordingId only)
+const OFFSCREEN_URL = "offscreen.html";
+
+async function hasOffscreenDoc() {
+  if (typeof chrome.offscreen === "undefined") return false;
+  if (typeof chrome.runtime.getContexts === "function") {
+    try {
+      const contexts = await chrome.runtime.getContexts({
+        contextTypes: ["OFFSCREEN_DOCUMENT"],
+      });
+      return contexts.length > 0;
+    } catch {}
+  }
+  // Fallback for older runtimes
+  try {
+    return await chrome.offscreen.hasDocument();
+  } catch {
+    return false;
+  }
+}
+
+async function ensureOffscreenDoc() {
+  if (typeof chrome.offscreen === "undefined") {
+    throw new Error("chrome.offscreen API not available - need Chrome >= 116 with offscreen permission");
+  }
+  if (await hasOffscreenDoc()) return;
+  await chrome.offscreen.createDocument({
+    url: OFFSCREEN_URL,
+    reasons: ["USER_MEDIA"],
+    justification: "MediaRecorder lifecycle for tab capture - real-video recording engine",
+  });
+  log(`mr offscreen document created`);
+}
+
+async function sendToOffscreen(payload, { timeoutMs = 10000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`offscreen ${payload.cmd} timeout`)), timeoutMs);
+    try {
+      chrome.runtime.sendMessage({ target: "offscreen", ...payload }, (response) => {
+        clearTimeout(t);
+        const err = chrome.runtime.lastError;
+        if (err) return reject(new Error(err.message));
+        if (!response) return reject(new Error("offscreen returned no response"));
+        if (response.ok === false) return reject(new Error(response.error || "offscreen reported failure"));
+        resolve(response);
+      });
+    } catch (e) {
+      clearTimeout(t);
+      reject(e);
+    }
+  });
+}
+
+async function mrStartRecording(tabId, opts = {}) {
+  if (mrRecordingState.has(tabId)) {
+    throw new Error(`Tab ${tabId} already has an MR recording`);
+  }
+  if (recordingState.has(tabId)) {
+    throw new Error(`Tab ${tabId} already has a CDP recording`);
+  }
+
+  const frameRate = Math.max(5, Math.min(60, opts.frameRate || opts.fps || 30));
+  const videoBitsPerSecond = opts.videoBitsPerSecond || 2_500_000;
+  const captureAudio = opts.captureAudio === true; // opt-in
+  const format = (opts.format || "webm").toLowerCase();
+  const recordingId = `mr-${tabId}-${Date.now()}`;
+
+  // Bring the tab to front. Tab capture works on hidden tabs but the visible
+  // frame is what gets encoded - if the tab isn't being rendered the video
+  // is blank. This is the same workaround the CDP engine uses.
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId !== undefined) {
+      // Respect global private-mode lock: never raise focus, only normalize state
+      const winState = mrPrivateLockActive() ? "normal" : "normal";
+      await chrome.windows.update(tab.windowId, { state: winState });
+    }
+    await chrome.tabs.update(tabId, { active: true });
+  } catch (e) {
+    log(`mr front-tab WARN: ${e.message}`);
+  }
+
+  // Mint a tab MediaStream ID. This is the gating call - it requires the
+  // tab to be the active tab in its window and (some Chrome versions) a
+  // recent user gesture. Inside an MCP-driven session we have neither, so
+  // we use the callback variant that pulls from activeTab permission.
+  let streamId;
+  try {
+    streamId = await new Promise((resolve, reject) => {
+      chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
+        const err = chrome.runtime.lastError;
+        if (err) return reject(new Error(err.message));
+        if (!id) return reject(new Error("getMediaStreamId returned empty"));
+        resolve(id);
+      });
+    });
+  } catch (e) {
+    throw new Error(`tabCapture.getMediaStreamId failed: ${e.message}. Tab ${tabId} must be the active tab in its window; if running in private/locked mode, the tab can still be captured but must be focused inside its owned window.`);
+  }
+
+  await ensureOffscreenDoc();
+
+  // Tell the host to set up a writable .webm file at the recording location
+  await sendVrecToHost({
+    type: "vrec_mr_begin",
+    recordingId,
+    format,
+    mimeTypeHint: "video/webm",
+  }, { timeoutMs: 10000 });
+
+  // Start the offscreen recorder
+  const startResp = await sendToOffscreen({
+    cmd: "start",
+    recordingId,
+    streamId,
+    frameRate,
+    videoBitsPerSecond,
+    captureAudio,
+    chunkMs: opts.chunkMs || 1000,
+  }, { timeoutMs: 15000 });
+
+  const state = {
+    recordingId,
+    status: "recording",
+    startedAt: Date.now(),
+    mimeType: startResp.mimeType || "video/webm",
+    format,
+    chunkCount: 0,
+    bytesSent: 0,
+    frameRate,
+    videoBitsPerSecond,
+    captureAudio,
+    savePath: null,
+    _finalizedResolve: null,
+    _finalizedPromise: null,
+  };
+  state._finalizedPromise = new Promise((resolve) => { state._finalizedResolve = resolve; });
+  mrRecordingState.set(tabId, state);
+  mrByRecordingId.set(recordingId, tabId);
+
+  // Keep-alive arms so the SW survives the recording window
+  _exportKeepaliveStart();
+
+  log(`mr start tab=${tabId} rid=${recordingId} fps=${frameRate} bps=${videoBitsPerSecond} mime=${state.mimeType}`);
+  return state;
+}
+
+async function mrStopRecording(tabId) {
+  const state = mrRecordingState.get(tabId);
+  if (!state) throw new Error(`No MR recording for tab ${tabId}`);
+  if (state.status !== "recording") {
+    return mrStateInfo(state);
+  }
+  state.status = "stopping";
+  // Stop the recorder; offscreen will flush remaining chunks and emit
+  // orellius_mr_stopped which resolves _finalizedPromise via the chunk handler.
+  try {
+    await sendToOffscreen({ cmd: "stop", recordingId: state.recordingId }, { timeoutMs: 30000 });
+  } catch (e) {
+    log(`mr stop offscreen warn: ${e.message}`);
+  }
+  // Wait for the final chunk to land at the host (the orellius_mr_stopped
+  // event sets state.status = "stopped" via the on-stop handler).
+  const deadline = Date.now() + 30000;
+  while (state.status !== "stopped" && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (state.status !== "stopped") {
+    log(`mr stop deadline hit (rid=${state.recordingId}, chunks=${state.chunkCount})`);
+    state.status = "stopped";
+  }
+  state.stoppedAt = state.stoppedAt || Date.now();
+
+  // Tell host to finalize (close file handle, return path)
+  try {
+    const fin = await sendVrecToHost({
+      type: "vrec_mr_finalize",
+      recordingId: state.recordingId,
+      format: state.format,
+      chunkCount: state.chunkCount,
+      bytesSent: state.bytesSent,
+      durationMs: state.stoppedAt - state.startedAt,
+      mimeType: state.mimeType,
+    }, { timeoutMs: 60000 });
+    state.savePath = fin?.savePath || null;
+  } catch (e) {
+    log(`mr finalize WARN: ${e.message}`);
+  }
+  return mrStateInfo(state);
+}
+
+function mrStateInfo(state) {
+  return {
+    recordingId: state.recordingId,
+    frameCount: null, // not tracked per-frame in MR engine
+    chunkCount: state.chunkCount,
+    bytesSent: state.bytesSent,
+    durationMs: (state.stoppedAt || Date.now()) - state.startedAt,
+    mimeType: state.mimeType,
+    format: state.format,
+    savePath: state.savePath,
+    fps: state.frameRate,
+  };
+}
+
+async function mrClear(tabId) {
+  const state = mrRecordingState.get(tabId);
+  if (!state) return false;
+  try {
+    await sendToOffscreen({ cmd: "cancel", recordingId: state.recordingId }, { timeoutMs: 5000 });
+  } catch {}
+  try {
+    await sendVrecToHost({ type: "vrec_mr_abort", recordingId: state.recordingId }, { timeoutMs: 5000 });
+  } catch {}
+  mrByRecordingId.delete(state.recordingId);
+  mrRecordingState.delete(tabId);
+  _exportKeepaliveStop();
+  return true;
+}
+
+function mrPrivateLockActive() {
+  // Re-uses the existing private-mode flag. The actual lookup lives in the
+  // global focus-policy module; we just need a boolean to avoid focusing.
+  // Default to true (safer - never steal focus).
+  return globalThis._forcePrivate === true || globalThis._privateModeLocked === true || true;
+}
+
+// Listen for chunks coming back from the offscreen document
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || (msg.type !== "orellius_mr_chunk" && msg.type !== "orellius_mr_stopped" && msg.type !== "orellius_mr_error")) {
+    return false;
+  }
+  const tabId = mrByRecordingId.get(msg.recordingId);
+  if (!tabId) return false;
+  const state = mrRecordingState.get(tabId);
+  if (!state) return false;
+
+  if (msg.type === "orellius_mr_chunk") {
+    state.chunkCount = msg.seq;
+    state.bytesSent += msg.size;
+    // Forward to native host. Each chunk is base64 of ~2s of webm at our
+    // chosen bitrate (~625 KB at 2.5Mbps for 2s). Well under the 1MB native
+    // messaging cap (we use 1s chunks by default = ~312 KB).
+    sendVrecToHost({
+      type: "vrec_mr_chunk",
+      recordingId: msg.recordingId,
+      seq: msg.seq,
+      base64: msg.base64,
+      size: msg.size,
+      mimeType: msg.mimeType,
+      ts: msg.ts,
+    }, { timeoutMs: 15000 }).catch((e) => {
+      log(`mr chunk forward error: ${e.message}`);
+    });
+  } else if (msg.type === "orellius_mr_stopped") {
+    state.status = "stopped";
+    state.stoppedAt = Date.now();
+    state.chunkCount = msg.chunkCount || state.chunkCount;
+    state.bytesSent = msg.bytesSent || state.bytesSent;
+    state.mimeType = msg.mimeType || state.mimeType;
+    if (state._finalizedResolve) state._finalizedResolve();
+    log(`mr stopped rid=${msg.recordingId} chunks=${state.chunkCount} bytes=${state.bytesSent}`);
+  } else if (msg.type === "orellius_mr_error") {
+    log(`mr error rid=${msg.recordingId}: ${msg.error}`);
+  }
+  return false; // not awaiting a response
+});
+
 // --- Native-host request/response correlation for vrec_* messages ---
 const pendingVrecRequests = new Map(); // requestId -> {resolve, reject, timer}
 let vrecRequestCounter = 0;
@@ -2847,14 +3132,99 @@ const toolHandlers = {
       return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
     }
 
+    // Engine selection. "media-recorder" (default) uses chrome.tabCapture +
+    // MediaRecorder via an offscreen document - frame-paced, Loom/Camtasia
+    // quality. "cdp-legacy" uses Page.startScreencast - paint-event-driven,
+    // good for compositing synthetic cursor overlays but produces choppy
+    // video on static pages. For an active recording, the engine is locked
+    // by the start_recording call; stop/export/clear auto-detect.
+    const requestedEngine = (options.engine || (action === "start_recording" ? "media-recorder" : null) || "").toLowerCase();
+    const isMrActive = mrRecordingState.has(tabId);
+    const isCdpActive = recordingState.has(tabId);
+    let engine;
+    if (action === "start_recording") {
+      engine = requestedEngine || "media-recorder";
+    } else {
+      // For stop/export/clear, follow whichever engine is actually running
+      if (isMrActive) engine = "media-recorder";
+      else if (isCdpActive) engine = "cdp-legacy";
+      else engine = requestedEngine || "media-recorder";
+    }
+
     try {
+      if (engine === "media-recorder") {
+        switch (action) {
+          case "start_recording": {
+            const state = await mrStartRecording(tabId, { ...options, format: (format || "webm").toLowerCase() });
+            return {
+              content: [{
+                type: "text",
+                text: `Recording started on tab ${tabId} (MediaRecorder engine). Codec: ${state.mimeType}, ${state.frameRate}fps target, ${(state.videoBitsPerSecond/1000).toFixed(0)}kbps. Output: ${state.format}. Call record_video(action='stop_recording') when done. Audio: ${state.captureAudio ? "captured" : "off"}.`,
+              }],
+            };
+          }
+
+          case "stop_recording": {
+            const info = await mrStopRecording(tabId);
+            return {
+              content: [{
+                type: "text",
+                text: `Recording stopped (MediaRecorder): ${info.chunkCount} chunks, ${(info.bytesSent/1024).toFixed(1)} KiB, ${(info.durationMs/1000).toFixed(1)}s, ${info.mimeType}. ${info.savePath ? `Saved to ${info.savePath}.` : "Call record_video(action='export') to choose savePath."}`,
+              }],
+            };
+          }
+
+          case "export": {
+            // For the MR engine the .webm file already exists on disk from
+            // the streaming finalize. If savePath was provided, rename;
+            // otherwise return the auto-generated path.
+            const state = mrRecordingState.get(tabId);
+            if (!state) {
+              return { content: [{ type: "text", text: `No MR recording for tab ${tabId} - did you call stop_recording yet?` }] };
+            }
+            const fmt = (format || state.format || "webm").toLowerCase();
+            const desired = savePath || (filename ? null : null);
+            const result = await sendVrecToHost({
+              type: "vrec_mr_export",
+              recordingId: state.recordingId,
+              format: fmt,
+              filename: filename || `orellius-${Date.now()}.${fmt}`,
+              savePath: desired,
+            }, { timeoutMs: 120000 });
+            mrByRecordingId.delete(state.recordingId);
+            mrRecordingState.delete(tabId);
+            _exportKeepaliveStop();
+            return {
+              content: [{
+                type: "text",
+                text: `Exported MediaRecorder capture to ${result.savePath} (${(result.fileSize/1024).toFixed(1)} KiB, ${result.durationSec ? result.durationSec.toFixed(1) + "s" : "?"}, ${fmt}).`,
+              }],
+            };
+          }
+
+          case "clear": {
+            const had = await mrClear(tabId);
+            return {
+              content: [{
+                type: "text",
+                text: had ? `Cleared MR recording for tab ${tabId}` : `No MR recording to clear for tab ${tabId}`,
+              }],
+            };
+          }
+
+          default:
+            return { content: [{ type: "text", text: `Unknown action: ${action}. Valid: start_recording, stop_recording, export, clear.` }] };
+        }
+      }
+
+      // engine === "cdp-legacy"
       switch (action) {
         case "start_recording": {
           await vrecStartRecording(tabId, options || {});
           return {
             content: [{
               type: "text",
-              text: `Recording started on tab ${tabId}. Capture: ${options.maxWidth || 1280}x${options.maxHeight || 720} jpeg, ~${Math.round(30 / (options.everyNthFrame || 2))}fps. Call record_video(action='stop_recording') when done.`,
+              text: `Recording started on tab ${tabId} (CDP legacy engine). Capture: ${options.maxWidth || 1280}x${options.maxHeight || 720} jpeg, ~${Math.round(30 / (options.everyNthFrame || 2))}fps. Call record_video(action='stop_recording') when done.`,
             }],
           };
         }
@@ -2906,7 +3276,7 @@ const toolHandlers = {
           return { content: [{ type: "text", text: `Unknown action: ${action}. Valid: start_recording, stop_recording, export, clear.` }] };
       }
     } catch (err) {
-      return { content: [{ type: "text", text: `gif_creator(${action}) failed: ${err.message}` }] };
+      return { content: [{ type: "text", text: `gif_creator(${action}, engine=${engine}) failed: ${err.message}` }] };
     }
   },
 

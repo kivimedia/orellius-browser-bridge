@@ -247,14 +247,183 @@ function findFfmpeg() {
 
 async function handleVrecMessage(msg) {
   switch (msg.type) {
-    case "vrec_begin":    return vrecBegin(msg);
-    case "vrec_frame":    return vrecFrame(msg);
-    case "vrec_end":      return vrecEnd(msg);       // legacy: pre-B1 export-time pipeline
-    case "vrec_finalize": return vrecFinalize(msg);  // B1: stream-during-capture closer
-    case "vrec_abort":    return vrecAbort(msg);
+    case "vrec_begin":        return vrecBegin(msg);
+    case "vrec_frame":        return vrecFrame(msg);
+    case "vrec_end":          return vrecEnd(msg);          // legacy: pre-B1 export-time pipeline
+    case "vrec_finalize":     return vrecFinalize(msg);     // B1: stream-during-capture closer
+    case "vrec_abort":        return vrecAbort(msg);
+    // MediaRecorder engine (real-video path) - frame-paced webm chunks
+    case "vrec_mr_begin":     return vrecMrBegin(msg);
+    case "vrec_mr_chunk":     return vrecMrChunk(msg);
+    case "vrec_mr_finalize":  return vrecMrFinalize(msg);
+    case "vrec_mr_export":    return vrecMrExport(msg);
+    case "vrec_mr_abort":     return vrecMrAbort(msg);
     default:
       throw new Error(`Unknown vrec message: ${msg.type}`);
   }
+}
+
+// ===========================================================================
+// MediaRecorder engine handlers.
+//
+// The extension streams webm chunks (each ~1-2 seconds of encoded video) over
+// the native messaging channel. We append the bytes to a single .webm file
+// as they arrive. On finalize the file is closed and ready to use. If the
+// caller wants mp4, vrec_mr_export runs ffmpeg to repack (no re-encode needed,
+// just container swap most of the time).
+// ===========================================================================
+
+const mrRecordings = new Map(); // recordingId -> { tempPath, fd, format, mimeType, bytesWritten, chunkCount, startedAt, finalizedAt, durationMs }
+
+function mrTempPath(recordingId) {
+  return path.join(vrecTempRoot(), `${recordingId}.webm`);
+}
+
+async function vrecMrBegin(msg) {
+  const { requestId, recordingId, format, mimeTypeHint } = msg;
+  if (!recordingId) throw new Error("vrec_mr_begin: recordingId required");
+  if (mrRecordings.has(recordingId)) throw new Error(`MR recordingId ${recordingId} already active`);
+  const root = vrecTempRoot();
+  await fs.promises.mkdir(root, { recursive: true });
+  const tempPath = mrTempPath(recordingId);
+  // Open for append+create; we'll write chunks as they arrive
+  const fd = await fs.promises.open(tempPath, "w");
+  mrRecordings.set(recordingId, {
+    tempPath,
+    fd,
+    format: format || "webm",
+    mimeType: mimeTypeHint || "video/webm",
+    bytesWritten: 0,
+    chunkCount: 0,
+    startedAt: Date.now(),
+    finalizedAt: null,
+    durationMs: null,
+  });
+  log(`vrec_mr_begin ${recordingId} -> ${tempPath}`);
+  writeNativeMessage({ type: "vrec_mr_begin_ok", requestId, recordingId, tempPath });
+}
+
+async function vrecMrChunk(msg) {
+  const { requestId, recordingId, base64, seq, size, mimeType } = msg;
+  const rec = mrRecordings.get(recordingId);
+  if (!rec) throw new Error(`vrec_mr_chunk: unknown recordingId ${recordingId}`);
+  if (!base64) throw new Error("vrec_mr_chunk: base64 required");
+  const buf = Buffer.from(base64, "base64");
+  await rec.fd.write(buf);
+  rec.bytesWritten += buf.length;
+  rec.chunkCount = Math.max(rec.chunkCount, seq || 0);
+  if (mimeType) rec.mimeType = mimeType;
+  // Don't echo every chunk back - the extension fires-and-forgets ~1/sec.
+  // Just ack so the request promise resolves.
+  writeNativeMessage({ type: "vrec_mr_chunk_ok", requestId, recordingId, seq, bytesWritten: rec.bytesWritten });
+}
+
+async function vrecMrFinalize(msg) {
+  const { requestId, recordingId, durationMs, chunkCount, bytesSent, mimeType } = msg;
+  const rec = mrRecordings.get(recordingId);
+  if (!rec) throw new Error(`vrec_mr_finalize: unknown recordingId ${recordingId}`);
+  try { await rec.fd.close(); } catch {}
+  rec.fd = null;
+  rec.finalizedAt = Date.now();
+  rec.durationMs = durationMs || (rec.finalizedAt - rec.startedAt);
+  if (chunkCount) rec.chunkCount = chunkCount;
+  if (mimeType) rec.mimeType = mimeType;
+  let stat;
+  try {
+    stat = await fs.promises.stat(rec.tempPath);
+  } catch (e) {
+    throw new Error(`vrec_mr_finalize: stat failed on ${rec.tempPath}: ${e.message}`);
+  }
+  if (stat.size === 0) {
+    throw new Error("vrec_mr_finalize: webm file is 0 bytes - no chunks reached the host");
+  }
+  log(`vrec_mr_finalize ${recordingId}: ${stat.size}b, chunks=${rec.chunkCount}, dur=${rec.durationMs}ms`);
+  writeNativeMessage({
+    type: "vrec_mr_finalize_ok",
+    requestId,
+    recordingId,
+    savePath: rec.tempPath,
+    fileSize: stat.size,
+    chunkCount: rec.chunkCount,
+    durationSec: rec.durationMs / 1000,
+    mimeType: rec.mimeType,
+  });
+}
+
+async function vrecMrExport(msg) {
+  const { requestId, recordingId, format, filename, savePath } = msg;
+  const rec = mrRecordings.get(recordingId);
+  if (!rec) throw new Error(`vrec_mr_export: unknown recordingId ${recordingId}`);
+  if (rec.fd) {
+    try { await rec.fd.close(); } catch {}
+    rec.fd = null;
+  }
+  const targetFormat = (format || rec.format || "webm").toLowerCase();
+  const defaultName = filename || `orellius-${Date.now()}.${targetFormat}`;
+  const finalPath = savePath || path.join(os.homedir(), "Downloads", defaultName);
+  await fs.promises.mkdir(path.dirname(finalPath), { recursive: true });
+
+  if (targetFormat === "webm") {
+    // Same container - just move/rename
+    await fs.promises.copyFile(rec.tempPath, finalPath);
+    try { await fs.promises.unlink(rec.tempPath); } catch {}
+  } else if (targetFormat === "mp4") {
+    // Repack: webm (VP9/VP8) -> mp4 (H.264). Re-encode is needed because mp4
+    // doesn't support VP9 in most players. Use libx264 veryfast for speed.
+    const args = [
+      "-y",
+      "-i", rec.tempPath,
+      "-c:v", "libx264",
+      "-crf", "23",
+      "-preset", "veryfast",
+      "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart",
+      "-c:a", "aac",
+      "-b:a", "128k",
+      finalPath,
+    ];
+    await runFfmpegAttempt(args, { savePath: finalPath, format: "mp4" });
+    try { await fs.promises.unlink(rec.tempPath); } catch {}
+  } else if (targetFormat === "gif") {
+    // Two-pass palette gif for decent quality
+    const palette = finalPath + ".palette.png";
+    const gen = ["-y", "-i", rec.tempPath, "-vf", "fps=10,scale=720:-1:flags=lanczos,palettegen", palette];
+    await runFfmpegAttempt(gen, { savePath: palette, format: "png" });
+    const use = ["-y", "-i", rec.tempPath, "-i", palette, "-lavfi", "fps=10,scale=720:-1:flags=lanczos [x]; [x][1:v] paletteuse", finalPath];
+    await runFfmpegAttempt(use, { savePath: finalPath, format: "gif" });
+    try { await fs.promises.unlink(palette); } catch {}
+    try { await fs.promises.unlink(rec.tempPath); } catch {}
+  } else {
+    throw new Error(`vrec_mr_export: unsupported format ${targetFormat}`);
+  }
+
+  const stat = await fs.promises.stat(finalPath);
+  mrRecordings.delete(recordingId);
+  log(`vrec_mr_export ${recordingId} -> ${finalPath} (${stat.size}b, ${targetFormat})`);
+  writeNativeMessage({
+    type: "vrec_mr_export_ok",
+    requestId,
+    recordingId,
+    savePath: finalPath,
+    fileSize: stat.size,
+    durationSec: rec.durationMs ? rec.durationMs / 1000 : null,
+    format: targetFormat,
+  });
+}
+
+async function vrecMrAbort(msg) {
+  const { requestId, recordingId } = msg;
+  const rec = mrRecordings.get(recordingId);
+  if (!rec) {
+    writeNativeMessage({ type: "vrec_mr_abort_ok", requestId, recordingId });
+    return;
+  }
+  if (rec.fd) {
+    try { await rec.fd.close(); } catch {}
+  }
+  try { await fs.promises.unlink(rec.tempPath); } catch {}
+  mrRecordings.delete(recordingId);
+  writeNativeMessage({ type: "vrec_mr_abort_ok", requestId, recordingId });
 }
 
 // vrec_finalize is the B1 streaming-pipeline closer. Frames have already been

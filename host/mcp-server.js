@@ -585,22 +585,29 @@ server.tool(
 // 8. record_video (Playwright-style video recording, was: gif_creator)
 server.tool(
   "record_video",
-  "Record a browser session as video with synthetic cursor + click overlays composited onto each frame. Equivalent to Playwright's recordVideo. Output formats: webm (default), mp4, gif. Workflow: 1) start_recording (begins CDP screencast + mouse-event log on the tab), 2) drive the page via other tools (click, type, navigate, etc.), 3) stop_recording (halts capture but keeps frames), 4) export (writes the encoded video to disk via the native host's ffmpeg). All operations are scoped to a tab. Frames are captured at ~15fps by default and downscaled to fit 1280x720; tweak via options. The cursor and click ripples are SYNTHETIC (drawn from the same x/y values dispatched via Input.dispatchMouseEvent) because CDP-trusted clicks never move the OS pointer.",
+  "Record a browser session as video. Two engines: (1) DEFAULT 'media-recorder' uses chrome.tabCapture + MediaRecorder via an offscreen document - frame-paced webm/VP9 at the requested fps regardless of page repaint activity. This is Loom/Camtasia/Screenity-quality output. Best for sales demos, product walkthroughs, anything where the page sits idle (waiting on AI, etc.) between actions. (2) 'cdp-legacy' uses CDP Page.startScreencast - paint-event-driven, frames only emitted when the page repaints. Includes synthetic cursor + click ripple overlay composited per-frame, which the media-recorder engine cannot do (the real OS cursor is not captured by tab-capture). Use cdp-legacy when you need the cursor/click indicators in the final video. Workflow: 1) start_recording, 2) drive the page via other tools, 3) stop_recording, 4) export. All operations scoped to a tab.",
   {
-    action: z.enum(["start_recording", "stop_recording", "export", "clear"]).describe("Action to perform. start_recording: begin CDP Page.startScreencast on the tab and start logging mouse events. stop_recording: halt screencast but keep frames in memory. export: composite + ffmpeg-encode + write to disk; returns savePath. clear: discard frames (also stops if still recording)."),
+    action: z.enum(["start_recording", "stop_recording", "export", "clear"]).describe("Action to perform. start_recording: begin capture on the tab (engine picked from options.engine). stop_recording: halt capture. export: write the final file to disk (auto-format with format param). clear: cancel recording and discard."),
     tabId: z.number().describe("Tab ID. Must be a tab in the current MCP group. Use tabs_context_mcp first if unknown."),
-    format: z.enum(["webm", "mp4", "gif"]).optional().describe("Output container/codec for action='export'. Default 'webm' (libvpx-vp9, matches Playwright). 'mp4' uses libx264 (broadest compatibility). 'gif' uses ffmpeg's gif encoder (largest files, no audio, but universal preview)."),
+    format: z.enum(["webm", "mp4", "gif"]).optional().describe("Output container/codec for action='export'. Default 'webm'. For media-recorder engine: webm is no-op (already encoded as webm), mp4 transcodes via libx264, gif uses a two-pass palette. For cdp-legacy engine: webm uses libvpx-vp9, mp4 uses libx264, gif uses the gif encoder."),
     savePath: z.string().optional().describe("Absolute disk path for the output file (action='export'). If omitted, defaults to ~/Downloads/orellius-<timestamp>.<format>. Parent directories are created automatically."),
     filename: z.string().optional().describe("Convenience: just a filename when you don't care about the directory (saved under ~/Downloads). Ignored if savePath is set."),
     options: z.object({
-      showClickIndicators: z.boolean().optional().describe("Draw a synthetic cursor at the most-recent dispatched (x,y) and a ripple ring on each mousePressed event for ~500ms (default: true)."),
-      showProgressBar: z.boolean().optional().describe("Thin progress bar at the bottom of every frame (default: true)."),
-      showWatermark: z.boolean().optional().describe("Small 'Orellius' watermark in the lower-left corner (default: true)."),
-      maxWidth: z.number().optional().describe("Max capture width in CSS pixels (default 1280). The tab's CSS viewport is downscaled to fit."),
-      maxHeight: z.number().optional().describe("Max capture height in CSS pixels (default 720)."),
-      everyNthFrame: z.number().optional().describe("CDP screencast everyNthFrame (default 2 = ~15fps from a 30fps page; pass 1 for ~30fps; higher for lower fps + smaller files)."),
-      captureQuality: z.number().optional().describe("CDP screencast JPEG quality, 1-100 (default 80). Affects per-frame size, not codec quality."),
-    }).optional().describe("Capture/render options for start_recording (maxWidth/maxHeight/everyNthFrame/captureQuality) and export (showClickIndicators/showProgressBar/showWatermark). All have sensible defaults."),
+      engine: z.enum(["media-recorder", "cdp-legacy"]).optional().describe("Recording engine. Default 'media-recorder' for new recordings. The engine is locked at start_recording time; stop/export/clear auto-detect from the active recording."),
+      // media-recorder engine options
+      frameRate: z.number().optional().describe("[media-recorder] Target frame rate, 5-60 (default 30). Real video timeline regardless of page paint events."),
+      videoBitsPerSecond: z.number().optional().describe("[media-recorder] Encoder bitrate (default 2_500_000 = 2.5 Mbps). Higher = bigger file but better quality."),
+      captureAudio: z.boolean().optional().describe("[media-recorder] Include tab audio in the recording (default false). Note: enabling this mutes the captured tab to the user while recording."),
+      chunkMs: z.number().optional().describe("[media-recorder] How often the MediaRecorder emits a chunk in ms (default 1000). Affects pause-on-stop latency but not output quality."),
+      // cdp-legacy engine options (kept for backwards compat)
+      showClickIndicators: z.boolean().optional().describe("[cdp-legacy] Draw a synthetic cursor at the most-recent dispatched (x,y) and a ripple ring on each mousePressed event for ~500ms (default: true)."),
+      showProgressBar: z.boolean().optional().describe("[cdp-legacy] Thin progress bar at the bottom of every frame (default: true)."),
+      showWatermark: z.boolean().optional().describe("[cdp-legacy] Small 'Orellius' watermark in the lower-left corner (default: true)."),
+      maxWidth: z.number().optional().describe("[cdp-legacy] Max capture width in CSS pixels (default 1280). The tab's CSS viewport is downscaled to fit."),
+      maxHeight: z.number().optional().describe("[cdp-legacy] Max capture height in CSS pixels (default 720)."),
+      everyNthFrame: z.number().optional().describe("[cdp-legacy] CDP screencast everyNthFrame (default 2 = ~15fps from a 30fps page; pass 1 for ~30fps; higher for lower fps + smaller files)."),
+      captureQuality: z.number().optional().describe("[cdp-legacy] CDP screencast JPEG quality, 1-100 (default 80). Affects per-frame size, not codec quality."),
+    }).optional().describe("Capture/render options. Pass engine to choose recording engine. Other fields are engine-specific (see field descriptions)."),
   },
   async (args) => callTool("record_video", args)
 );
