@@ -1943,12 +1943,25 @@ async function ffStartRecording(tabId, opts = {}) {
     log(`ff window prep WARN: ${e.message}`);
   }
 
-  // Window title heuristic. Chrome's window title is "<tab title> - Google Chrome"
-  // on stock Chrome, "- Brave" / "- Microsoft Edge" on variants. Pass the tab
-  // title; ffmpeg gdigrab does substring matching, so the variant suffix
-  // doesn't usually break it. If multiple windows match the substring, the
-  // first one Windows returns wins (typically the foreground one).
-  const windowTitle = opts.windowTitle || tab?.title || null;
+  // Window title heuristic. Windows' top-level window title (what GDI sees
+  // and what gdigrab matches against) is "<tab title> - <browser name>",
+  // e.g. "Jewish Gardens Community Hub - Google Chrome". gdigrab does EXACT
+  // matching, not substring matching, so we have to construct the full
+  // title. The native_host receives an array of candidates and probes each
+  // until it finds the matching window.
+  const tabTitle = tab?.title || "";
+  const titleCandidates = opts.windowTitle
+    ? [opts.windowTitle]
+    : tabTitle
+      ? [
+          `${tabTitle} - Google Chrome`,
+          `${tabTitle} - Chromium`,
+          `${tabTitle} - Brave`,
+          `${tabTitle} - Microsoft Edge`,
+          tabTitle, // bare title (in case Chrome variant omits suffix)
+        ]
+      : [];
+  const windowTitle = titleCandidates[0] || null;
   const recordingId = `ff-${tabId}-${Date.now()}`;
 
   // savePath: callers can pass it explicitly; otherwise native_host fills
@@ -1957,6 +1970,7 @@ async function ffStartRecording(tabId, opts = {}) {
     type: "vrec_ff_start",
     recordingId,
     windowTitle,
+    titleCandidates, // host will try each in order on Windows
     region: opts.region || null,
     savePath: opts.savePath || null,
     format,

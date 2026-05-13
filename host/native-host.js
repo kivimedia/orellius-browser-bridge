@@ -363,15 +363,46 @@ function buildFfmpegCaptureArgs({ windowTitle, region, frameRate, videoBitsPerSe
   return args;
 }
 
+async function resolveWindowTitle(candidates) {
+  // Windows: query MainWindowTitle of running processes via PowerShell. Return
+  // the first candidate that actually matches a live window, or null.
+  if (process.platform !== "win32" || !Array.isArray(candidates) || candidates.length === 0) {
+    return null;
+  }
+  const escaped = candidates.map((c) => `'${String(c).replace(/'/g, "''")}'`).join(",");
+  const script = `$ErrorActionPreference='SilentlyContinue';$t=@(${escaped});Get-Process|Where-Object{$_.MainWindowTitle -ne '' -and $t -contains $_.MainWindowTitle}|Select-Object -First 1 -ExpandProperty MainWindowTitle`;
+  return new Promise((resolve) => {
+    const ps = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    ps.stdout.on("data", (d) => { out += d.toString(); });
+    ps.on("close", () => resolve(out.trim() || null));
+    ps.on("error", () => resolve(null));
+  });
+}
+
 async function vrecFfStart(msg) {
-  const { requestId, recordingId, windowTitle, region, savePath, format, frameRate, videoBitsPerSecond, drawCursor = true } = msg;
+  const { requestId, recordingId, windowTitle, titleCandidates, region, savePath, format, frameRate, videoBitsPerSecond, drawCursor = true } = msg;
   if (!recordingId) throw new Error("vrec_ff_start: recordingId required");
   if (ffmpegRecordings.has(recordingId)) throw new Error(`ffmpeg recordingId ${recordingId} already active`);
   const fmt = (format || "mp4").toLowerCase();
   const targetPath = savePath || path.join(os.homedir(), "Downloads", `orellius-${Date.now()}.${fmt}`);
   await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
 
-  const args = buildFfmpegCaptureArgs({ windowTitle, region, frameRate, videoBitsPerSecond, savePath: targetPath, format: fmt, drawCursor });
+  // Resolve the actual window title on Windows by probing the candidate list.
+  // This avoids the "wrong suffix" trap (Chrome vs Brave vs Edge etc.).
+  let resolvedTitle = windowTitle;
+  if (process.platform === "win32" && Array.isArray(titleCandidates) && titleCandidates.length > 0) {
+    const found = await resolveWindowTitle(titleCandidates);
+    if (found) {
+      resolvedTitle = found;
+      log(`vrec_ff resolved window title: "${found}" (from ${titleCandidates.length} candidates)`);
+    } else {
+      log(`vrec_ff WARN: none of the ${titleCandidates.length} title candidates matched a live window. Falling back to desktop capture.`);
+      resolvedTitle = null;
+    }
+  }
+
+  const args = buildFfmpegCaptureArgs({ windowTitle: resolvedTitle, region, frameRate, videoBitsPerSecond, savePath: targetPath, format: fmt, drawCursor });
   const ff = await findFirstFfmpeg();
   log(`vrec_ff_start ${recordingId} via ${ff}: ${args.join(" ")}`);
 
