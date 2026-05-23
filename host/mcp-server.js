@@ -1017,6 +1017,132 @@ server.tool(
   async (args) => callTool("session_end", args)
 );
 
+// 30. run_script
+//
+// Escape hatch for batch jobs that would otherwise need dozens of MCP
+// roundtrips (e.g., logging into N accounts back-to-back, running a Playwright
+// sweep, building a generated report). Writes the supplied JS to a temp file
+// and runs it with `node` in the chosen working directory. Captures stdout +
+// stderr + exit code and returns them along with any new file paths created
+// under `outputDir` so you can attach screenshots / artifacts without a
+// second roundtrip.
+//
+// Caller is responsible for what the script does. This is a generic Node
+// runner - it does NOT touch the MCP browser tabs. For Playwright loops, pass
+// a `cwd` that has playwright installed (e.g., your project root). The MCP
+// browser-bridge tools (computer, javascript_tool, navigate, etc.) remain the
+// right choice for single-step interactive work.
+server.tool(
+  "run_script",
+  "One-shot Node.js script runner for batch tasks (Playwright loops, bulk auth proofs, multi-step automation reports). Writes the inline `script` to a temp .mjs file and runs it with `node` in `cwd`. Returns stdout/stderr/exitCode/durationMs plus any new files created under `outputDir`. Use this INSTEAD of looping 50+ MCP calls when you need to run the same browser flow against many inputs. Caller's `cwd` must contain whatever node_modules the script imports (e.g., pass an agency-board path for Playwright scripts).",
+  {
+    script: z.string().describe("Inline JS source. Will be written to a temp .mjs file and executed with `node --experimental-vm-modules`. Use ESM imports. The script should write its own log to stdout."),
+    cwd: z.string().describe("Absolute working directory passed to the spawned `node`. Must contain any node_modules the script imports (Playwright, @supabase/supabase-js, etc.). Example: 'E:/FromC/projects/agency-board'."),
+    args: z.array(z.string()).optional().describe("Optional argv strings passed to the script as process.argv slice. Default: []."),
+    env: z.record(z.string()).optional().describe("Optional extra env vars merged on top of the parent env. Use sparingly - prefer passing secrets via the script itself."),
+    timeoutMs: z.number().min(1000).max(1800000).optional().describe("Max time in ms before SIGKILL. Default 600000 (10 min). Max 1800000 (30 min)."),
+    outputDir: z.string().optional().describe("Optional absolute directory. Files created under here during the script run are returned in `newFiles` so the caller can attach them. Created if missing."),
+    saveScriptPath: z.string().optional().describe("Optional: instead of using a tmp file, write `script` to this absolute path before running. Helps when debugging - the file persists after the call."),
+  },
+  async (args) => {
+    const startedAt = Date.now();
+    const cwd = args.cwd;
+    if (!cwd || !path.isAbsolute(cwd)) {
+      return textResult(JSON.stringify({ error: "cwd must be an absolute path" }));
+    }
+    try {
+      const cwdStat = fs.statSync(cwd);
+      if (!cwdStat.isDirectory()) throw new Error("not a directory");
+    } catch (e) {
+      return textResult(JSON.stringify({ error: `cwd not accessible: ${e.message}` }));
+    }
+
+    let scriptPath;
+    let cleanupScript = false;
+    if (args.saveScriptPath) {
+      scriptPath = args.saveScriptPath;
+      try {
+        fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+        fs.writeFileSync(scriptPath, args.script, "utf-8");
+      } catch (e) {
+        return textResult(JSON.stringify({ error: `cannot write saveScriptPath: ${e.message}` }));
+      }
+    } else {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "orellius-run-script-"));
+      scriptPath = path.join(tmpDir, "script.mjs");
+      fs.writeFileSync(scriptPath, args.script, "utf-8");
+      cleanupScript = true;
+    }
+
+    // Snapshot files in outputDir before the run so we can diff after.
+    let outputDir = args.outputDir || null;
+    let beforeFiles = new Set();
+    if (outputDir) {
+      try {
+        fs.mkdirSync(outputDir, { recursive: true });
+        beforeFiles = new Set(fs.readdirSync(outputDir));
+      } catch (e) {
+        return textResult(JSON.stringify({ error: `cannot use outputDir: ${e.message}` }));
+      }
+    }
+
+    const timeoutMs = args.timeoutMs ?? 600000;
+    const child = spawn("node", [scriptPath, ...(args.args || [])], {
+      cwd,
+      env: { ...process.env, ...(args.env || {}) },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const STDOUT_CAP = 256 * 1024;
+    const STDERR_CAP = 64 * 1024;
+    child.stdout.on("data", (chunk) => {
+      if (stdout.length < STDOUT_CAP) stdout += chunk.toString("utf-8");
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < STDERR_CAP) stderr += chunk.toString("utf-8");
+    });
+
+    let timedOut = false;
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill("SIGKILL"); } catch {}
+    }, timeoutMs);
+
+    const exitCode = await new Promise((resolve) => {
+      child.once("close", (code) => resolve(code));
+      child.once("error", () => resolve(-1));
+    });
+    clearTimeout(killTimer);
+
+    let newFiles = [];
+    if (outputDir) {
+      try {
+        const after = fs.readdirSync(outputDir);
+        newFiles = after.filter((f) => !beforeFiles.has(f)).map((f) => path.join(outputDir, f));
+      } catch {
+        // ignore - just don't return newFiles
+      }
+    }
+
+    if (cleanupScript) {
+      try { fs.rmSync(path.dirname(scriptPath), { recursive: true, force: true }); } catch {}
+    }
+
+    return textResult(JSON.stringify({
+      exitCode,
+      timedOut,
+      durationMs: Date.now() - startedAt,
+      stdout: stdout.length === STDOUT_CAP ? stdout + "\n[stdout truncated]" : stdout,
+      stderr: stderr.length === STDERR_CAP ? stderr + "\n[stderr truncated]" : stderr,
+      scriptPath: args.saveScriptPath ? scriptPath : null,
+      newFiles,
+    }, null, 2));
+  }
+);
+
 // --- Start MCP server FIRST (must respond to Claude Code before TCP setup) ---
 
 const transport = new StdioServerTransport();
