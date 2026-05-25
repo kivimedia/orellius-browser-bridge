@@ -1039,7 +1039,7 @@ server.tool(
     script: z.string().describe("Inline JS source. Will be written to a temp .mjs file and executed with `node --experimental-vm-modules`. Use ESM imports. The script should write its own log to stdout."),
     cwd: z.string().describe("Absolute working directory passed to the spawned `node`. Must contain any node_modules the script imports (Playwright, @supabase/supabase-js, etc.). Example: 'E:/FromC/projects/agency-board'."),
     args: z.array(z.string()).optional().describe("Optional argv strings passed to the script as process.argv slice. Default: []."),
-    env: z.record(z.string()).optional().describe("Optional extra env vars merged on top of the parent env. Use sparingly - prefer passing secrets via the script itself."),
+    env: z.record(z.string(), z.string()).optional().describe("Optional extra env vars merged on top of the parent env. Use sparingly - prefer passing secrets via the script itself."),
     timeoutMs: z.number().min(1000).max(1800000).optional().describe("Max time in ms before SIGKILL. Default 600000 (10 min). Max 1800000 (30 min)."),
     outputDir: z.string().optional().describe("Optional absolute directory. Files created under here during the script run are returned in `newFiles` so the caller can attach them. Created if missing."),
     saveScriptPath: z.string().optional().describe("Optional: instead of using a tmp file, write `script` to this absolute path before running. Helps when debugging - the file persists after the call."),
