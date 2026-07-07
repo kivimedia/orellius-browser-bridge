@@ -57,8 +57,20 @@ google-chrome \
   --disable-dev-shm-usage \
   --user-data-dir=~/.chrome-orellius \
   --load-extension=~/orellius-browser-bridge/extension \
+  --auto-accept-this-tab-capture \
+  --use-fake-ui-for-media-stream \
   > /dev/null 2>&1 &
 ```
+
+> **Recording flags (required for hands-free `record_video`):**
+> `--auto-accept-this-tab-capture` + `--use-fake-ui-for-media-stream` let the
+> media-recorder engine capture the current tab via
+> `getDisplayMedia({preferCurrentTab:true})` with **no toolbar-icon click and no
+> screen-picker**. Without them, tab-capture needs the activeTab gesture (icon
+> click) and display-media pops the picker. This is the fix for "recording
+> stalls / needs a click / fails silently." Validated 2026-07-07. Only use these
+> on the dedicated Orellius Chrome profile, never a profile you browse with.
+> **Windows launch** (same flags): add them to your `chrome.exe ... --load-extension=<repo>\extension` command.
 
 3. Start MCP server:
 ```bash

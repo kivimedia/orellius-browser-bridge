@@ -117,6 +117,13 @@ export async function launchIsolatedChrome(opts = {}) {
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
     "--disable-features=Translate,InfoBars,OptimizationHints,MediaRouter",
+    // Hands-free screen/tab recording: auto-accept getDisplayMedia({preferCurrentTab})
+    // so record_video (media-recorder engine) captures with NO toolbar-icon click
+    // and NO screen-picker. Validated 2026-07-07 (getDisplayMedia on load -> real
+    // frames, zero gesture). Safe for a dedicated automation Chrome; do not use on
+    // a browser you also browse the web with.
+    "--auto-accept-this-tab-capture",
+    "--use-fake-ui-for-media-stream",
     "--disable-component-update",
     "--disable-sync",
     "--disable-default-apps",

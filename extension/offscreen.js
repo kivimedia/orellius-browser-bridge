@@ -84,12 +84,21 @@ async function startSession(msg) {
     // getDisplayMedia path - shows screen-picker, user chooses tab/window/screen
     // This is the path Loom, MarizAI's TrainingRecorder, and Screenity use as their default.
     try {
+      // preferCurrentTab + selfBrowserSurface make the picker default to (and,
+      // with the launch flags --auto-accept-this-tab-capture +
+      // --use-fake-ui-for-media-stream, auto-accept) the CURRENT tab with no
+      // gesture and no picker. Tab capture is also occlusion-independent, so it
+      // records even when the window is behind others / on another virtual
+      // desktop (unlike the gdigrab/ffmpeg-native engine). Without the flags
+      // this still works but shows the normal picker.
       stream = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate, width: { max: 1920 }, height: { max: 1080 } },
         audio: captureAudio,
+        preferCurrentTab: true,
+        selfBrowserSurface: "include",
       });
     } catch (e) {
-      throw new Error(`getDisplayMedia failed (user may have cancelled the picker): ${e.message}`);
+      throw new Error(`getDisplayMedia failed (no capture flags and user cancelled/blocked the picker): ${e.message}`);
     }
   } else {
     throw new Error(`unknown capture mode: ${mode}`);

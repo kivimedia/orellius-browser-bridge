@@ -1816,7 +1816,25 @@ async function mrStartRecording(tabId, opts = {}) {
   // Keep-alive arms so the SW survives the recording window
   _exportKeepaliveStart();
 
-  log(`mr start tab=${tabId} rid=${recordingId} fps=${frameRate} bps=${videoBitsPerSecond} mime=${state.mimeType}`);
+  // Liveness gate: confirm real frames are actually flowing so we never hand
+  // back a silently-empty or black recording (the #1 "it failed but I didn't
+  // find out until later" complaint). The first MediaRecorder chunk lands ~chunkMs
+  // after start; if nothing arrives the capture source is not painting or was
+  // blocked. We surface a warning instead of pretending the recording is fine.
+  const liveDeadline = Date.now() + Math.max(1600, (opts.chunkMs || 1000) + 800);
+  while (state.bytesSent === 0 && state.status === "recording" && Date.now() < liveDeadline) {
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  if (state.bytesSent === 0 && state.status === "recording") {
+    state.warning =
+      "LIVENESS: no video data in the first ~1.6s - the capture is likely blank " +
+      "(source tab not painting, or capture blocked because the Chrome launch is " +
+      "missing --auto-accept-this-tab-capture / --use-fake-ui-for-media-stream). " +
+      "Recording continues; verify the output before trusting it.";
+    log(`mr LIVENESS WARN rid=${recordingId}: 0 bytes ${liveDeadline - state.startedAt}ms after start`);
+  }
+
+  log(`mr start tab=${tabId} rid=${recordingId} fps=${frameRate} bps=${videoBitsPerSecond} mime=${state.mimeType} bytes@start=${state.bytesSent}`);
   return state;
 }
 
@@ -3369,7 +3387,7 @@ const toolHandlers = {
             return {
               content: [{
                 type: "text",
-                text: `Recording started on tab ${tabId} (MediaRecorder engine). Codec: ${state.mimeType}, ${state.frameRate}fps target, ${(state.videoBitsPerSecond/1000).toFixed(0)}kbps. Output: ${state.format}. Call record_video(action='stop_recording') when done. Audio: ${state.captureAudio ? "captured" : "off"}.`,
+                text: `Recording started on tab ${tabId} (MediaRecorder engine). Codec: ${state.mimeType}, ${state.frameRate}fps target, ${(state.videoBitsPerSecond/1000).toFixed(0)}kbps. Output: ${state.format}. Call record_video(action='stop_recording') when done. Audio: ${state.captureAudio ? "captured" : "off"}.${state.warning ? `\n\n⚠ ${state.warning}` : ` Frames confirmed flowing (${state.bytesSent} bytes in first ~1.5s).`}`,
               }],
             };
           }
