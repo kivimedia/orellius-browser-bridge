@@ -1696,15 +1696,15 @@ function startCdpShotLoop(tabId, recordingId, fps, quality) {
   const tick = async () => {
     if (cdpMrByTab.get(tabId) !== recordingId) return;
     try {
-      // fromSurface:false forces a fresh render from the renderer instead of
-      // reading the GPU compositor surface, which goes STALE for an occluded /
-      // background window (Chrome stops compositing it). Without this the poll
-      // returns the last on-screen frame forever and the video freezes on the
-      // page that was visible when recording started, even as we navigate.
+      // Default surface capture (fromSurface:true) returns real, current content
+      // AS LONG AS the window is visible/foreground - Chrome keeps the compositor
+      // surface fresh for the active tab of a visible window. For an occluded
+      // window the surface goes stale (video freezes on the start page), and
+      // fromSurface:false returns blank in headed Chrome - so reliable capture
+      // requires the window visible, which mrStartRecording ensures for cdp mode.
       const shot = await cdp(tabId, "Page.captureScreenshot", {
         format: "jpeg",
         quality: quality || 55,
-        fromSurface: false,
         optimizeForSpeed: true,
       });
       if (shot && shot.data && cdpMrByTab.get(tabId) === recordingId) {
