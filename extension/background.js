@@ -1676,6 +1676,46 @@ const mrByRecordingId = new Map(); // recordingId -> tabId (chunk callbacks come
 // chrome.tabCapture / activeTab gesture and no launch flags, just the debugger
 // session Orellius already holds. See mrStartRecording captureMode "cdp".
 const cdpMrByTab = new Map();
+// tabId -> setTimeout handle for the CDP screenshot-poll loop that feeds the
+// offscreen canvas. We poll Page.captureScreenshot (which renders a tab even
+// when its window is hidden / occluded / not the OS-foreground window) instead
+// of Page.startScreencast (which only emits frames for an ON-SCREEN tab and
+// yields all-black otherwise). This is what makes hands-free capture work
+// without surfacing the window over the user's other work.
+const cdpShotTimers = new Map();
+
+// Poll Page.captureScreenshot at ~fps and forward each JPEG to the offscreen
+// canvas as a cdp_frame. Recursive setTimeout (not setInterval) so a slow
+// screenshot never lets calls pile up on the debugger channel. Self-stops when
+// the tab is no longer the active cdp recording (cdpMrByTab mismatch).
+function startCdpShotLoop(tabId, recordingId, fps, quality) {
+  // Cap the poll at 15fps: captureScreenshot is a full render+encode per call,
+  // and the offscreen canvas.captureStream holds the last frame between polls,
+  // so the OUTPUT stays smooth (30fps) even if content updates at ~10-12fps.
+  const intervalMs = Math.max(70, Math.round(1000 / Math.min(Math.max(fps || 10, 4), 15)));
+  const tick = async () => {
+    if (cdpMrByTab.get(tabId) !== recordingId) return;
+    try {
+      const shot = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: quality || 55 });
+      if (shot && shot.data && cdpMrByTab.get(tabId) === recordingId) {
+        chrome.runtime.sendMessage({ target: "offscreen", cmd: "cdp_frame", recordingId, data: shot.data }).catch(() => {});
+      }
+    } catch (e) {
+      // transient (mid-navigation target swap, detached frame) - keep polling
+    }
+    if (cdpMrByTab.get(tabId) === recordingId) {
+      cdpShotTimers.set(tabId, setTimeout(tick, intervalMs));
+    }
+  };
+  tick();
+}
+
+function stopCdpShotLoop(tabId) {
+  const t = cdpShotTimers.get(tabId);
+  if (t) clearTimeout(t);
+  cdpShotTimers.delete(tabId);
+}
+
 const OFFSCREEN_URL = "offscreen.html";
 
 async function hasOffscreenDoc() {
@@ -1893,18 +1933,16 @@ async function mrStartRecording(tabId, opts = {}) {
     // screencastFrame handler forwards frames to the canvas, and start the stream.
     if (useCdp) {
       cdpMrByTab.set(tabId, recordingId);
-      await cdp(tabId, "Page.startScreencast", {
-        format: "jpeg",
-        quality: opts.captureQuality || 70,
-        maxWidth: cdpW,
-        maxHeight: cdpH,
-        everyNthFrame: 1,
-      });
-      log(`mr cdp-canvas screencast started tab=${tabId} rid=${recordingId} ${cdpW}x${cdpH}@${frameRate}`);
+      // Feed the canvas via a Page.captureScreenshot poll loop, which renders
+      // the tab even when its window is hidden/occluded - unlike
+      // Page.startScreencast, which only paints an on-screen tab (black else).
+      startCdpShotLoop(tabId, recordingId, frameRate, opts.captureQuality || 55);
+      log(`mr cdp-canvas shot-loop started tab=${tabId} rid=${recordingId} ${cdpW}x${cdpH}@~${Math.min(frameRate, 15)}fps`);
     }
   } catch (e) {
     // Roll back all registration so a failed start never wedges the tab.
     cdpMrByTab.delete(tabId);
+    stopCdpShotLoop(tabId);
     mrRecordingState.delete(tabId);
     mrByRecordingId.delete(recordingId);
     _exportKeepaliveStop();
@@ -1941,11 +1979,12 @@ async function mrStopRecording(tabId) {
     return mrStateInfo(state);
   }
   state.status = "stopping";
-  // CDP-canvas mode: stop the screencast first so no more frames are forwarded
-  // to the canvas while we flush the recorder.
+  // CDP-canvas mode: stop the screenshot poll loop first so no more frames are
+  // forwarded to the canvas while we flush the recorder. Delete the map entry
+  // FIRST so any in-flight tick sees the mismatch and self-stops.
   if (cdpMrByTab.has(tabId)) {
-    try { await cdp(tabId, "Page.stopScreencast", {}); } catch (e) { log(`mr cdp stopScreencast warn: ${e.message}`); }
     cdpMrByTab.delete(tabId);
+    stopCdpShotLoop(tabId);
   }
   // Stop the recorder; offscreen will flush remaining chunks and emit
   // orellius_mr_stopped which resolves _finalizedPromise via the chunk handler.
@@ -2002,8 +2041,8 @@ async function mrClear(tabId) {
   const state = mrRecordingState.get(tabId);
   if (!state) return false;
   if (cdpMrByTab.has(tabId)) {
-    try { await cdp(tabId, "Page.stopScreencast", {}); } catch {}
     cdpMrByTab.delete(tabId);
+    stopCdpShotLoop(tabId);
   }
   try {
     await sendToOffscreen({ cmd: "cancel", recordingId: state.recordingId }, { timeoutMs: 5000 });
