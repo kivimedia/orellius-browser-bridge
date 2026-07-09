@@ -1696,7 +1696,17 @@ function startCdpShotLoop(tabId, recordingId, fps, quality) {
   const tick = async () => {
     if (cdpMrByTab.get(tabId) !== recordingId) return;
     try {
-      const shot = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: quality || 55 });
+      // fromSurface:false forces a fresh render from the renderer instead of
+      // reading the GPU compositor surface, which goes STALE for an occluded /
+      // background window (Chrome stops compositing it). Without this the poll
+      // returns the last on-screen frame forever and the video freezes on the
+      // page that was visible when recording started, even as we navigate.
+      const shot = await cdp(tabId, "Page.captureScreenshot", {
+        format: "jpeg",
+        quality: quality || 55,
+        fromSurface: false,
+        optimizeForSpeed: true,
+      });
       if (shot && shot.data && cdpMrByTab.get(tabId) === recordingId) {
         chrome.runtime.sendMessage({ target: "offscreen", cmd: "cdp_frame", recordingId, data: shot.data }).catch(() => {});
       }
