@@ -1855,9 +1855,19 @@ async function mrStartRecording(tabId, opts = {}) {
       await ensureDomain(tabId, "Page");
       try {
         const tab = await chrome.tabs.get(tabId);
-        if (tab.windowId !== undefined && !mrPrivateLockActive()) {
-          await chrome.windows.update(tab.windowId, { focused: true, state: "normal" });
+        if (tab.windowId !== undefined) {
+          // A minimized window does not paint, so Page.startScreencast would
+          // capture only black. Un-minimize it (state:"normal") - this is a
+          // no-op for an already-normal window and does NOT raise it over other
+          // apps. Only set focused:true in public mode (steals OS focus).
+          const win = await chrome.windows.get(tab.windowId);
+          const update = {};
+          if (win.state === "minimized") update.state = "normal";
+          if (!mrPrivateLockActive()) { update.focused = true; update.state = "normal"; }
+          if (Object.keys(update).length) await chrome.windows.update(tab.windowId, update);
         }
+        // The active tab of a (non-minimized) window paints even when the window
+        // is occluded/unfocused, so activating our tab is enough for capture.
         await chrome.tabs.update(tabId, { active: true });
         try { await cdp(tabId, "Page.bringToFront", {}); } catch {}
       } catch (e) {
@@ -2008,10 +2018,12 @@ async function mrClear(tabId) {
 }
 
 function mrPrivateLockActive() {
-  // Re-uses the existing private-mode flag. The actual lookup lives in the
-  // global focus-policy module; we just need a boolean to avoid focusing.
-  // Default to true (safer - never steal focus).
-  return globalThis._forcePrivate === true || globalThis._privateModeLocked === true || true;
+  // True = do NOT raise/focus the window (private mode). Note this only governs
+  // FOCUS-stealing; capture still un-minimizes the window when needed, because
+  // Chrome does not paint a minimized tab and Page.startScreencast would then
+  // yield only black frames. Un-minimizing an already-normal window is a no-op
+  // and does not raise it over other apps, so capture stays non-disruptive.
+  return globalThis._forcePrivate === true || globalThis._privateModeLocked === true;
 }
 
 // ============================================================================
