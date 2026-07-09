@@ -1110,6 +1110,18 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       });
       vrecKickWorker(tabId);
     }
+    // CDP-canvas MediaRecorder mode: forward the raw jpeg to the offscreen
+    // canvas that backs the MediaRecorder. Fire-and-forget; the offscreen
+    // handler draws it and captureStream samples it. This runs independently of
+    // the cdp-legacy recordingState path above (they use separate maps).
+    if (cdpMrByTab.has(tabId)) {
+      chrome.runtime.sendMessage({
+        target: "offscreen",
+        cmd: "cdp_frame",
+        recordingId: cdpMrByTab.get(tabId),
+        data: params.data,
+      }).catch(() => {});
+    }
     // Always ack so CDP keeps streaming, even if we've stopped buffering
     // (e.g. recording was cleared but a final frame is in flight).
     if (params.sessionId !== undefined) {
@@ -1658,6 +1670,12 @@ function vrecClear(tabId) {
 
 const mrRecordingState = new Map(); // tabId -> { recordingId, status, startedAt, mimeType, format, savePath, chunkCount, bytesSent, frameRate, captureAudio, videoBitsPerSecond, _stopWaiters, _finalizedResolve, _finalizedPromise }
 const mrByRecordingId = new Map(); // recordingId -> tabId (chunk callbacks come from offscreen with recordingId only)
+// tabId -> recordingId for the CDP-canvas capture mode. When set, the
+// Page.screencastFrame handler forwards each frame to the offscreen canvas that
+// backs a MediaRecorder. This is the hands-free tab-capture path: no
+// chrome.tabCapture / activeTab gesture and no launch flags, just the debugger
+// session Orellius already holds. See mrStartRecording captureMode "cdp".
+const cdpMrByTab = new Map();
 const OFFSCREEN_URL = "offscreen.html";
 
 async function hasOffscreenDoc() {
@@ -1746,8 +1764,13 @@ async function mrStartRecording(tabId, opts = {}) {
   // automation context, this typically fails with "Extension has not been
   // invoked for the current page". Fall through to display-media mode if so.
   let streamId = null;
-  let captureMode = (opts.captureMode || "auto").toLowerCase(); // "auto" | "tab-capture" | "display-media"
-  if (captureMode === "tab-capture" || captureMode === "auto") {
+  let useCdp = false;
+  let captureMode = (opts.captureMode || "auto").toLowerCase(); // "auto" | "tab-capture" | "display-media" | "cdp"
+  if (captureMode === "cdp") {
+    // Explicit CDP-canvas mode: hands-free, no gesture, no launch flags. Frames
+    // come from Page.startScreencast (below) via the debugger session.
+    useCdp = true;
+  } else if (captureMode === "tab-capture" || captureMode === "auto") {
     try {
       streamId = await new Promise((resolve, reject) => {
         chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
@@ -1761,11 +1784,14 @@ async function mrStartRecording(tabId, opts = {}) {
       log(`mr tab-capture streamId acquired for tab ${tabId}`);
     } catch (e) {
       if (captureMode === "tab-capture") {
-        throw new Error(`tabCapture.getMediaStreamId failed: ${e.message}. To use silent tab-capture mode, click the Orellius extension toolbar icon on this tab once before starting recording (Chrome's activeTab security gate).`);
+        throw new Error(`tabCapture.getMediaStreamId failed: ${e.message}. To use silent tab-capture mode, click the Orellius extension toolbar icon on this tab once before starting recording (Chrome's activeTab security gate) - OR use captureMode:"cdp" for a hands-free path that needs no gesture.`);
       }
-      // auto mode - fall through to display-media path
-      log(`mr tab-capture failed (${e.message}), falling back to display-media (user picker)`);
-      captureMode = "display-media";
+      // auto mode - fall back to the hands-free CDP-canvas path (no toolbar
+      // click, no launch flags, no screen-picker). This is the reliable
+      // unattended capture path on a Chrome without the tab-capture flags.
+      log(`mr tab-capture unavailable (${e.message}); falling back to hands-free cdp-canvas`);
+      useCdp = true;
+      captureMode = "cdp";
     }
   }
 
@@ -1779,6 +1805,10 @@ async function mrStartRecording(tabId, opts = {}) {
     mimeTypeHint: "video/webm",
   }, { timeoutMs: 10000 });
 
+  // CDP-canvas capture dimensions (also the Page.startScreencast cap).
+  const cdpW = Math.min(opts.maxWidth || 1280, 1280);
+  const cdpH = Math.min(opts.maxHeight || 720, 720);
+
   // For display-media mode, the screen-picker UI is modal and blocks until
   // the user clicks Share / Cancel. Give it 60 seconds to allow the user
   // time to select the tab.
@@ -1786,13 +1816,52 @@ async function mrStartRecording(tabId, opts = {}) {
   const startResp = await sendToOffscreen({
     cmd: "start",
     recordingId,
-    mode: captureMode,
+    mode: useCdp ? "cdp-canvas" : captureMode,
     streamId,
     frameRate,
     videoBitsPerSecond,
     captureAudio,
     chunkMs: opts.chunkMs || 1000,
+    width: cdpW,
+    height: cdpH,
   }, { timeoutMs: offscreenTimeout });
+
+  // For CDP-canvas mode, now attach the debugger, surface the tab so its
+  // compositor paints (hidden tabs emit zero screencast frames), register the
+  // tab so the screencastFrame handler forwards frames to the offscreen canvas,
+  // and start the screencast. Order matters: the offscreen canvas+recorder is
+  // already live (above), so no early frames are dropped.
+  if (useCdp) {
+    try {
+      await ensureAttached(tabId);
+      await ensureDomain(tabId, "Page");
+      // Surface the tab/window - hidden tabs don't paint, so screencast would be
+      // empty. Respect the private-mode lock (activate tab without stealing focus).
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.windowId !== undefined && !mrPrivateLockActive()) {
+          await chrome.windows.update(tab.windowId, { focused: true, state: "normal" });
+        }
+        await chrome.tabs.update(tabId, { active: true });
+        try { await cdp(tabId, "Page.bringToFront", {}); } catch {}
+      } catch (e) {
+        log(`mr cdp front-window WARN: ${e.message}`);
+      }
+      cdpMrByTab.set(tabId, recordingId);
+      await cdp(tabId, "Page.startScreencast", {
+        format: "jpeg",
+        quality: opts.captureQuality || 70,
+        maxWidth: cdpW,
+        maxHeight: cdpH,
+        everyNthFrame: 1,
+      });
+      log(`mr cdp-canvas screencast started tab=${tabId} rid=${recordingId} ${cdpW}x${cdpH}@${frameRate}`);
+    } catch (e) {
+      cdpMrByTab.delete(tabId);
+      try { await sendToOffscreen({ cmd: "cancel", recordingId }, { timeoutMs: 5000 }); } catch {}
+      throw new Error(`cdp-canvas start failed: ${e.message}`);
+    }
+  }
 
   const state = {
     recordingId,
@@ -1845,6 +1914,12 @@ async function mrStopRecording(tabId) {
     return mrStateInfo(state);
   }
   state.status = "stopping";
+  // CDP-canvas mode: stop the screencast first so no more frames are forwarded
+  // to the canvas while we flush the recorder.
+  if (cdpMrByTab.has(tabId)) {
+    try { await cdp(tabId, "Page.stopScreencast", {}); } catch (e) { log(`mr cdp stopScreencast warn: ${e.message}`); }
+    cdpMrByTab.delete(tabId);
+  }
   // Stop the recorder; offscreen will flush remaining chunks and emit
   // orellius_mr_stopped which resolves _finalizedPromise via the chunk handler.
   try {
@@ -1899,6 +1974,10 @@ function mrStateInfo(state) {
 async function mrClear(tabId) {
   const state = mrRecordingState.get(tabId);
   if (!state) return false;
+  if (cdpMrByTab.has(tabId)) {
+    try { await cdp(tabId, "Page.stopScreencast", {}); } catch {}
+    cdpMrByTab.delete(tabId);
+  }
   try {
     await sendToOffscreen({ cmd: "cancel", recordingId: state.recordingId }, { timeoutMs: 5000 });
   } catch {}

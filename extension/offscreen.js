@@ -80,6 +80,27 @@ async function startSession(msg) {
     } catch (e) {
       throw new Error(`tab-capture getUserMedia failed: ${e.message}`);
     }
+  } else if (mode === "cdp-canvas") {
+    // CDP-fed canvas capture. The background service worker holds a chrome.debugger
+    // session on the tab (Orellius always has one) and runs Page.startScreencast;
+    // each Page.screencastFrame jpeg is forwarded here as a "cdp_frame" message.
+    // We draw the latest frame onto a canvas and MediaRecorder its captureStream.
+    // Because captureStream samples the canvas continuously at `frameRate`, the
+    // output is smooth even when screencast frames arrive sparsely (the last frame
+    // is held). This needs NO chrome.tabCapture, NO activeTab gesture (toolbar
+    // click), and NO --auto-accept-this-tab-capture launch flags - it works on any
+    // Chrome the extension is loaded in, purely via the debugger API.
+    const cw = msg.width || 1280;
+    const ch = msg.height || 720;
+    const canvas = document.createElement("canvas");
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, cw, ch);
+    stream = canvas.captureStream(frameRate);
+    // Stash on the session (set below) via a closure var picked up after creation.
+    startSession._pendingCdpCanvas = { canvas, ctx };
   } else if (mode === "display-media") {
     // getDisplayMedia path - shows screen-picker, user chooses tab/window/screen
     // This is the path Loom, MarizAI's TrainingRecorder, and Screenity use as their default.
@@ -127,7 +148,9 @@ async function startSession(msg) {
     startedAt: Date.now(),
     finishedResolve: null,
     finishedPromise: null,
+    cdpCanvas: startSession._pendingCdpCanvas || null,
   };
+  startSession._pendingCdpCanvas = null;
   session.finishedPromise = new Promise((resolve) => { session.finishedResolve = resolve; });
   sessions.set(recordingId, session);
 
@@ -164,6 +187,7 @@ async function startSession(msg) {
   };
 
   recorder.onstop = () => {
+    if (session.cdpTicker) { clearInterval(session.cdpTicker); session.cdpTicker = null; }
     chrome.runtime.sendMessage({
       type: "orellius_mr_stopped",
       recordingId,
@@ -187,6 +211,22 @@ async function startSession(msg) {
       }
     });
   });
+
+  // CDP-canvas redraw ticker: canvas.captureStream(fps) only emits a frame when
+  // the canvas is painted. During page dead air no screencast frames arrive, so
+  // we re-blit the last frame at the target fps to keep the stream flowing at a
+  // steady rate (otherwise MediaRecorder stalls / the timeline compresses).
+  if (session.cdpCanvas) {
+    const periodMs = Math.max(16, Math.round(1000 / frameRate));
+    session.cdpTicker = setInterval(() => {
+      try {
+        if (session.recorder.state !== "recording") return;
+        const { canvas, ctx, lastImg } = session.cdpCanvas;
+        if (lastImg) ctx.drawImage(lastImg, 0, 0, canvas.width, canvas.height);
+        else { ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+      } catch {}
+    }, periodMs);
+  }
 
   recorder.start(chunkMs);
   return {
@@ -220,6 +260,7 @@ async function cancelSession(msg) {
   const { recordingId } = msg;
   const session = sessions.get(recordingId);
   if (!session) return { ok: false, error: `no active session for ${recordingId}` };
+  if (session.cdpTicker) { clearInterval(session.cdpTicker); session.cdpTicker = null; }
   try {
     session.recorder.ondataavailable = null;
     session.recorder.stop();
@@ -229,8 +270,31 @@ async function cancelSession(msg) {
   return { ok: true, recordingId, cancelled: true };
 }
 
+// Draw one forwarded CDP screencast frame (base64 jpeg) onto the session canvas.
+// Fire-and-forget: decode happens async via Image, captureStream picks up the
+// draw on its next sample. We never block the message pipe on decode.
+function drawCdpFrame(session, base64) {
+  if (!session || !session.cdpCanvas || !base64) return;
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const { canvas, ctx } = session.cdpCanvas;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      session.cdpCanvas.lastImg = img; // held for the redraw ticker
+    } catch {}
+  };
+  img.onerror = () => {};
+  img.src = "data:image/jpeg;base64," + base64;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.target !== "offscreen") return false;
+  // High-frequency CDP frame path: handle synchronously, no async response
+  // channel per frame (30fps would otherwise open 30 response ports/sec).
+  if (msg.cmd === "cdp_frame") {
+    drawCdpFrame(sessions.get(msg.recordingId), msg.data);
+    return false;
+  }
   (async () => {
     try {
       let result;
