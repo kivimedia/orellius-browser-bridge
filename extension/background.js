@@ -1702,7 +1702,15 @@ function startCdpShotLoop(tabId, recordingId, fps, quality) {
       // window the surface goes stale (video freezes on the start page), and
       // fromSurface:false returns blank in headed Chrome - so reliable capture
       // requires the window visible, which mrStartRecording ensures for cdp mode.
-      const shot = await cdp(tabId, "Page.captureScreenshot", {
+      // retriableCdp (not plain cdp): a cross-origin navigation (e.g.
+      // facebook.com -> kmboards.co during an OAuth round-trip) swaps the tab's
+      // render process and silently detaches the debugger, so a plain
+      // captureScreenshot then errors and the poll's catch freezes the canvas on
+      // the last frame of the OLD origin (the whole post-OAuth portion records as
+      // that stale frame). retriableCdp catches the transient failure,
+      // re-attaches, and captures the CURRENT page, so the video follows the
+      // navigation across origins.
+      const shot = await retriableCdp(tabId, "Page.captureScreenshot", {
         format: "jpeg",
         quality: quality || 55,
         optimizeForSpeed: true,
