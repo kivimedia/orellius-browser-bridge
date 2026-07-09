@@ -1813,61 +1813,21 @@ async function mrStartRecording(tabId, opts = {}) {
   // the user clicks Share / Cancel. Give it 60 seconds to allow the user
   // time to select the tab.
   const offscreenTimeout = captureMode === "display-media" ? 90000 : 15000;
-  const startResp = await sendToOffscreen({
-    cmd: "start",
-    recordingId,
-    mode: useCdp ? "cdp-canvas" : captureMode,
-    streamId,
-    frameRate,
-    videoBitsPerSecond,
-    captureAudio,
-    chunkMs: opts.chunkMs || 1000,
-    width: cdpW,
-    height: cdpH,
-  }, { timeoutMs: offscreenTimeout });
 
-  // For CDP-canvas mode, now attach the debugger, surface the tab so its
-  // compositor paints (hidden tabs emit zero screencast frames), register the
-  // tab so the screencastFrame handler forwards frames to the offscreen canvas,
-  // and start the screencast. Order matters: the offscreen canvas+recorder is
-  // already live (above), so no early frames are dropped.
-  if (useCdp) {
-    try {
-      await ensureAttached(tabId);
-      await ensureDomain(tabId, "Page");
-      // Surface the tab/window - hidden tabs don't paint, so screencast would be
-      // empty. Respect the private-mode lock (activate tab without stealing focus).
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        if (tab.windowId !== undefined && !mrPrivateLockActive()) {
-          await chrome.windows.update(tab.windowId, { focused: true, state: "normal" });
-        }
-        await chrome.tabs.update(tabId, { active: true });
-        try { await cdp(tabId, "Page.bringToFront", {}); } catch {}
-      } catch (e) {
-        log(`mr cdp front-window WARN: ${e.message}`);
-      }
-      cdpMrByTab.set(tabId, recordingId);
-      await cdp(tabId, "Page.startScreencast", {
-        format: "jpeg",
-        quality: opts.captureQuality || 70,
-        maxWidth: cdpW,
-        maxHeight: cdpH,
-        everyNthFrame: 1,
-      });
-      log(`mr cdp-canvas screencast started tab=${tabId} rid=${recordingId} ${cdpW}x${cdpH}@${frameRate}`);
-    } catch (e) {
-      cdpMrByTab.delete(tabId);
-      try { await sendToOffscreen({ cmd: "cancel", recordingId }, { timeoutMs: 5000 }); } catch {}
-      throw new Error(`cdp-canvas start failed: ${e.message}`);
-    }
-  }
-
+  // CRITICAL ordering: register the recording state + recordingId->tab map
+  // BEFORE starting the offscreen MediaRecorder. The recorder's very first
+  // ondataavailable carries the webm EBML header / init segment and fires
+  // ~chunkMs after start - which can be WHILE the slow useCdp attach +
+  // startScreencast block below is still awaiting. If the maps aren't set yet,
+  // the chunk router (onMessage "orellius_mr_chunk") looks up mrByRecordingId,
+  // finds nothing, and drops the chunk - producing a headerless, unplayable
+  // file (EBML magic absent). Registering first guarantees every chunk, header
+  // included, is routed to the host.
   const state = {
     recordingId,
     status: "recording",
     startedAt: Date.now(),
-    mimeType: startResp.mimeType || "video/webm",
+    mimeType: "video/webm",
     format,
     chunkCount: 0,
     bytesSent: 0,
@@ -1884,6 +1844,63 @@ async function mrStartRecording(tabId, opts = {}) {
 
   // Keep-alive arms so the SW survives the recording window
   _exportKeepaliveStart();
+
+  let startResp;
+  try {
+    // For CDP-canvas mode, attach the debugger and surface the tab FIRST (hidden
+    // tabs don't paint, so the screencast would be empty), so that once the
+    // recorder starts the screencast can begin immediately (minimal black lead-in).
+    if (useCdp) {
+      await ensureAttached(tabId);
+      await ensureDomain(tabId, "Page");
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.windowId !== undefined && !mrPrivateLockActive()) {
+          await chrome.windows.update(tab.windowId, { focused: true, state: "normal" });
+        }
+        await chrome.tabs.update(tabId, { active: true });
+        try { await cdp(tabId, "Page.bringToFront", {}); } catch {}
+      } catch (e) {
+        log(`mr cdp front-window WARN: ${e.message}`);
+      }
+    }
+
+    startResp = await sendToOffscreen({
+      cmd: "start",
+      recordingId,
+      mode: useCdp ? "cdp-canvas" : captureMode,
+      streamId,
+      frameRate,
+      videoBitsPerSecond,
+      captureAudio,
+      chunkMs: opts.chunkMs || 1000,
+      width: cdpW,
+      height: cdpH,
+    }, { timeoutMs: offscreenTimeout });
+    state.mimeType = startResp.mimeType || state.mimeType;
+
+    // Now that the offscreen canvas + recorder are live, register the tab so the
+    // screencastFrame handler forwards frames to the canvas, and start the stream.
+    if (useCdp) {
+      cdpMrByTab.set(tabId, recordingId);
+      await cdp(tabId, "Page.startScreencast", {
+        format: "jpeg",
+        quality: opts.captureQuality || 70,
+        maxWidth: cdpW,
+        maxHeight: cdpH,
+        everyNthFrame: 1,
+      });
+      log(`mr cdp-canvas screencast started tab=${tabId} rid=${recordingId} ${cdpW}x${cdpH}@${frameRate}`);
+    }
+  } catch (e) {
+    // Roll back all registration so a failed start never wedges the tab.
+    cdpMrByTab.delete(tabId);
+    mrRecordingState.delete(tabId);
+    mrByRecordingId.delete(recordingId);
+    _exportKeepaliveStop();
+    try { await sendToOffscreen({ cmd: "cancel", recordingId }, { timeoutMs: 5000 }); } catch {}
+    throw new Error(`mr start failed (${useCdp ? "cdp-canvas" : captureMode}): ${e.message}`);
+  }
 
   // Liveness gate: confirm real frames are actually flowing so we never hand
   // back a silently-empty or black recording (the #1 "it failed but I didn't
