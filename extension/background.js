@@ -1676,6 +1676,59 @@ const mrByRecordingId = new Map(); // recordingId -> tabId (chunk callbacks come
 // chrome.tabCapture / activeTab gesture and no launch flags, just the debugger
 // session Orellius already holds. See mrStartRecording captureMode "cdp".
 const cdpMrByTab = new Map();
+// tabId -> the addScriptToEvaluateOnNewDocument identifier for the auto-injected
+// cinematic driver, so we can remove it when the recording stops.
+const cdpDriverScript = new Map();
+
+// Cinematic driver, auto-injected on EVERY page while a cdp-canvas recording is
+// active. Autonomous automation clicks/types via instant JS, so a recording of
+// it has NO on-screen motion (no cursor, no smooth scroll, no typing) and reads
+// as a slideshow. This exposes window.__cin: a visible arrow cursor that GLIDES
+// (eased bezier) to each target with a click ripple, smooth scroll, and
+// char-by-char typing - all DOM/CSS motion, so it's captured as live footage.
+// Callers then use e.g. `await __cin.click(el)` / `await __cin.type(el,text)`
+// instead of `el.click()`. Idempotent; safe on every navigation.
+const CINEMATIC_DRIVER_SRC = String.raw`
+(function () {
+  if (window.__cin && window.__cin.__v === 3) return;
+  var S = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  var easeInOut = function (t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; };
+  function ensureCursor() {
+    if (!document.documentElement) return null;
+    var c = document.getElementById("__cin_cursor"); if (c) return c;
+    c = document.createElement("div"); c.id = "__cin_cursor";
+    c.style.cssText = "position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;width:22px;height:22px;will-change:transform;filter:drop-shadow(0 1px 2px rgba(0,0,0,.55))";
+    c.innerHTML = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M5 3 L5 19 L9.5 14.5 L12.5 21 L15 20 L12 13.5 L18 13 Z" fill="#ffffff" stroke="#111" stroke-width="1.2" stroke-linejoin="round"/></svg>';
+    document.documentElement.appendChild(c); return c;
+  }
+  var state = { x: (window.innerWidth || 1280) * 0.5, y: (window.innerHeight || 720) * 0.4 };
+  function place(c, x, y) { if (c) { c.style.left = x + "px"; c.style.top = y + "px"; } state.x = x; state.y = y; }
+  function ripple(x, y) {
+    if (!document.body) return;
+    if (!document.getElementById("__cin_style")) { var st = document.createElement("style"); st.id = "__cin_style"; st.textContent = "@keyframes __cin_rip{from{transform:scale(1);opacity:.9}to{transform:scale(4);opacity:0}}"; (document.head || document.documentElement).appendChild(st); }
+    var r = document.createElement("div"); r.style.cssText = "position:fixed;left:" + (x - 6) + "px;top:" + (y - 6) + "px;z-index:2147483646;width:12px;height:12px;border-radius:50%;pointer-events:none;background:rgba(59,130,246,.45);border:2px solid rgba(59,130,246,.9);animation:__cin_rip .5s ease-out forwards";
+    document.documentElement.appendChild(r); setTimeout(function () { r.remove(); }, 550);
+  }
+  async function moveTo(x, y, dur) {
+    var c = ensureCursor(); dur = dur || 480; var sx = state.x, sy = state.y, dx = x - sx, dy = y - sy, dist = Math.hypot(dx, dy);
+    if (dist < 2) { place(c, x, y); return; }
+    var nx = -dy / dist, ny = dx / dist, arc = Math.min(60, dist * 0.12), cx = sx + dx * 0.5 + nx * arc, cy = sy + dy * 0.5 + ny * arc, steps = Math.max(16, Math.round(dur / 12));
+    for (var i = 1; i <= steps; i++) { var t = easeInOut(i / steps), mt = 1 - t, px = mt*mt*sx + 2*mt*t*cx + t*t*x, py = mt*mt*sy + 2*mt*t*cy + t*t*y; place(c, px, py); var el = document.elementFromPoint(px, py); if (el) el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: px, clientY: py })); await S(dur / steps); }
+    place(c, x, y);
+  }
+  function centerOf(el) { var r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }
+  async function moveToEl(el, dur) { var p = centerOf(el); await moveTo(p.x, p.y, dur); }
+  async function click(el, opts) { opts = opts || {}; await moveToEl(el, opts.moveDur); await S(120); ripple(state.x, state.y); ["mousedown","mouseup","click"].forEach(function (type) { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: state.x, clientY: state.y })); }); try { el.click(); } catch (e) {} await S(opts.after == null ? 300 : opts.after); }
+  async function scrollToEl(el, block) { el.scrollIntoView({ behavior: "smooth", block: block || "center" }); await S(650); }
+  async function scrollBy(dy, dur) { dur = dur || 700; var start = window.scrollY, steps = Math.max(16, Math.round(dur / 12)); for (var i = 1; i <= steps; i++) { window.scrollTo(0, start + dy * easeInOut(i / steps)); await S(dur / steps); } }
+  function setNative(el, val) { var proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; Object.getOwnPropertyDescriptor(proto, "value").set.call(el, val); el.dispatchEvent(new Event("input", { bubbles: true })); }
+  async function type(el, text, cps) { cps = cps || 24; await moveToEl(el); await S(150); el.focus(); ripple(state.x, state.y); var cur = ""; for (var ch of text) { cur += ch; setNative(el, cur); await S(1000 / cps + (Math.random() * 40 - 15)); } el.dispatchEvent(new Event("change", { bubbles: true })); await S(150); }
+  function find(sel, test) { var list = Array.prototype.slice.call(document.querySelectorAll(sel)); return test ? list.find(test) : list[0]; }
+  window.__cin = { __v: 3, S: S, moveTo: moveTo, moveToEl: moveToEl, click: click, scrollToEl: scrollToEl, scrollBy: scrollBy, type: type, ensureCursor: ensureCursor, place: place, find: find, state: state };
+  if (document.documentElement) ensureCursor(); else document.addEventListener("DOMContentLoaded", ensureCursor);
+})();
+`;
+
 // tabId -> setTimeout handle for the CDP screenshot-poll loop that feeds the
 // offscreen canvas. We poll Page.captureScreenshot (which renders a tab even
 // when its window is hidden / occluded / not the OS-foreground window) instead
@@ -1735,6 +1788,16 @@ function stopCdpShotLoop(tabId) {
   const t = cdpShotTimers.get(tabId);
   if (t) clearTimeout(t);
   cdpShotTimers.delete(tabId);
+}
+
+// Remove the auto-injected cinematic driver when a recording ends (the injected
+// cursor helper is otherwise harmless, but keep the tab clean). Fire-and-forget.
+async function removeCinematicDriver(tabId) {
+  const id = cdpDriverScript.get(tabId);
+  cdpDriverScript.delete(tabId);
+  if (id) {
+    try { await cdp(tabId, "Page.removeScriptToEvaluateOnNewDocument", { identifier: id }); } catch {}
+  }
 }
 
 // Force a clean debugger detach+reattach whenever a cdp-recording tab NAVIGATES.
@@ -1996,6 +2059,21 @@ async function mrStartRecording(tabId, opts = {}) {
     // screencastFrame handler forwards frames to the canvas, and start the stream.
     if (useCdp) {
       cdpMrByTab.set(tabId, recordingId);
+      // Auto-inject the cinematic driver so autonomous demos have LIVE motion
+      // (a gliding cursor, smooth scroll, char-by-char typing) instead of instant
+      // JS jump-cuts that read as a slideshow. addScriptToEvaluateOnNewDocument
+      // covers every future page load / navigation; Runtime.evaluate seeds the
+      // current page. Callers use window.__cin (e.g. await __cin.click(el)).
+      if (opts.cinematic !== false) {
+        try {
+          const added = await cdp(tabId, "Page.addScriptToEvaluateOnNewDocument", { source: CINEMATIC_DRIVER_SRC });
+          if (added && added.identifier) cdpDriverScript.set(tabId, added.identifier);
+          await cdp(tabId, "Runtime.evaluate", { expression: CINEMATIC_DRIVER_SRC });
+          log(`mr cinematic driver injected tab=${tabId}`);
+        } catch (e) {
+          log(`mr cinematic driver inject WARN: ${e.message}`);
+        }
+      }
       // Feed the canvas via a Page.captureScreenshot poll loop, which renders
       // the tab even when its window is hidden/occluded - unlike
       // Page.startScreencast, which only paints an on-screen tab (black else).
@@ -2006,6 +2084,7 @@ async function mrStartRecording(tabId, opts = {}) {
     // Roll back all registration so a failed start never wedges the tab.
     cdpMrByTab.delete(tabId);
     stopCdpShotLoop(tabId);
+    removeCinematicDriver(tabId);
     mrRecordingState.delete(tabId);
     mrByRecordingId.delete(recordingId);
     _exportKeepaliveStop();
@@ -2048,6 +2127,7 @@ async function mrStopRecording(tabId) {
   if (cdpMrByTab.has(tabId)) {
     cdpMrByTab.delete(tabId);
     stopCdpShotLoop(tabId);
+    removeCinematicDriver(tabId);
   }
   // Stop the recorder; offscreen will flush remaining chunks and emit
   // orellius_mr_stopped which resolves _finalizedPromise via the chunk handler.
@@ -2106,6 +2186,7 @@ async function mrClear(tabId) {
   if (cdpMrByTab.has(tabId)) {
     cdpMrByTab.delete(tabId);
     stopCdpShotLoop(tabId);
+    removeCinematicDriver(tabId);
   }
   try {
     await sendToOffscreen({ cmd: "cancel", recordingId: state.recordingId }, { timeoutMs: 5000 });
