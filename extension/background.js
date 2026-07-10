@@ -856,10 +856,90 @@ function isTransientCdpError(err) {
 // activate a tab in another session's window. Without that guard, two
 // concurrent sessions sharing a window would race tab activations and each
 // would think their click went to the wrong tab.
+// THE ISOLATION INVARIANT. Activating a tab (chrome.tabs.update{active:true},
+// required for CDP input) switches the VISIBLE tab of whatever window the tab
+// lives in. If our owned tab is sitting in the human's window - which happens
+// when a session adopts/loses its window, e.g. after an MV3 service-worker
+// restart wipes the in-memory sessionWindows map - activating it yanks the
+// human away from the tab they were on. The force-private lock only ever
+// governed WINDOW focus, so it could never stop this. The fix: before we ever
+// activate, guarantee the tab lives in a window that contains ONLY this
+// session's tabs. If it doesn't, relocate our whole group into a dedicated
+// background window first, so the activation is invisible to the human.
+//
+// Returns the tab re-fetched at its (possibly new) location.
+async function isolateOwnedTab(tab) {
+  const sessionId = _currentSessionId;
+  if (!sessionId || tab.windowId === undefined) return tab;
+
+  const gid = tab.groupId;
+  const myTitle = `\u{1F512} Claude · ${sessionId.slice(0, 8)}`;
+
+  // Fast path: the window already holds a single Orellius group and nothing
+  // else. Activating our tab there cannot disturb a human tab (there is none).
+  if (gid !== undefined && gid !== -1) {
+    let winTabs = [];
+    try { winTabs = await chrome.tabs.query({ windowId: tab.windowId }); } catch {}
+    const allOurGroup = winTabs.length > 0 && winTabs.every((t) => t.groupId === gid);
+    if (allOurGroup) {
+      let title = "";
+      try { title = (await chrome.tabGroups.get(gid)).title || ""; } catch {}
+      if (title.startsWith("\u{1F512} Claude")) {
+        // Re-record window ownership (lost on SW restart) only if it's OUR group.
+        if (title === myTitle && getSessionWindowId(sessionId) !== tab.windowId) {
+          setSessionWindowId(sessionId, tab.windowId);
+        }
+        return tab;
+      }
+    }
+  }
+
+  // Slow path: our tab is sharing a window with human (or other) tabs. Move our
+  // whole group (or just this tab, if ungrouped) into our own window.
+  let ourTabIds = [tab.id];
+  if (gid !== undefined && gid !== -1) {
+    try { ourTabIds = (await chrome.tabs.query({ groupId: gid })).map((t) => t.id); } catch {}
+  }
+  let ownWin = getSessionWindowId(sessionId);
+  if (ownWin === tab.windowId) ownWin = undefined;          // the shared window is not a valid target
+  if (ownWin !== undefined) { try { await chrome.windows.get(ownWin); } catch { ownWin = undefined; } }
+
+  try {
+    if (ownWin === undefined) {
+      // Seed a fresh background window with our first tab (windows.create with a
+      // tabId MOVES that tab, no stray blank tab), then pull the rest in.
+      const [firstId, ...restIds] = ourTabIds;
+      const win = await chrome.windows.create({ tabId: firstId, focused: false });
+      ownWin = win.id;
+      if (restIds.length) await chrome.tabs.move(restIds, { windowId: ownWin, index: -1 });
+      // Keep it out of sight while locked / private.
+      if (mrPrivateLockActive()) { try { await chrome.windows.update(ownWin, { state: "minimized" }); } catch {} }
+    } else {
+      await chrome.tabs.move(ourTabIds, { windowId: ownWin, index: -1 });
+    }
+    // Tabs drop their group when they cross windows - re-group and relabel so the
+    // 🔒 marker and per-session ownership signal survive.
+    const newGid = await chrome.tabs.group({ tabIds: ourTabIds });
+    await chrome.tabGroups.update(newGid, { title: myTitle, color: "blue" });
+    const state = getSessionState(sessionId);
+    state.tabGroupId = newGid;
+    state.tabGroupTabs = new Set(ourTabIds);
+    setSessionWindowId(sessionId, ownWin);
+    log(`isolated ${ourTabIds.length} owned tab(s) for session ${sessionId} into window ${ownWin} (was sharing window ${tab.windowId} with foreign tabs)`);
+  } catch (e) {
+    log(`isolateOwnedTab failed (session ${sessionId}): ${e.message}`);
+  }
+  return await chrome.tabs.get(tab.id).catch(() => tab);
+}
+
 async function focusTabForInput(tabId, opts = {}) {
   try {
-    const tab = await chrome.tabs.get(tabId);
+    let tab = await chrome.tabs.get(tabId);
     await assertTabInOwnedWindow(tabId, tab);
+    // Enforce the isolation invariant BEFORE activating: never let our tab be
+    // activated while it shares a window with the human's tabs. This may move
+    // the tab to a different window, so re-fetch it afterward.
+    tab = await isolateOwnedTab(tab);
     await chrome.tabs.update(tabId, { active: true });
     // The global private lock overrides any per-call request for public focus
     // (e.g. browser_show's transient raise). Tab activation within the owned
