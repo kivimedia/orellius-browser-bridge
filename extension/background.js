@@ -1732,6 +1732,7 @@ function stopCdpShotLoop(tabId) {
   const t = cdpShotTimers.get(tabId);
   if (t) clearTimeout(t);
   cdpShotTimers.delete(tabId);
+  cdpMrLastOrigin.delete(tabId);
 }
 
 // Force a clean debugger detach+reattach whenever a cdp-recording tab NAVIGATES.
@@ -1746,11 +1747,20 @@ function stopCdpShotLoop(tabId) {
 // follows the redirect across origins. chrome.debugger.attach throws if still
 // attached, so we detach (awaited) first; a per-tab guard prevents overlap.
 const cdpMrReattaching = new Set();
+const cdpMrLastOrigin = new Map(); // tabId -> last-seen origin while recording
+function originOf(u) { try { return new URL(u).origin; } catch { return null; } }
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!cdpMrByTab.has(tabId)) return;
-  // A cross-origin redirect surfaces as a changeInfo.url change; also cover a
-  // full document load completing.
-  if (!(changeInfo.url || changeInfo.status === "complete")) return;
+  if (!changeInfo.url) return;
+  const newOrigin = originOf(changeInfo.url);
+  const prevOrigin = cdpMrLastOrigin.get(tabId);
+  cdpMrLastOrigin.set(tabId, newOrigin);
+  // Only a CROSS-ORIGIN change swaps the render process and strands the capture
+  // session on the old target (the OAuth redirect facebook.com <-> kmboards.co).
+  // Same-origin SPA route changes (buffer -> buffer/comments) keep the same
+  // process, so skip them - detaching there would needlessly interrupt the poll
+  // AND kill any in-flight driving command (Runtime.evaluate) mid-navigation.
+  if (!prevOrigin || prevOrigin === newOrigin) return;
   if (cdpMrReattaching.has(tabId)) return;
   if (!attachedTabs.has(tabId)) return;
   cdpMrReattaching.add(tabId);
@@ -1760,7 +1770,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
       try { await chrome.debugger.detach({ tabId }); } catch {}
       // The next capture tick's retriableCdp -> ensureAttached re-binds to the
       // now-current target. We don't re-attach here to avoid racing the poll.
-      log(`vrec cdp-canvas: forced debugger reattach after nav on tab ${tabId} (${changeInfo.url ? "url-change" : "load-complete"})`);
+      log(`vrec cdp-canvas: forced debugger reattach on cross-origin nav ${prevOrigin} -> ${newOrigin} (tab ${tabId})`);
     } finally {
       cdpMrReattaching.delete(tabId);
     }
