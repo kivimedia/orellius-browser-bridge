@@ -1580,7 +1580,12 @@ async function vrecStartRecording(tabId, opts = {}) {
   try {
     const tab = await chrome.tabs.get(tabId);
     if (tab.windowId !== undefined) {
-      await chrome.windows.update(tab.windowId, { focused: true, state: "normal", drawAttention: false });
+      // Un-minimize so the compositor paints (required for screencast), but only
+      // steal OS focus when focus-stealing is permitted. Under the private lock
+      // this MUST NOT foreground the window.
+      const update = { state: "normal", drawAttention: false };
+      if (!mrPrivateLockActive()) update.focused = true;
+      await chrome.windows.update(tab.windowId, update);
     }
     await chrome.tabs.update(tabId, { active: true });
     // Use CDP Page.bringToFront for double-belt-and-suspenders: tells the
@@ -2218,12 +2223,17 @@ async function mrClear(tabId) {
 }
 
 function mrPrivateLockActive() {
-  // True = do NOT raise/focus the window (private mode). Note this only governs
-  // FOCUS-stealing; capture still un-minimizes the window when needed, because
-  // Chrome does not paint a minimized tab and Page.startScreencast would then
-  // yield only black frames. Un-minimizing an already-normal window is a no-op
-  // and does not raise it over other apps, so capture stays non-disruptive.
-  return globalThis._forcePrivate === true || globalThis._privateModeLocked === true;
+  // True = do NOT raise/focus the window. Note this only governs FOCUS-stealing;
+  // capture still un-minimizes the window when needed, because Chrome does not
+  // paint a minimized tab and Page.startScreencast would then yield only black
+  // frames. Un-minimizing an already-normal window is a no-op and does not raise
+  // it over other apps, so capture stays non-disruptive.
+  //
+  // Reads the real lock/mode state (module-scoped `lockedToPrivate` + `defaultMode`).
+  // The old globals `_forcePrivate` / `_privateModeLocked` were never assigned
+  // anywhere, so this always returned false and every recording stole OS focus
+  // regardless of the force-private lock.
+  return lockedToPrivate === true || defaultMode !== "public";
 }
 
 // ============================================================================
@@ -2649,7 +2659,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       if (r.status === "recording") {
         try {
           const tab = await chrome.tabs.get(tabId);
-          if (tab.windowId !== undefined) {
+          if (tab.windowId !== undefined && !mrPrivateLockActive()) {
+            // Re-foreground the window only when focus-stealing is permitted.
+            // Under the private lock this stays a no-op; activating the tab
+            // (below) + Page.bringToFront keep a non-minimized window painting
+            // without yanking OS focus every tick.
             await chrome.windows.update(tab.windowId, { focused: true, drawAttention: false });
           }
           await chrome.tabs.update(tabId, { active: true });
