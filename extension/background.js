@@ -1732,7 +1732,6 @@ function stopCdpShotLoop(tabId) {
   const t = cdpShotTimers.get(tabId);
   if (t) clearTimeout(t);
   cdpShotTimers.delete(tabId);
-  cdpMrLastOrigin.delete(tabId);
 }
 
 // Force a clean debugger detach+reattach whenever a cdp-recording tab NAVIGATES.
@@ -1747,20 +1746,20 @@ function stopCdpShotLoop(tabId) {
 // follows the redirect across origins. chrome.debugger.attach throws if still
 // attached, so we detach (awaited) first; a per-tab guard prevents overlap.
 const cdpMrReattaching = new Set();
-const cdpMrLastOrigin = new Map(); // tabId -> last-seen origin while recording
-function originOf(u) { try { return new URL(u).origin; } catch { return null; } }
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!cdpMrByTab.has(tabId)) return;
-  if (!changeInfo.url) return;
-  const newOrigin = originOf(changeInfo.url);
-  const prevOrigin = cdpMrLastOrigin.get(tabId);
-  cdpMrLastOrigin.set(tabId, newOrigin);
-  // Only a CROSS-ORIGIN change swaps the render process and strands the capture
-  // session on the old target (the OAuth redirect facebook.com <-> kmboards.co).
-  // Same-origin SPA route changes (buffer -> buffer/comments) keep the same
-  // process, so skip them - detaching there would needlessly interrupt the poll
-  // AND kill any in-flight driving command (Runtime.evaluate) mid-navigation.
-  if (!prevOrigin || prevOrigin === newOrigin) return;
+  // Trigger on a full DOCUMENT LOAD completing (status === "complete"), which
+  // covers every real navigation that reloads the document and can strand the
+  // capture session on the old target: cross-origin OAuth redirects
+  // (facebook.com <-> kmboards.co) AND same-origin full loads (Page.navigate
+  // /buffer/comments -> /buffer). Client-side SPA route changes (a button that
+  // pushState-navigates within /buffer) do NOT fire a document status:"complete",
+  // so they pass through untouched - those keep the same process and the poll
+  // follows them naturally. Using "complete" (not changeInfo.url) also means we
+  // fire AFTER the page has loaded, which is well after any driving command
+  // (Runtime.evaluate) that started the navigation has already returned - so we
+  // never kill an in-flight command mid-nav (the 60s-timeout problem).
+  if (changeInfo.status !== "complete") return;
   if (cdpMrReattaching.has(tabId)) return;
   if (!attachedTabs.has(tabId)) return;
   cdpMrReattaching.add(tabId);
@@ -1770,7 +1769,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
       try { await chrome.debugger.detach({ tabId }); } catch {}
       // The next capture tick's retriableCdp -> ensureAttached re-binds to the
       // now-current target. We don't re-attach here to avoid racing the poll.
-      log(`vrec cdp-canvas: forced debugger reattach on cross-origin nav ${prevOrigin} -> ${newOrigin} (tab ${tabId})`);
+      log(`vrec cdp-canvas: forced debugger reattach on document load-complete (tab ${tabId})`);
     } finally {
       cdpMrReattaching.delete(tabId);
     }
