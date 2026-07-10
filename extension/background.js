@@ -1734,6 +1734,39 @@ function stopCdpShotLoop(tabId) {
   cdpShotTimers.delete(tabId);
 }
 
+// Force a clean debugger detach+reattach whenever a cdp-recording tab NAVIGATES.
+// Why: an OAuth-style cross-origin REDIRECT (facebook.com -> 302 -> kmboards.co,
+// e.g. clicking "Got it" at the end of a Facebook Login flow) swaps the tab's
+// render process WITHOUT raising a debugger error. The capture poll's session
+// stays bound to the old (facebook) target, so Page.captureScreenshot keeps
+// returning the STALE pre-redirect frame and the whole post-OAuth portion records
+// as that frozen frame. retriableCdp only re-attaches on a *thrown* transient
+// error, which never fires here. Detaching on the navigation event forces the
+// poll's next ensureAttached to re-bind to the NEW page's target, so capture
+// follows the redirect across origins. chrome.debugger.attach throws if still
+// attached, so we detach (awaited) first; a per-tab guard prevents overlap.
+const cdpMrReattaching = new Set();
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!cdpMrByTab.has(tabId)) return;
+  // A cross-origin redirect surfaces as a changeInfo.url change; also cover a
+  // full document load completing.
+  if (!(changeInfo.url || changeInfo.status === "complete")) return;
+  if (cdpMrReattaching.has(tabId)) return;
+  if (!attachedTabs.has(tabId)) return;
+  cdpMrReattaching.add(tabId);
+  (async () => {
+    try {
+      attachedTabs.delete(tabId);
+      try { await chrome.debugger.detach({ tabId }); } catch {}
+      // The next capture tick's retriableCdp -> ensureAttached re-binds to the
+      // now-current target. We don't re-attach here to avoid racing the poll.
+      log(`vrec cdp-canvas: forced debugger reattach after nav on tab ${tabId} (${changeInfo.url ? "url-change" : "load-complete"})`);
+    } finally {
+      cdpMrReattaching.delete(tabId);
+    }
+  })();
+});
+
 const OFFSCREEN_URL = "offscreen.html";
 
 async function hasOffscreenDoc() {
