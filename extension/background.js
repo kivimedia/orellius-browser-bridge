@@ -1689,10 +1689,13 @@ const cdpShotTimers = new Map();
 // screenshot never lets calls pile up on the debugger channel. Self-stops when
 // the tab is no longer the active cdp recording (cdpMrByTab mismatch).
 function startCdpShotLoop(tabId, recordingId, fps, quality) {
-  // Cap the poll at 15fps: captureScreenshot is a full render+encode per call,
-  // and the offscreen canvas.captureStream holds the last frame between polls,
-  // so the OUTPUT stays smooth (30fps) even if content updates at ~10-12fps.
-  const intervalMs = Math.max(70, Math.round(1000 / Math.min(Math.max(fps || 10, 4), 15)));
+  // Poll target up to 30fps. captureScreenshot is a full render+encode per call
+  // and the recursive setTimeout only schedules the NEXT capture AFTER the
+  // current one resolves, so the loop self-throttles to whatever the machine can
+  // sustain (typically ~15-25fps) - a low interval floor just removes the old
+  // hard 15fps ceiling so smooth on-page motion (a gliding cursor, scrolling,
+  // typing) is sampled at the highest achievable rate instead of looking choppy.
+  const intervalMs = Math.max(8, Math.round(1000 / Math.min(Math.max(fps || 24, 4), 30)));
   const tick = async () => {
     if (cdpMrByTab.get(tabId) !== recordingId) return;
     try {
