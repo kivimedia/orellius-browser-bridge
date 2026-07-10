@@ -227,6 +227,14 @@ function connectNativeHost() {
         });
         return;
       }
+      // Hub-originated PIN rotation (set-pin CLI). passwd-style: requires the
+      // CURRENT pin, so an agent that doesn't know it gains nothing.
+      if (msg.type === "admin_set_pin") {
+        handleAdminSetPin(msg).catch((err) => {
+          log(`admin_set_pin failed: ${err.message}`);
+        });
+        return;
+      }
       // Hub-originated tab/window cleanup (close-unused / shutdown CLI).
       if (msg.type === "admin_close_tabs") {
         handleAdminCloseTabs(msg).catch((err) => {
@@ -701,6 +709,31 @@ async function handleAdminSetMode(msg) {
       }
     }
   }
+}
+
+// Hub-originated admin_set_pin (POST /admin/set-pin?old=..&new=..). passwd
+// semantics: the caller must present the CURRENT pin. An agent that already
+// knows the current pin could unlock anyway, so this adds no new attack
+// surface; an agent that doesn't know it cannot install a pin of its choosing.
+async function handleAdminSetPin(msg) {
+  const oldPin = msg.oldPin === undefined || msg.oldPin === null ? "" : String(msg.oldPin);
+  const newPin = msg.newPin === undefined || msg.newPin === null ? "" : String(msg.newPin);
+  if (!OVERRIDE_PIN || oldPin !== OVERRIDE_PIN) {
+    log("admin_set_pin REFUSED: bad/missing current pin");
+    return;
+  }
+  if (!/^\d{4,10}$/.test(newPin)) {
+    log("admin_set_pin REFUSED: new pin must be 4-10 digits");
+    return;
+  }
+  // Rotating the pin clears any per-session binding, matching the popup's
+  // rotate behavior.
+  await chrome.storage.local.set({
+    [OVERRIDE_PIN_STORAGE_KEY]: newPin,
+    [PIN_BINDING_STORAGE_KEY]: null,
+  });
+  OVERRIDE_PIN = newPin;
+  log("admin_set_pin OK: override PIN rotated via CLI (binding cleared)");
 }
 
 // Per-session window claim. Each Claude session that creates an MCP tab group

@@ -385,6 +385,32 @@ const adminServer = http.createServer((req, res) => {
     return;
   }
 
+  // POST /admin/set-pin?old=<current>&new=<new>
+  //
+  // passwd-style PIN rotation: the extension validates the CURRENT pin before
+  // accepting the new one, so this endpoint adds no agent-exploitable surface
+  // (an agent that knows the current pin could already unlock).
+  if (req.method === "POST" && url.pathname === "/admin/set-pin") {
+    const oldPin = url.searchParams.get("old") || "";
+    const newPin = url.searchParams.get("new") || "";
+    const delivered = broadcastAdminMessage({
+      type: "admin_set_pin",
+      oldPin,
+      newPin,
+      reason: "set-pin CLI",
+    });
+    log(`/admin/set-pin broadcast delivered to ${delivered} native_host(s)`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      delivered,
+      message: delivered > 0
+        ? "Set-pin request sent. The extension only honors it when the correct CURRENT pin was supplied (?old=...). Confirm the new PIN in the extension popup."
+        : "No browser extensions connected; set-pin will apply when one reconnects (and only with the correct current pin).",
+    }));
+    return;
+  }
+
   // POST /admin/close-unused
   //
   // Close every Orellius-owned window whose sessionId is NOT in the hub's
