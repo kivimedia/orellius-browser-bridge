@@ -361,19 +361,26 @@ const adminServer = http.createServer((req, res) => {
   }
 
   if (req.method === "POST" && url.pathname === "/admin/unlock") {
+    // Unlock requires the override PIN (?pin=XXXXXX). The extension validates
+    // it and silently refuses a bad/missing pin - this keeps sibling Claude
+    // sessions from removing the human's lock (which they did, 2026-07-11).
+    // The human reads the PIN by clicking the Orellius extension icon.
+    const pin = url.searchParams.get("pin") || "";
     const delivered = broadcastAdminMessage({
       type: "admin_set_mode",
       lock: false,
+      pin,
       reason: "unlock CLI",
     });
-    log(`/admin/unlock broadcast delivered to ${delivered} native_host(s)`);
+    log(`/admin/unlock broadcast delivered to ${delivered} native_host(s) (pin ${pin ? "supplied" : "MISSING"})`);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       ok: true,
       delivered,
+      pinSupplied: !!pin,
       message: delivered > 0
-        ? `Unlocked. ${delivered} browser native_host(s) notified. Sessions can switch to public mode again via the browser_mode tool.`
-        : "No browser extensions are currently connected to the hub. Unlock will take effect when the extension reconnects.",
+        ? `Unlock request sent to ${delivered} native_host(s). The extension only honors it when the correct override PIN was supplied (?pin=XXXXXX - the human reads it from the Orellius extension popup). A bad or missing pin is silently refused.`
+        : "No browser extensions are currently connected to the hub. Unlock will take effect when the extension reconnects (if the pin is correct).",
     }));
     return;
   }

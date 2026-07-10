@@ -9,9 +9,131 @@ self.addEventListener("unhandledrejection", (event) => {
 const NATIVE_HOST_NAME = "com.orellius.browser_bridge";
 
 // --- Debug logging ---
+const _logRing = [];
 function log(msg) {
   console.log(`[BrowserBridge] ${msg}`);
+  // TEMPORARY diagnostic: keep recent log lines retrievable via tabs_context_mcp.
+  try {
+    _logRing.push(`${new Date().toISOString().slice(11, 23)} ${msg}`);
+    if (_logRing.length > 150) _logRing.shift();
+  } catch {}
 }
+
+// TEMPORARY diagnostic: per-window census - who owns each window's tabs?
+async function _debugWindowsOverview() {
+  try {
+    const wins = await chrome.windows.getAll({ populate: true });
+    const lines = [];
+    for (const w of wins) {
+      let claude = 0, human = 0;
+      const groups = new Set();
+      for (const t of w.tabs || []) {
+        let isClaude = false;
+        if (t.groupId !== undefined && t.groupId !== -1) {
+          try {
+            const g = await chrome.tabGroups.get(t.groupId);
+            if ((g.title || "").startsWith("\u{1F512} Claude")) { isClaude = true; groups.add(g.title); }
+          } catch {}
+        }
+        if (isClaude) claude++; else human++;
+      }
+      const owner = findOwnerOfWindow(w.id);
+      lines.push(`window ${w.id}: ${w.state}${w.focused ? " FOCUSED" : ""} tabs=${(w.tabs || []).length} claude=${claude} human=${human}${owner ? ` claimedBy=${owner}` : ""}${groups.size ? ` groups=[${[...groups].join(" | ")}]` : ""}`);
+    }
+    return lines.join("\n");
+  } catch (e) { return `windows overview FAILED: ${e.message}`; }
+}
+
+// TEMPORARY diagnostic: does windows.create actually make a separate window on
+// this Chrome? Cached once per SW lifetime so 13 sessions don't spam probes.
+let _probeResult = null;
+async function _probeWindowCreate() {
+  if (_probeResult !== null) return _probeResult;
+  try {
+    const beforeWins = (await chrome.windows.getAll()).map((w) => w.id);
+    const beforeTabs = new Set((await chrome.tabs.query({})).map((t) => t.id));
+    const win = await chrome.windows.create({ focused: false, url: "about:blank" });
+    const isNew = !beforeWins.includes(win.id);
+    const created = (await chrome.tabs.query({})).filter((t) => !beforeTabs.has(t.id));
+    _probeResult = `windows.create -> winId=${win.id} isNewWindow=${isNew} priorWins=[${beforeWins.join(",")}] createdTabs=[${created.map((t) => `${t.id}@win${t.windowId}`).join(",")}]`;
+    for (const t of created) { try { await chrome.tabs.remove(t.id); } catch {} }
+  } catch (e) { _probeResult = `windows.create probe FAILED: ${e.message}`; }
+  return _probeResult;
+}
+
+// ===== TEMPORARY focus-steal instrumentation (remove after diagnosis) =====
+// Wraps the Chrome APIs that can foreground a tab/window and records each call
+// with a short stack trace, so we can pin exactly which code path steals focus.
+// The trace is appended to tabs_context_mcp's response for remote retrieval.
+const _focusTrace = [];
+function _shortStack() {
+  try {
+    return (new Error().stack || "").split("\n").slice(3, 8)
+      .map((s) => s.trim().replace(/^at\s+/, "")).join("  <-  ");
+  } catch { return ""; }
+}
+function _pushTrace(entry) {
+  try {
+    entry.t = Date.now();
+    entry.session = _currentSessionId || "(none)";
+    _focusTrace.push(entry);
+    if (_focusTrace.length > 300) _focusTrace.shift();
+    console.log(`[FOCUS-TRACE] ${entry.api} ${JSON.stringify(entry)}`);
+  } catch {}
+}
+// Best-effort async annotation: was the activated tab sharing a window with the
+// human's tabs? entry.STEAL === true means this activation switched the human's
+// visible tab (the real focus-steal signal).
+async function _annotateHumanWindow(entry, tabId) {
+  try {
+    if (tabId == null) return;
+    const tab = await chrome.tabs.get(tabId);
+    entry.windowId = tab.windowId;
+    const winTabs = await chrome.tabs.query({ windowId: tab.windowId });
+    let human = 0;
+    for (const t of winTabs) {
+      if (t.groupId === undefined || t.groupId === -1) { human++; continue; }
+      try {
+        const g = await chrome.tabGroups.get(t.groupId);
+        if (!(g && (g.title || "").startsWith("\u{1F512} Claude"))) human++;
+      } catch { human++; }
+    }
+    entry.humanTabs = human;
+    entry.STEAL = human > 0;
+  } catch {}
+}
+try {
+  const _oTabsUpdate = chrome.tabs.update.bind(chrome.tabs);
+  chrome.tabs.update = function (...a) {
+    const p = a.find((x) => x && typeof x === "object");
+    if (p && p.active === true) {
+      const tabId = typeof a[0] === "number" ? a[0] : undefined;
+      const entry = { api: "tabs.update{active}", tabId, stack: _shortStack() };
+      _pushTrace(entry);
+      _annotateHumanWindow(entry, tabId);
+    }
+    return _oTabsUpdate(...a);
+  };
+  const _oWinUpdate = chrome.windows.update.bind(chrome.windows);
+  chrome.windows.update = function (...a) {
+    const p = a.find((x) => x && typeof x === "object");
+    if (p && (p.focused === true || (p.state && p.state !== "minimized"))) _pushTrace({ api: "windows.update", focused: p.focused === true, state: p.state, windowId: typeof a[0] === "number" ? a[0] : undefined, stack: _shortStack() });
+    return _oWinUpdate(...a);
+  };
+  const _oWinCreate = chrome.windows.create.bind(chrome.windows);
+  chrome.windows.create = function (...a) {
+    const p = a.find((x) => x && typeof x === "object") || {};
+    if (p.focused !== false) _pushTrace({ api: "windows.create", focused: p.focused, state: p.state, stack: _shortStack() });
+    return _oWinCreate(...a);
+  };
+  const _oDbgSend = chrome.debugger.sendCommand.bind(chrome.debugger);
+  chrome.debugger.sendCommand = function (...a) {
+    if (a[1] === "Page.bringToFront") _pushTrace({ api: "Page.bringToFront", tabId: a[0] && a[0].tabId, stack: _shortStack() });
+    return _oDbgSend(...a);
+  };
+  console.log("[FOCUS-TRACE] instrumentation installed");
+} catch (e) { console.log(`[FOCUS-TRACE] install failed: ${e.message}`); }
+// ===== end instrumentation =====
 
 // --- Badge status indicator ---
 function setBadge(status) {
@@ -407,7 +529,7 @@ async function setDefaultMode(mode) {
   if (lockedToPrivate && m === "public") {
     // Hard refuse - the user installed the global lock specifically to prevent
     // any session from going public. Surface a clear error to the calling tool.
-    throw new Error('Orellius is locked to private mode (global "force-private" lock active). Run `POST http://127.0.0.1:18766/admin/unlock` or click "Unlock private mode" in the extension popup to allow public mode again.');
+    throw new Error('Orellius is locked to private mode by the human (global "force-private" lock). Public mode is unavailable. Do NOT attempt to unlock or work around this - only the human can unlock it, from the Orellius extension popup. Continue in private mode: your tab still works in the background (input, navigation, screenshots all function).');
   }
   defaultMode = m;
   await chrome.storage.local.set({ [MODE_STORAGE_KEY]: m });
@@ -537,6 +659,19 @@ async function handleAdminSetMode(msg) {
 
   // Apply lock first so any subsequent mode change can be validated against it.
   if (wantLock !== null) {
+    if (wantLock === false) {
+      // Unlocking is a HUMAN-ONLY action. Sibling Claude sessions used to
+      // defeat the lock by running the unlock CLI themselves (observed
+      // 2026-07-11: a session hit the locked error, ran POST /admin/unlock,
+      // switched to public mode and resumed focus-stealing). The unlock
+      // broadcast must now carry the override PIN, which only the human can
+      // read from the extension popup.
+      const supplied = msg.pin === undefined || msg.pin === null ? "" : String(msg.pin);
+      if (!OVERRIDE_PIN || supplied !== OVERRIDE_PIN) {
+        log(`admin_set_mode unlock REFUSED: bad/missing pin (reason="${msg.reason || ""}")`);
+        return;
+      }
+    }
     await setPrivateLock(wantLock);
   }
   if (wantMode === "private") {
@@ -856,6 +991,18 @@ function isTransientCdpError(err) {
 // activate a tab in another session's window. Without that guard, two
 // concurrent sessions sharing a window would race tab activations and each
 // would think their click went to the wrong tab.
+// A window is "fully ours" when every tab in it belongs to the given group.
+// Mandatory guard before ANY windows.update({focused:true}): raising a window
+// that also holds the human's tabs steals their whole workspace, regardless of
+// public/private mode.
+async function _windowFullyOurs(windowId, gid) {
+  if (gid === undefined || gid === -1 || windowId === undefined) return false;
+  try {
+    const winTabs = await chrome.tabs.query({ windowId });
+    return winTabs.length > 0 && winTabs.every((t) => t.groupId === gid);
+  } catch { return false; }
+}
+
 // THE ISOLATION INVARIANT. Activating a tab (chrome.tabs.update{active:true},
 // required for CDP input) switches the VISIBLE tab of whatever window the tab
 // lives in. If our owned tab is sitting in the human's window - which happens
@@ -905,27 +1052,36 @@ async function isolateOwnedTab(tab) {
   if (ownWin !== undefined) { try { await chrome.windows.get(ownWin); } catch { ownWin = undefined; } }
 
   try {
+    // GOTCHA (proven 2026-07-11): windows.create({tabId}) and tabs.move do NOT
+    // carry a GROUPED tab across windows - Chrome leaves the tab behind and
+    // you get an empty window that auto-closes moments later, while the old
+    // code logged success. The reliable move for grouped tabs: ungroup first,
+    // then tabs.group with createProperties.windowId, which moves the tabs
+    // into the target window as part of creating the group there.
+    let placeholderTabId;
     if (ownWin === undefined) {
-      // Seed a fresh background window with our first tab (windows.create with a
-      // tabId MOVES that tab, no stray blank tab), then pull the rest in.
-      const [firstId, ...restIds] = ourTabIds;
-      const win = await chrome.windows.create({ tabId: firstId, focused: false });
+      const win = await chrome.windows.create({ focused: false, url: "about:blank" });
       ownWin = win.id;
-      if (restIds.length) await chrome.tabs.move(restIds, { windowId: ownWin, index: -1 });
+      placeholderTabId = win.tabs && win.tabs[0] ? win.tabs[0].id : undefined;
       // Keep it out of sight while locked / private.
       if (mrPrivateLockActive()) { try { await chrome.windows.update(ownWin, { state: "minimized" }); } catch {} }
-    } else {
-      await chrome.tabs.move(ourTabIds, { windowId: ownWin, index: -1 });
     }
-    // Tabs drop their group when they cross windows - re-group and relabel so the
-    // 🔒 marker and per-session ownership signal survive.
-    const newGid = await chrome.tabs.group({ tabIds: ourTabIds });
+    try { await chrome.tabs.ungroup(ourTabIds); } catch {}
+    const newGid = await chrome.tabs.group({ tabIds: ourTabIds, createProperties: { windowId: ownWin } });
     await chrome.tabGroups.update(newGid, { title: myTitle, color: "blue" });
+    if (placeholderTabId !== undefined) { try { await chrome.tabs.remove(placeholderTabId); } catch {} }
+    // VERIFY the move actually took effect - never trust it blindly again.
+    const movedTab = await chrome.tabs.get(tab.id);
+    if (movedTab.windowId !== ownWin) {
+      log(`isolateOwnedTab VERIFY FAILED (session ${sessionId}): tab ${tab.id} still in window ${movedTab.windowId}, wanted ${ownWin}`);
+      return movedTab;
+    }
     const state = getSessionState(sessionId);
     state.tabGroupId = newGid;
     state.tabGroupTabs = new Set(ourTabIds);
     setSessionWindowId(sessionId, ownWin);
-    log(`isolated ${ourTabIds.length} owned tab(s) for session ${sessionId} into window ${ownWin} (was sharing window ${tab.windowId} with foreign tabs)`);
+    log(`isolated ${ourTabIds.length} owned tab(s) for session ${sessionId} into window ${ownWin} (was sharing window ${tab.windowId} with foreign tabs) [verified]`);
+    return movedTab;
   } catch (e) {
     log(`isolateOwnedTab failed (session ${sessionId}): ${e.message}`);
   }
@@ -947,7 +1103,10 @@ async function focusTabForInput(tabId, opts = {}) {
     // OS window never gets brought forward.
     const wantPublic = !lockedToPrivate && (opts.public ?? (defaultMode === "public"));
     if (wantPublic && tab.windowId !== undefined) {
-      await chrome.windows.update(tab.windowId, { focused: true });
+      // Even in public mode, never raise a window containing the human's tabs.
+      if (await _windowFullyOurs(tab.windowId, tab.groupId)) {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      }
     }
   } catch (e) {
     // Ownership errors are programmer errors (caller acted on wrong window) -
@@ -1278,6 +1437,21 @@ const MAX_SCREENSHOT_WIDTH = 1280;
 const MAX_SCREENSHOT_HEIGHT = 800;
 
 async function takeScreenshot(tabId, opts = {}) {
+  // STOPGAP (shared-window focus theft): when our tab lives in the human's
+  // window, activating it to capture switches the human's visible tab. Remember
+  // which tab was active, activate ours only for the capture, then restore the
+  // human's tab in the finally below. Capture still works (our tab is active
+  // during it); the human's view flickers at worst instead of being left on our
+  // tab. No-op when our tab is already the active/only tab (isolated / iso mode).
+  let _restoreTabId = null;
+  try {
+    const _t = await chrome.tabs.get(tabId);
+    if (_t.windowId !== undefined) {
+      const [_active] = await chrome.tabs.query({ windowId: _t.windowId, active: true });
+      if (_active && _active.id !== tabId) _restoreTabId = _active.id;
+    }
+  } catch {}
+  try {
   // Always refocus the target before capture. Some pages trigger focus-
   // stealing side effects (Radix portals, Google Sign-In iframes, etc.) that
   // make the CDP path refuse subsequent commands.
@@ -1418,6 +1592,12 @@ async function takeScreenshot(tabId, opts = {}) {
   }
 
   return { base64, imageId };
+  } finally {
+    // Restore the human's tab so our capture never leaves them on our tab.
+    if (_restoreTabId !== null) {
+      try { await chrome.tabs.update(_restoreTabId, { active: true }); } catch {}
+    }
+  }
 }
 
 // --- Mouse helpers ---
@@ -1661,10 +1841,10 @@ async function vrecStartRecording(tabId, opts = {}) {
     const tab = await chrome.tabs.get(tabId);
     if (tab.windowId !== undefined) {
       // Un-minimize so the compositor paints (required for screencast), but only
-      // steal OS focus when focus-stealing is permitted. Under the private lock
-      // this MUST NOT foreground the window.
+      // steal OS focus when focus-stealing is permitted AND the window is
+      // entirely ours. Under the private lock this MUST NOT foreground anything.
       const update = { state: "normal", drawAttention: false };
-      if (!mrPrivateLockActive()) update.focused = true;
+      if (!mrPrivateLockActive() && (await _windowFullyOurs(tab.windowId, tab.groupId))) update.focused = true;
       await chrome.windows.update(tab.windowId, update);
     }
     await chrome.tabs.update(tabId, { active: true });
@@ -2131,7 +2311,7 @@ async function mrStartRecording(tabId, opts = {}) {
           const win = await chrome.windows.get(tab.windowId);
           const update = {};
           if (win.state === "minimized") update.state = "normal";
-          if (!mrPrivateLockActive()) { update.focused = true; update.state = "normal"; }
+          if (!mrPrivateLockActive() && (await _windowFullyOurs(tab.windowId, tab.groupId))) { update.focused = true; update.state = "normal"; }
           if (Object.keys(update).length) await chrome.windows.update(tab.windowId, update);
         }
         // The active tab of a (non-minimized) window paints even when the window
@@ -2739,9 +2919,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       if (r.status === "recording") {
         try {
           const tab = await chrome.tabs.get(tabId);
-          if (tab.windowId !== undefined && !mrPrivateLockActive()) {
-            // Re-foreground the window only when focus-stealing is permitted.
-            // Under the private lock this stays a no-op; activating the tab
+          if (tab.windowId !== undefined && !mrPrivateLockActive() && (await _windowFullyOurs(tab.windowId, tab.groupId))) {
+            // Re-foreground the window only when focus-stealing is permitted
+            // AND the window is entirely ours. Otherwise activating the tab
             // (below) + Page.bringToFront keep a non-minimized window painting
             // without yanking OS focus every tick.
             await chrome.windows.update(tab.windowId, { focused: true, drawAttention: false });
@@ -2810,13 +2990,22 @@ const toolHandlers = {
   async tabs_context_mcp(args) {
     await ensureTabGroup(args.createIfEmpty);
     const state = getSessionState(_currentSessionId);
+    // TEMPORARY: append the focus-steal trace + window census + create-probe +
+    // recent extension logs for remote retrieval.
+    const _trace = `\n\n===FOCUS-TRACE (${_focusTrace.length} events, newest last)===\n` +
+      _focusTrace.slice(-30).map((e) => JSON.stringify(e)).join("\n") +
+      `\n\n===WINDOWS===\n${await _debugWindowsOverview()}` +
+      `\n\n===CREATE-PROBE===\n${await _probeWindowCreate()}` +
+      `\n\n===RECENT-LOGS===\n${_logRing.slice(-40).join("\n")}`;
     if (state.tabGroupId === null) {
       return {
-        content: [{ type: "text", text: "No MCP tab group exists. Use createIfEmpty: true to create one." }],
+        content: [{ type: "text", text: "No MCP tab group exists. Use createIfEmpty: true to create one." + _trace }],
       };
     }
     const tabs = await chrome.tabs.query({ groupId: state.tabGroupId });
-    return formatTabContext(tabs);
+    const r = formatTabContext(tabs);
+    r.content[0].text += _trace;
+    return r;
   },
 
   async tabs_create_mcp(args) {
@@ -4033,13 +4222,23 @@ const toolHandlers = {
       try {
         await chrome.windows.update(wid, { drawAttention: true });
         return { content: [{ type: "text", text:
-          `Orellius is locked to private mode - flagged window ${wid} (session "${sid}") for attention in the taskbar but did NOT raise it. Run \`POST http://127.0.0.1:18766/admin/unlock\` to re-enable focus stealing.`
+          `Orellius is locked to private mode - flagged window ${wid} (session "${sid}") for attention in the taskbar but did NOT raise it. Do NOT attempt to unlock; only the human can (extension popup).`
         }] };
       } catch (e) {
         return { content: [{ type: "text", text: `Locked to private; drawAttention failed: ${e.message}` }] };
       }
     }
     try {
+      // Raising is only legitimate when the window is entirely session-owned.
+      // If the human's tabs share it, raising would hijack their workspace -
+      // fall back to a taskbar flash.
+      const state = getSessionState(sid);
+      if (!(await _windowFullyOurs(wid, state.tabGroupId))) {
+        await chrome.windows.update(wid, { drawAttention: true });
+        return { content: [{ type: "text", text:
+          `Window ${wid} also contains the human's tabs - flagged it in the taskbar instead of raising it.`
+        }] };
+      }
       await chrome.windows.update(wid, { focused: true, drawAttention: true });
       return { content: [{ type: "text", text: `Brought window ${wid} (session "${sid}") to the foreground.` }] };
     } catch (e) {

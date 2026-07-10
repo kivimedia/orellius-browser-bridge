@@ -271,7 +271,11 @@
       if (!confirm("Unlock private mode? Future Claude sessions will be allowed to switch into public mode (window focus stealing) again via the browser_mode tool.")) return;
       await chrome.storage.local.set({ [LOCK_KEY]: false });
       try {
-        await fetch("http://127.0.0.1:18766/admin/unlock", { method: "POST" });
+        // The unlock broadcast is PIN-gated (agent-proof); the popup is the
+        // human path, so it reads the PIN from storage and supplies it.
+        const pinData = await chrome.storage.local.get("orellius_override_pin_v1");
+        const pin = encodeURIComponent(String(pinData["orellius_override_pin_v1"] || ""));
+        await fetch(`http://127.0.0.1:18766/admin/unlock?pin=${pin}`, { method: "POST" });
       } catch { /* hub may not be running */ }
       await refresh();
       toast("Unlocked");
