@@ -1751,6 +1751,12 @@ function startCdpShotLoop(tabId, recordingId, fps, quality) {
   const intervalMs = Math.max(8, Math.round(1000 / Math.min(Math.max(fps || 24, 4), 30)));
   const tick = async () => {
     if (cdpMrByTab.get(tabId) !== recordingId) return;
+    // While the load-complete listener is detaching + re-attaching + re-injecting
+    // the driver, don't capture (a racing retriableCdp re-attach would fight it).
+    if (cdpMrReattaching.has(tabId)) {
+      cdpShotTimers.set(tabId, setTimeout(tick, 60));
+      return;
+    }
     try {
       // Default surface capture (fromSurface:true) returns real, current content
       // AS LONG AS the window is visible/foreground - Chrome keeps the compositor
@@ -1833,9 +1839,20 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     try {
       attachedTabs.delete(tabId);
       try { await chrome.debugger.detach({ tabId }); } catch {}
-      // The next capture tick's retriableCdp -> ensureAttached re-binds to the
-      // now-current target. We don't re-attach here to avoid racing the poll.
-      log(`vrec cdp-canvas: forced debugger reattach on document load-complete (tab ${tabId})`);
+      // Re-attach HERE (the poll is paused while cdpMrReattaching is set) and,
+      // critically, RE-INJECT the cinematic driver: detaching the debugger wipes
+      // any Page.addScriptToEvaluateOnNewDocument, so without re-adding it the
+      // driver would vanish on every navigation and only the first page would
+      // have the gliding cursor. Re-add it (future pages) + seed this page.
+      await ensureAttached(tabId);
+      if (cdpDriverScript.has(tabId)) {
+        try {
+          const added = await cdp(tabId, "Page.addScriptToEvaluateOnNewDocument", { source: CINEMATIC_DRIVER_SRC });
+          if (added && added.identifier) cdpDriverScript.set(tabId, added.identifier);
+          await cdp(tabId, "Runtime.evaluate", { expression: CINEMATIC_DRIVER_SRC });
+        } catch {}
+      }
+      log(`vrec cdp-canvas: reattach + re-inject driver on load-complete (tab ${tabId})`);
     } finally {
       cdpMrReattaching.delete(tabId);
     }
