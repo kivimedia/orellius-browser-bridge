@@ -89,13 +89,21 @@
     input[type="text"]:focus { outline: none; border-color: var(--accent); }
     .footer { margin-top: 4px; font-size: 11px; color: var(--muted); line-height: 1.5; }
     .footer code { background: rgba(255, 255, 255, 0.06); padding: 1px 5px; border-radius: 3px; font-size: 10.5px; }
+    /* A toast nobody notices is the same as no toast. High contrast, its own
+       colour, and it slides in so the movement catches the eye. */
     .toast {
       position: fixed; bottom: 12px; left: 16px; right: 16px;
-      background: var(--panel); border: 1px solid var(--border);
-      padding: 8px 12px; border-radius: 8px; font-size: 12px;
-      opacity: 0; pointer-events: none; transition: opacity 0.18s;
+      background: #1f7a4d; color: #f2fff8;
+      border: 1px solid #2fa96c;
+      padding: 9px 12px; border-radius: 8px;
+      font-size: 12px; font-weight: 600; text-align: center;
+      box-shadow: 0 4px 14px rgba(0,0,0,.45);
+      opacity: 0; transform: translateY(6px);
+      pointer-events: none; transition: opacity .18s, transform .18s;
     }
-    .toast.show { opacity: 1; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    /* Failures must not be dressed up as success. */
+    .toast.bad { background: #7a2c22; border-color: #b8503f; color: #ffeee9; }
   </style>
 </head>
 <body>
@@ -171,10 +179,15 @@
     const $forcePrivate = document.getElementById("forcePrivate");
     const $unlockPrivate = document.getElementById("unlockPrivate");
 
-    function toast(msg) {
+    let toastTimer = null;
+    function toast(msg, bad) {
       $toast.textContent = msg;
+      $toast.classList.toggle("bad", !!bad);
       $toast.classList.add("show");
-      setTimeout(() => $toast.classList.remove("show"), 1400);
+      // Restart the timer on every toast, otherwise a second toast inherits the
+      // first one's remaining time and vanishes almost immediately.
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => $toast.classList.remove("show"), 2200);
     }
 
     function generatePin() {
@@ -212,12 +225,70 @@
       }
     }
 
-    document.getElementById("copy").addEventListener("click", async () => {
-      const pin = $pin.textContent;
-      if (!pin || pin === "------") return;
-      await navigator.clipboard.writeText(pin);
-      toast("Copied PIN");
-    });
+    // Copy the PIN. This used to be a bare `await navigator.clipboard.writeText()`
+    // with no catch, which failed silently in two ways at once: the manifest was
+    // missing "clipboardWrite" so the promise REJECTED, and because the rejection
+    // threw, the toast() on the next line never ran either. So the button did
+    // nothing and said nothing. Now: try the async API, fall back to a real
+    // execCommand copy, and ALWAYS tell the human what happened.
+    async function copyPin() {
+      const pin = ($pin.textContent || "").trim();
+      if (!pin || pin === "------") {
+        toast("No PIN to copy yet");
+        return;
+      }
+
+      // 1. The modern API. Needs "clipboardWrite" AND a focused document.
+      try {
+        await navigator.clipboard.writeText(pin);
+        toast("Copied PIN " + pin);
+        return;
+      } catch (e) {
+        // fall through, never surface a raw error to the human
+      }
+
+      // 2. Fallback: a real selection + execCommand. Works when the async API is
+      // unavailable or the popup does not have clipboard focus.
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = pin;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "0";
+        ta.style.left = "0";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        ta.setSelectionRange(0, pin.length);
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        if (ok) {
+          toast("Copied PIN " + pin);
+          return;
+        }
+      } catch (e) {
+        // fall through to the last resort
+      }
+
+      // 3. Last resort: select the PIN on screen so it can be copied by hand,
+      // and say so plainly rather than pretending it worked.
+      try {
+        const range = document.createRange();
+        range.selectNodeContents($pin);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } catch (e) { /* nothing more we can do */ }
+      toast("Could not copy - PIN selected, press Ctrl+C", true);
+    }
+
+    document.getElementById("copy").addEventListener("click", copyPin);
+
+    // The PIN itself is click-to-copy too - the button is not the only way in.
+    $pin.style.cursor = "pointer";
+    $pin.title = "Click to copy";
+    $pin.addEventListener("click", copyPin);
 
     document.getElementById("rotate").addEventListener("click", async () => {
       if (!confirm("Rotate to a random 6-digit PIN? Any in-flight agent calls using the old PIN will fail. Existing session binding will be cleared.")) return;
