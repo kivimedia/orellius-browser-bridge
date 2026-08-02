@@ -558,6 +558,36 @@ const adminServer = http.createServer((req, res) => {
   // their next tabs_context_mcp({createIfEmpty:true}) auto-recreates a fresh
   // window. Useful when you want a clean slate without restarting any Claude
   // conversation.
+  // POST /admin/reload-extension
+  //
+  // Make Chrome re-read the unpacked extension from disk. Chrome does NOT do
+  // this on browser restart, so without it every extension change required a
+  // human to click Reload on chrome://extensions - and the version shown there
+  // stays stale until they do, which looks identical to a change that was
+  // never shipped.
+  //
+  // The extension calls chrome.runtime.reload(), which keeps the same
+  // extension id (unlike --load-extension, which would mint a new one and
+  // break native messaging). The service worker dies instantly, so there is no
+  // ack to wait for; the native host reconnects on its own within a few
+  // seconds. Verify with GET /admin/status -> nativeHosts.
+  if (req.method === "POST" && url.pathname === "/admin/reload-extension") {
+    const delivered = broadcastAdminMessage({
+      type: "admin_reload_extension",
+      reason: "reload-extension CLI",
+    });
+    log(`/admin/reload-extension broadcast delivered to ${delivered} native_host(s)`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      delivered,
+      message: delivered > 0
+        ? `Sent reload to ${delivered} browser extension(s). The extension re-reads from disk and its native host reconnects in a few seconds - confirm with GET /admin/status (nativeHosts) and check the version in chrome://extensions.`
+        : "No browser extensions are connected to the hub. No-op.",
+    }));
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/admin/shutdown") {
     const delivered = broadcastAdminMessage({
       type: "admin_close_tabs",

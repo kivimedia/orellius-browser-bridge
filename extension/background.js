@@ -239,6 +239,27 @@ function connectNativeHost() {
         });
         return;
       }
+      // Hub-originated extension reload.
+      //
+      // Chrome does NOT pick up edits to an unpacked extension on browser
+      // restart - it keeps serving the loaded copy until something explicitly
+      // reloads it. Until this handler existed, shipping any extension change
+      // meant asking the human to go click Reload on chrome://extensions, and
+      // the version in that page stays stale until they do, which looks
+      // exactly like a change that was never made.
+      //
+      // --load-extension is NOT an alternative: this manifest has no "key", so
+      // loading by path mints a DIFFERENT extension id and breaks native
+      // messaging (the host manifest pins the current id in allowed_origins).
+      //
+      // chrome.runtime.reload() re-reads the extension from disk, keeping the
+      // same id. The service worker dies immediately, so nothing after this
+      // line runs and no reply is possible - fire and forget by design.
+      if (msg.type === "admin_reload_extension") {
+        log("admin_reload_extension: reloading from disk now");
+        try { chrome.runtime.reload(); } catch (e) { log(`reload failed: ${e.message}`); }
+        return;
+      }
       // Hub-originated tab/window cleanup (close-unused / shutdown CLI).
       if (msg.type === "admin_close_tabs") {
         handleAdminCloseTabs(msg).catch((err) => {
