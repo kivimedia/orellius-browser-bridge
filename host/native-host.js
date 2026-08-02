@@ -102,6 +102,10 @@ function connectTcp() {
   log(`Connecting to MCP server at 127.0.0.1:${TCP_PORT}...`);
   tcpSocket = new net.Socket();
 
+  // Detect a half-open socket (hub killed hard, no FIN delivered) instead of
+  // sitting on a dead connection forever.
+  tcpSocket.setKeepAlive(true, 15000);
+
   tcpSocket.connect(TCP_PORT, "127.0.0.1", () => {
     log(`Connected to hub on port ${TCP_PORT}`);
     reconnectAttempts = 0;
@@ -109,15 +113,31 @@ function connectTcp() {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
     }
-    // Wait for the extension to identify its browser via init. Fall back to
-    // "chromium" if it doesn't (covers pre-multi-browser extension builds).
     if (!registered) {
-      initTimer = setTimeout(() => {
-        if (!registered) {
-          log(`No init message after ${INIT_TIMEOUT_MS}ms; registering as default browser=chromium`);
-          registerWithHub("chromium");
-        }
-      }, INIT_TIMEOUT_MS);
+      if (detectedBrowser) {
+        // RECONNECT path. The extension sends `init` only once, when it first
+        // calls connectNative - it will never send another one. So on any
+        // reconnect we must re-register ourselves using the browser we already
+        // learned. Without this the socket reconnects but no
+        // `register_native_host` is ever sent: the hub shows nativeHosts: []
+        // and every browser tool fails, while this process looks perfectly
+        // healthy. That made any hub restart silently kill the browser link
+        // until Chrome itself was restarted (found 2026-08-02, right after the
+        // hub was put under pm2 - which restarts it, so the bug would have
+        // fired routinely).
+        log(`Reconnected; re-registering as browser=${detectedBrowser}`);
+        registerWithHub(detectedBrowser);
+      } else {
+        // FIRST connect. Wait for the extension to identify its browser via
+        // init. Fall back to "chromium" if it doesn't (covers
+        // pre-multi-browser extension builds).
+        initTimer = setTimeout(() => {
+          if (!registered) {
+            log(`No init message after ${INIT_TIMEOUT_MS}ms; registering as default browser=chromium`);
+            registerWithHub("chromium");
+          }
+        }, INIT_TIMEOUT_MS);
+      }
     }
   });
 
@@ -147,6 +167,10 @@ function connectTcp() {
   tcpSocket.on("close", () => {
     log(`Hub connection closed`);
     tcpSocket = null;
+    // Registration lives on the SOCKET, not on this process. Dropping this
+    // flag is what lets the reconnect path re-register (see connect handler).
+    registered = false;
+    if (initTimer) { clearTimeout(initTimer); initTimer = null; }
     if (!reconnectTimer) {
       reconnectTimer = setInterval(() => {
         reconnectAttempts++;
