@@ -25,6 +25,11 @@ const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes with no MCP clients -> exit
 // live process counted as active.
 const SESSION_IDLE_TTL_MS = Number(process.env.ORELLIUS_SESSION_TTL_MS) || 15 * 60 * 1000;
 const SWEEP_INTERVAL_MS = Number(process.env.ORELLIUS_SWEEP_INTERVAL_MS) || 60 * 1000;
+// How long a freshly-registered session is protected from the sweeper before
+// it has to show a real browser call. Short on purpose: registration is a
+// connection event, not browsing, and treating it as browsing makes
+// /admin/status unable to answer "who is driving the browser right now".
+const REGISTER_GRACE_MS = 60 * 1000;
 
 function log(msg) {
   const ts = new Date().toISOString().slice(11, 19);
@@ -285,11 +290,17 @@ const server = net.createServer((socket) => {
             }
 
             mcpClients.set(socketSessionId, socket);
-            // Registration now only happens lazily, immediately before the
-            // first tool call, so it counts as activity. Without this the
-            // sweeper could evict a session in the millisecond gap between
-            // registering and its first tool_request landing.
-            touchSession(socketSessionId);
+            // Registration is NOT a browser call, and must not be recorded as
+            // one: doing that made a session that had merely reconnected look
+            // identical to one actively driving the browser, which produced a
+            // wrong diagnosis on 2026-08-02 (sessions read as "3s since last
+            // activity" when they had done nothing at all).
+            //
+            // It still needs a grace window, or the sweeper could evict a
+            // session in the gap between registering and its first
+            // tool_request landing. So backdate the stamp to give exactly
+            // REGISTER_GRACE_MS of protection, no more.
+            sessionActivity.set(socketSessionId, Date.now() - SESSION_IDLE_TTL_MS + REGISTER_GRACE_MS);
             if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
             log(`MCP client registered: session=${socketSessionId} from ${remote} (total: ${mcpClients.size})`);
             socket.write(JSON.stringify({ type: "registered", role: "mcp_client", sessionId: socketSessionId }) + "\n");
