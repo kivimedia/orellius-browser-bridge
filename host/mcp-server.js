@@ -428,7 +428,10 @@ const server = new McpServer({
 server.tool(
   "tabs_context_mcp",
   "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. Also checks for available session recovery (previous session snapshots). CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
-  { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
+  {
+    createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect."),
+    diagnostics: z.boolean().optional().describe("Append focus-steal trace, window census, window-create probe and recent extension logs to the response. Verbose - only pass this when actually debugging window focus or tab-isolation problems."),
+  },
   async (args) => {
     const result = await callTool("tabs_context_mcp", args);
     

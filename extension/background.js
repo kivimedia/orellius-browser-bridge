@@ -78,7 +78,11 @@ function _pushTrace(entry) {
     entry.session = _currentSessionId || "(none)";
     _focusTrace.push(entry);
     if (_focusTrace.length > 300) _focusTrace.shift();
-    console.log(`[FOCUS-TRACE] ${entry.api} ${JSON.stringify(entry)}`);
+    // The ring buffer above is what matters; retrieve it with
+    // tabs_context_mcp({diagnostics: true}). Only mirror to the console for a
+    // genuine STEAL, which is the event actually worth noticing live -
+    // logging every activation buried the service-worker console in noise.
+    if (entry.STEAL) console.log(`[FOCUS-TRACE] STEAL ${entry.api} ${JSON.stringify(entry)}`);
   } catch {}
 }
 // Best-effort async annotation: was the activated tab sharing a window with the
@@ -3023,13 +3027,23 @@ const toolHandlers = {
   async tabs_context_mcp(args) {
     await ensureTabGroup(args.createIfEmpty);
     const state = getSessionState(_currentSessionId);
-    // TEMPORARY: append the focus-steal trace + window census + create-probe +
-    // recent extension logs for remote retrieval.
-    const _trace = `\n\n===FOCUS-TRACE (${_focusTrace.length} events, newest last)===\n` +
-      _focusTrace.slice(-30).map((e) => JSON.stringify(e)).join("\n") +
-      `\n\n===WINDOWS===\n${await _debugWindowsOverview()}` +
-      `\n\n===CREATE-PROBE===\n${await _probeWindowCreate()}` +
-      `\n\n===RECENT-LOGS===\n${_logRing.slice(-40).join("\n")}`;
+
+    // The focus-steal diagnostics (trace + window census + create-probe +
+    // recent logs) used to be appended to EVERY response. They were added for
+    // the July 2026 focus-steal investigation, which shipped its fix in
+    // v1.11.8 - after that they were pure token cost on every single call, in
+    // an agent's context, forever.
+    //
+    // They are now opt-in: pass diagnostics: true. The instrumentation itself
+    // still runs, so the trace is complete the moment you ask for it.
+    const _trace = args.diagnostics
+      ? `\n\n===FOCUS-TRACE (${_focusTrace.length} events, newest last)===\n` +
+        _focusTrace.slice(-30).map((e) => JSON.stringify(e)).join("\n") +
+        `\n\n===WINDOWS===\n${await _debugWindowsOverview()}` +
+        `\n\n===CREATE-PROBE===\n${await _probeWindowCreate()}` +
+        `\n\n===RECENT-LOGS===\n${_logRing.slice(-40).join("\n")}`
+      : "";
+
     if (state.tabGroupId === null) {
       return {
         content: [{ type: "text", text: "No MCP tab group exists. Use createIfEmpty: true to create one." + _trace }],
@@ -3037,7 +3051,7 @@ const toolHandlers = {
     }
     const tabs = await chrome.tabs.query({ groupId: state.tabGroupId });
     const r = formatTabContext(tabs);
-    r.content[0].text += _trace;
+    if (_trace) r.content[0].text += _trace;
     return r;
   },
 
