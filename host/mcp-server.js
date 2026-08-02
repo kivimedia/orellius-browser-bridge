@@ -23,7 +23,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const DEFAULT_PORT = 18765;
+const DEFAULT_HOST = "127.0.0.1";
 const SESSION_ID = crypto.randomUUID().slice(0, 8);
+// How long to wait for the hub to acknowledge our registration on the first
+// browser tool call before giving up and surfacing a real error.
+const REGISTER_TIMEOUT_MS = 15000;
 
 // Browser routing: when set to "firefox", tools in BIDI_TOOLS are routed to
 // host/bidi-driver.js (WebDriver BiDi over WebSocket) instead of forwarded to
@@ -57,6 +61,14 @@ function log(msg) {
 }
 
 function getPort() {
+  // ORELLIUS_HUB_PORT wins over the config file so a single session can be
+  // pointed at a different hub (e.g. an SSH tunnel to the VPS) without
+  // touching global config that every other session shares.
+  if (process.env.ORELLIUS_HUB_PORT) {
+    const p = Number(process.env.ORELLIUS_HUB_PORT);
+    if (Number.isInteger(p) && p > 0 && p < 65536) return p;
+    log(`Ignoring invalid ORELLIUS_HUB_PORT="${process.env.ORELLIUS_HUB_PORT}"`);
+  }
   const configPath = path.join(os.homedir(), ".config", "orellius-browser-bridge", "config.json");
   try {
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
@@ -66,16 +78,45 @@ function getPort() {
   }
 }
 
+function getHubHost() {
+  if (process.env.ORELLIUS_HUB_HOST) return String(process.env.ORELLIUS_HUB_HOST).trim();
+  const configPath = path.join(os.homedir(), ".config", "orellius-browser-bridge", "config.json");
+  try {
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    if (config.hubHost) return String(config.hubHost).trim();
+  } catch {}
+  return DEFAULT_HOST;
+}
+
 // --- TCP client to hub ---
 
 const TCP_PORT = getPort();
+const HUB_HOST = getHubHost();
+// ORELLIUS_HUB_REMOTE=1 marks this session as remote even though the host is
+// loopback. That is the NORMAL case for the VPS: the SSH tunnel listens on
+// 127.0.0.1:<localPort>, so host alone cannot distinguish "tunnel to the VPS
+// browser" from "local browser". Without this flag a dropped tunnel would
+// silently auto-spawn a LOCAL hub and drive Ziv's own Chrome while the caller
+// believed it was driving the VPS - the exact failure this whole change exists
+// to prevent.
+const HUB_FORCE_REMOTE = process.env.ORELLIUS_HUB_REMOTE === "1";
+// A remote hub is never auto-spawned: there is nothing local to spawn, and
+// silently starting a local hub would mask a dead tunnel.
+const HUB_IS_LOCAL = !HUB_FORCE_REMOTE
+  && (HUB_HOST === "127.0.0.1" || HUB_HOST === "localhost" || HUB_HOST === "::1");
 let hubSocket = null;
 let hubBuffer = Buffer.alloc(0);
 const pendingRequests = new Map(); // id -> { resolve, reject, timer }
 let requestIdCounter = 0;
 let registered = false;
+// In-flight lazy connection attempt, shared by concurrent first calls.
+let hubConnectPromise = null;
 
-function sendToExtension(tool, args) {
+async function sendToExtension(tool, args) {
+  // LAZY: the hub connection is established on the FIRST browser tool call,
+  // not at process start. A Claude session that never browses never spawns a
+  // hub, never claims a browser window, and costs nothing but this process.
+  await ensureHubConnection();
   return new Promise((resolve, reject) => {
     if (!hubSocket || hubSocket.destroyed) {
       reject(new Error("Hub is not connected. Make sure a supported browser is running with the Orellius extension installed and enabled."));
@@ -109,14 +150,26 @@ function sendToExtension(tool, args) {
 /** Ensure hub.js is running. Spawns it as a detached background process if needed. */
 async function ensureHub() {
   // Try connecting - if it works, hub is already running
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const probe = new net.Socket();
-    probe.connect(TCP_PORT, "127.0.0.1", () => {
+    probe.connect(TCP_PORT, HUB_HOST, () => {
       probe.destroy();
       resolve(); // Hub is running
     });
-    probe.on("error", () => {
+    probe.on("error", (err) => {
       probe.destroy();
+      if (!HUB_IS_LOCAL) {
+        // Remote hub (SSH tunnel to the VPS). Never spawn a local hub here -
+        // that would silently drive the LOCAL browser while the caller
+        // believes it is driving the remote one.
+        reject(new Error(
+          `No hub reachable at ${HUB_HOST}:${TCP_PORT} (${err.message}). ` +
+          `This session is configured for a REMOTE browser, so falling back to ` +
+          `the local browser is refused. Start the tunnel with:\n` +
+          `  node ${path.join(__dirname, "orellius-remote.mjs")} --port=${TCP_PORT}`
+        ));
+        return;
+      }
       // Hub not running - spawn it
       log("Hub not running, spawning...");
       const hubPath = path.join(__dirname, "hub.js");
@@ -132,12 +185,49 @@ async function ensureHub() {
   });
 }
 
+/**
+ * Lazily bring up the hub connection and wait until the hub has acknowledged
+ * our registration. Called from sendToExtension() on every browser tool call;
+ * a no-op once connected. Concurrent callers share one in-flight attempt.
+ */
+function ensureHubConnection() {
+  if (registered && hubSocket && !hubSocket.destroyed) return Promise.resolve();
+  if (hubConnectPromise) return hubConnectPromise;
+
+  hubConnectPromise = (async () => {
+    await ensureHub();
+    connectToHub();
+    await new Promise((resolve, reject) => {
+      if (registered) return resolve();
+      const started = Date.now();
+      const iv = setInterval(() => {
+        if (registered) {
+          clearInterval(iv);
+          resolve();
+        } else if (Date.now() - started > REGISTER_TIMEOUT_MS) {
+          clearInterval(iv);
+          reject(new Error(
+            `Hub at ${HUB_HOST}:${TCP_PORT} did not acknowledge registration within ` +
+            `${REGISTER_TIMEOUT_MS / 1000}s.`
+          ));
+        }
+      }, 50);
+    });
+  })().catch((err) => {
+    // Clear so the NEXT tool call retries instead of caching the failure.
+    hubConnectPromise = null;
+    throw err;
+  });
+
+  return hubConnectPromise;
+}
+
 function connectToHub() {
   if (hubSocket && !hubSocket.destroyed) return;
 
   hubSocket = new net.Socket();
-  hubSocket.connect(TCP_PORT, "127.0.0.1", () => {
-    log(`Connected to hub on port ${TCP_PORT}`);
+  hubSocket.connect(TCP_PORT, HUB_HOST, () => {
+    log(`Connected to hub at ${HUB_HOST}:${TCP_PORT}${HUB_IS_LOCAL ? "" : " (REMOTE)"}`);
     // Register as MCP client with our sessionId
     hubSocket.write(JSON.stringify({ type: "register_mcp_client", sessionId: SESSION_ID }) + "\n");
   });
@@ -181,16 +271,18 @@ function connectToHub() {
     log("Hub connection closed");
     hubSocket = null;
     registered = false;
+    // Drop the cached connection so the next browser tool call reconnects.
+    hubConnectPromise = null;
     // Reject all pending requests
     for (const [id, { reject, timer }] of pendingRequests) {
       clearTimeout(timer);
       reject(new Error("Hub connection lost"));
     }
     pendingRequests.clear();
-    // Try reconnecting after a delay
-    setTimeout(() => {
-      if (!hubSocket) connectToHub();
-    }, 2000);
+    // NO eager reconnect. Reconnecting on a timer is what kept idle sessions
+    // permanently registered (and permanently holding a browser window) for
+    // days. ensureHubConnection() re-establishes transparently on the next
+    // real tool call, including after an idle-TTL eviction by the hub.
   });
 }
 
@@ -214,15 +306,15 @@ process.stdin.on("end", () => {
 });
 process.stdin.resume();
 
-// Set up hub connection in the background (after MCP is already connected).
-async function setupHubConnection() {
-  await ensureHub();
-  connectToHub();
-}
-
-setupHubConnection().catch((err) => {
-  log(`Hub connection failed: ${err.message}. Browser tools will not work.`);
-});
+// NOTE: the hub connection is deliberately NOT established here.
+//
+// Before 2026-08-02 this file called setupHubConnection() at module load, so
+// every Claude Code session spawned/joined a hub and claimed a browser window
+// whether or not it ever browsed. With ~15 concurrent VS Code sessions that
+// was ~1.6 GB of idle processes plus a permanent, unreapable claim on a Chrome
+// window per session. Connection now happens on the first browser tool call
+// via ensureHubConnection() in sendToExtension().
+log(`Ready (lazy). Hub ${HUB_HOST}:${TCP_PORT} will be contacted on first browser tool call.`);
 
 // --- Helper to wrap tool results for MCP ---
 

@@ -13,6 +13,19 @@ import os from "node:os";
 const DEFAULT_PORT = 18765;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes with no MCP clients -> exit
 
+// How long a registered MCP session may go WITHOUT making a browser tool call
+// before the hub evicts it: its Chrome window is closed and its socket dropped.
+// The session is not broken by this - mcp-server.js reconnects transparently on
+// its next tool call.
+//
+// Before this existed, "registered" was forever: a Claude session that browsed
+// once held a Chrome window until VS Code closed. With ~15 concurrent sessions
+// that meant windows from two-day-old conversations were still pinned open, and
+// /admin/close-unused could never reap anything because every session with a
+// live process counted as active.
+const SESSION_IDLE_TTL_MS = Number(process.env.ORELLIUS_SESSION_TTL_MS) || 15 * 60 * 1000;
+const SWEEP_INTERVAL_MS = Number(process.env.ORELLIUS_SWEEP_INTERVAL_MS) || 60 * 1000;
+
 function log(msg) {
   const ts = new Date().toISOString().slice(11, 19);
   process.stderr.write(`[hub ${ts}] ${msg}\n`);
@@ -59,9 +72,79 @@ const mcpClients = new Map();
 /** @type {Map<string, {sessionId: string, browser: string}>} requestId -> routing info */
 const requestRouting = new Map();
 
+/**
+ * sessionId -> epoch ms of the last BROWSER TOOL CALL from that session.
+ *
+ * This is the real definition of "active". A live MCP process is not activity -
+ * that was the old bug. Only an actual tool_request counts.
+ * @type {Map<string, number>}
+ */
+const sessionActivity = new Map();
+
 const DEFAULT_BROWSER = "chromium";
 
 let idleTimer = null;
+
+function touchSession(sessionId) {
+  if (sessionId) sessionActivity.set(sessionId, Date.now());
+}
+
+/**
+ * Sessions that have made a browser tool call within SESSION_IDLE_TTL_MS.
+ * This is what the extension must preserve when closing windows.
+ */
+function activeSessionIds() {
+  const cutoff = Date.now() - SESSION_IDLE_TTL_MS;
+  const out = [];
+  for (const sessionId of mcpClients.keys()) {
+    const last = sessionActivity.get(sessionId);
+    if (last !== undefined && last >= cutoff) out.push(sessionId);
+  }
+  return out;
+}
+
+/**
+ * Evict sessions that have been idle past the TTL: close their browser windows
+ * and drop their sockets. mcp-server.js re-registers on its next tool call, so
+ * nothing the user does is broken by this.
+ */
+function sweepIdleSessions() {
+  if (mcpClients.size === 0) return;
+  const cutoff = Date.now() - SESSION_IDLE_TTL_MS;
+  const idle = [];
+  for (const sessionId of mcpClients.keys()) {
+    const last = sessionActivity.get(sessionId);
+    if (last === undefined || last < cutoff) idle.push(sessionId);
+  }
+  if (idle.length === 0) return;
+
+  const stillActive = activeSessionIds();
+  const delivered = broadcastAdminMessage({
+    type: "admin_close_tabs",
+    mode: "unused",
+    activeSessionIds: stillActive,
+    reason: `idle TTL sweep (${SESSION_IDLE_TTL_MS / 60000}min)`,
+  });
+  log(
+    `Idle sweep: evicting ${idle.length} session(s) [${idle.join(", ")}], ` +
+    `keeping ${stillActive.length} active. Window-close broadcast to ${delivered} native_host(s).`
+  );
+
+  for (const sessionId of idle) {
+    const sock = mcpClients.get(sessionId);
+    mcpClients.delete(sessionId);
+    sessionActivity.delete(sessionId);
+    for (const [reqId, route] of requestRouting) {
+      if (route.sessionId === sessionId) requestRouting.delete(reqId);
+    }
+    if (sock && !sock.destroyed) sock.destroy();
+  }
+  resetIdleTimer();
+}
+
+const sweepTimer = setInterval(sweepIdleSessions, SWEEP_INTERVAL_MS);
+// Never let the sweeper alone hold the process open.
+if (sweepTimer.unref) sweepTimer.unref();
 
 function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
@@ -202,6 +285,11 @@ const server = net.createServer((socket) => {
             }
 
             mcpClients.set(socketSessionId, socket);
+            // Registration now only happens lazily, immediately before the
+            // first tool call, so it counts as activity. Without this the
+            // sweeper could evict a session in the millisecond gap between
+            // registering and its first tool_request landing.
+            touchSession(socketSessionId);
             if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
             log(`MCP client registered: session=${socketSessionId} from ${remote} (total: ${mcpClients.size})`);
             socket.write(JSON.stringify({ type: "registered", role: "mcp_client", sessionId: socketSessionId }) + "\n");
@@ -227,8 +315,10 @@ const server = net.createServer((socket) => {
         if (msg.type === "heartbeat") continue;
 
         if (socketType === "mcp_client") {
-          // MCP client sending a tool request -> forward to native host
+          // MCP client sending a tool request -> forward to native host.
+          // THIS is what "active" means - a real browser tool call.
           msg.sessionId = socketSessionId;
+          touchSession(socketSessionId);
           forwardToNativeHost(msg);
         } else if (socketType === "native_host") {
           // Native host sending a response -> route to correct MCP client
@@ -251,6 +341,7 @@ const server = net.createServer((socket) => {
     } else if (socketType === "mcp_client" && socketSessionId) {
       log(`MCP client disconnected: session=${socketSessionId} (${remote})`);
       mcpClients.delete(socketSessionId);
+      sessionActivity.delete(socketSessionId);
       // Clean up pending request routing for this session
       for (const [reqId, route] of requestRouting) {
         if (route.sessionId === socketSessionId) requestRouting.delete(reqId);
@@ -334,6 +425,18 @@ const adminServer = http.createServer((req, res) => {
       nativeHosts: [...nativeHostSockets.keys()],
       mcpClientCount: mcpClients.size,
       mcpSessions: [...mcpClients.keys()],
+      // Registered != active. `activeSessions` are the ones that actually made
+      // a browser call inside the TTL and therefore still hold a window.
+      activeSessions: activeSessionIds(),
+      idleTtlMinutes: SESSION_IDLE_TTL_MS / 60000,
+      sessionIdleSeconds: Object.fromEntries(
+        [...mcpClients.keys()].map((sid) => [
+          sid,
+          sessionActivity.has(sid)
+            ? Math.round((Date.now() - sessionActivity.get(sid)) / 1000)
+            : null,
+        ])
+      ),
       uptimeSec: Math.round(process.uptime()),
     };
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -419,21 +522,31 @@ const adminServer = http.createServer((req, res) => {
   // Orellius windows over several Claude conversations and only one is still
   // wired up.
   if (req.method === "POST" && url.pathname === "/admin/close-unused") {
-    const activeSessionIds = [...mcpClients.keys()];
+    // "Active" means "made a browser tool call within SESSION_IDLE_TTL_MS",
+    // NOT "has a live MCP process". The old definition made this endpoint a
+    // permanent no-op: with ~15 VS Code windows open, every session counted as
+    // active and nothing was ever closed (measured 2026-08-02: 14 preserved,
+    // 0 closed). Callers can still force the old behavior with ?all=1.
+    const closeAll = url.searchParams.get("all") === "1";
+    const active = closeAll ? [] : activeSessionIds();
+    const idleCount = mcpClients.size - active.length;
     const delivered = broadcastAdminMessage({
       type: "admin_close_tabs",
       mode: "unused",
-      activeSessionIds,
-      reason: "close-unused CLI",
+      activeSessionIds: active,
+      reason: closeAll ? "close-unused CLI (all=1)" : "close-unused CLI",
     });
-    log(`/admin/close-unused broadcast delivered to ${delivered} native_host(s) (preserving ${activeSessionIds.length} active session(s))`);
+    log(`/admin/close-unused delivered to ${delivered} native_host(s): preserving ${active.length} active, reaping ${idleCount} idle of ${mcpClients.size} registered`);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       ok: true,
       delivered,
-      activeSessionCount: activeSessionIds.length,
+      registeredSessions: mcpClients.size,
+      activeSessionCount: active.length,
+      idleSessionCount: idleCount,
+      idleTtlMinutes: SESSION_IDLE_TTL_MS / 60000,
       message: delivered > 0
-        ? `Sent close-unused to ${delivered} browser native_host(s). ${activeSessionIds.length} active Claude session(s) keep their tabs; orphan sessions are being closed.`
+        ? `Sent close-unused to ${delivered} browser native_host(s). ${active.length} session(s) active in the last ${SESSION_IDLE_TTL_MS / 60000}min keep their windows; ${idleCount} idle session(s) are being closed.`
         : "No browser extensions are currently connected to the hub. No-op.",
     }));
     return;
