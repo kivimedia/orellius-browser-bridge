@@ -78,6 +78,19 @@ function getPort() {
   }
 }
 
+// The port the LOCAL hub listens on, ignoring ORELLIUS_HUB_PORT. That env var
+// points at the SSH tunnel (the remote browser), so reusing it for the local
+// target would send "drive my own Chrome" straight back to the VPS.
+function getConfigPort() {
+  const configPath = path.join(os.homedir(), ".config", "orellius-browser-bridge", "config.json");
+  try {
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return config.port || DEFAULT_PORT;
+  } catch {
+    return DEFAULT_PORT;
+  }
+}
+
 function getHubHost() {
   if (process.env.ORELLIUS_HUB_HOST) return String(process.env.ORELLIUS_HUB_HOST).trim();
   const configPath = path.join(os.homedir(), ".config", "orellius-browser-bridge", "config.json");
@@ -90,8 +103,6 @@ function getHubHost() {
 
 // --- TCP client to hub ---
 
-const TCP_PORT = getPort();
-const HUB_HOST = getHubHost();
 // ORELLIUS_HUB_REMOTE=1 marks this session as remote even though the host is
 // loopback. That is the NORMAL case for the VPS: the SSH tunnel listens on
 // 127.0.0.1:<localPort>, so host alone cannot distinguish "tunnel to the VPS
@@ -99,11 +110,35 @@ const HUB_HOST = getHubHost();
 // silently auto-spawn a LOCAL hub and drive Ziv's own Chrome while the caller
 // believed it was driving the VPS - the exact failure this whole change exists
 // to prevent.
-const HUB_FORCE_REMOTE = process.env.ORELLIUS_HUB_REMOTE === "1";
+//
+// The flag still decides the DEFAULT, and the default is still remote. What it
+// no longer does is decide it FOREVER. These used to be `const`s read once at
+// process start, so a session that needed Ziv's live cookies for one action had
+// to be killed and relaunched: on 2026-08-10 the only way to reach an
+// already-logged-in WhatsApp tab in his own Chrome was to restart Claude Code
+// mid-task. `browser_target` now moves this session between the two hubs at
+// runtime. Remote remains the default precisely because it is the polite one -
+// an agent that appears unasked in Ziv's window competes with him for it - so
+// switching is explicit, logged, and always reported back.
+const ENV_HUB_HOST = getHubHost();
+const ENV_HUB_PORT = getPort();
+const ENV_FORCE_REMOTE = process.env.ORELLIUS_HUB_REMOTE === "1";
+const ENV_IS_LOOPBACK = ENV_HUB_HOST === "127.0.0.1"
+  || ENV_HUB_HOST === "localhost" || ENV_HUB_HOST === "::1";
+
+const HUB_TARGETS = {
+  // Whatever the environment configured. On Ziv's box: the SSH tunnel to the VPS.
+  remote: { host: ENV_HUB_HOST, port: ENV_HUB_PORT, isLocal: false },
+  // Ziv's own browser, via a hub on loopback at the config/default port.
+  local: { host: DEFAULT_HOST, port: getConfigPort(), isLocal: true },
+};
+
+let hubTarget = (!ENV_FORCE_REMOTE && ENV_IS_LOOPBACK) ? "local" : "remote";
+let TCP_PORT = HUB_TARGETS[hubTarget].port;
+let HUB_HOST = HUB_TARGETS[hubTarget].host;
 // A remote hub is never auto-spawned: there is nothing local to spawn, and
 // silently starting a local hub would mask a dead tunnel.
-const HUB_IS_LOCAL = !HUB_FORCE_REMOTE
-  && (HUB_HOST === "127.0.0.1" || HUB_HOST === "localhost" || HUB_HOST === "::1");
+let HUB_IS_LOCAL = HUB_TARGETS[hubTarget].isLocal;
 let hubSocket = null;
 let hubBuffer = Buffer.alloc(0);
 const pendingRequests = new Map(); // id -> { resolve, reject, timer }
@@ -220,6 +255,60 @@ function ensureHubConnection() {
   });
 
   return hubConnectPromise;
+}
+
+/**
+ * Drop the current hub connection and everything cached about it.
+ *
+ * Used when moving between hubs. A socket still pointed at the old hub would
+ * keep answering with the OLD browser's tabs, which is the worst possible
+ * failure here: the caller would believe it had switched and quietly act on the
+ * wrong machine.
+ */
+function teardownHub(reason) {
+  if (hubSocket && !hubSocket.destroyed) {
+    log(`Closing hub connection (${reason})`);
+    hubSocket.removeAllListeners("close");
+    try { hubSocket.destroy(); } catch {}
+  }
+  hubSocket = null;
+  registered = false;
+  hubConnectPromise = null;
+  hubBuffer = Buffer.alloc(0);
+  for (const [, { reject, timer }] of pendingRequests) {
+    clearTimeout(timer);
+    reject(new Error(`Hub connection closed: ${reason}`));
+  }
+  pendingRequests.clear();
+}
+
+/**
+ * Point this session at the other browser, live. Reconnects eagerly rather than
+ * lazily so the caller finds out NOW whether the target is actually reachable,
+ * instead of discovering a dead tunnel halfway through the next task.
+ */
+async function switchHubTarget(next) {
+  const target = HUB_TARGETS[next];
+  if (!target) throw new Error(`Unknown hub target "${next}"`);
+  const previous = hubTarget;
+  teardownHub(`switching hub target ${previous} -> ${next}`);
+  hubTarget = next;
+  TCP_PORT = target.port;
+  HUB_HOST = target.host;
+  HUB_IS_LOCAL = target.isLocal;
+  log(`Hub target is now ${next} (${HUB_HOST}:${TCP_PORT})`);
+  try {
+    await ensureHubConnection();
+  } catch (err) {
+    // Roll back rather than strand the session on an unreachable hub: the old
+    // one demonstrably worked a moment ago.
+    teardownHub("failed to reach new target, rolling back");
+    hubTarget = previous;
+    TCP_PORT = HUB_TARGETS[previous].port;
+    HUB_HOST = HUB_TARGETS[previous].host;
+    HUB_IS_LOCAL = HUB_TARGETS[previous].isLocal;
+    throw err;
+  }
 }
 
 function connectToHub() {
@@ -825,7 +914,70 @@ server.tool(
   async (args) => callTool("shortcuts_execute", args)
 );
 
-// 16. switch_browser
+// 16. browser_target - remote (VPS) vs local (the user's own browser), at runtime
+server.tool(
+  "browser_target",
+  "Switch which MACHINE's browser this session drives, without restarting anything. " +
+  "'remote' is the default and drives the VPS browser: use it for research, public pages, " +
+  "QA of a deployed site, and anything the agent holds its own credentials for. " +
+  "'local' drives the user's OWN browser and is only for tasks that need HIS live session - " +
+  "a tab he already has open, a portal with no separate seat, anything riding his cookies. " +
+  "Tell him in chat before switching to local; never appear in his window unannounced. " +
+  "Switching drops the old hub connection, so call tabs_context_mcp again afterwards - " +
+  "tab IDs from the previous target are meaningless on the new one. " +
+  "Call with no argument to report the current target.",
+  {
+    target: z.enum(["remote", "local"]).optional()
+      .describe("Which machine's browser to drive. Omit to query the current target."),
+  },
+  async (args) => {
+    const next = args?.target;
+    const describe = (name) => {
+      const t = HUB_TARGETS[name];
+      return `${name} (${t.host}:${t.port})`;
+    };
+    if (!next) {
+      return textResult(
+        `Current browser target: ${describe(hubTarget)}.\n` +
+        `Available: remote=${HUB_TARGETS.remote.host}:${HUB_TARGETS.remote.port}, ` +
+        `local=${HUB_TARGETS.local.host}:${HUB_TARGETS.local.port}.\n` +
+        `Pass target:'local' to drive the user's own browser, target:'remote' for the VPS.`
+      );
+    }
+    if (next === hubTarget) {
+      return textResult(`Already driving the ${describe(hubTarget)} browser. Nothing changed.`);
+    }
+    // Both targets resolving to the same hub means this box has no separate
+    // remote configured; say so rather than pretending the switch did something.
+    const a = HUB_TARGETS[next], b = HUB_TARGETS[hubTarget];
+    if (a.host === b.host && a.port === b.port) {
+      return textResult(
+        `remote and local both point at ${a.host}:${a.port} on this machine, so there is ` +
+        `nothing to switch between. Set ORELLIUS_HUB_PORT/ORELLIUS_HUB_HOST to a tunnel ` +
+        `to give this session a genuinely separate remote browser.`
+      );
+    }
+    const previous = hubTarget;
+    try {
+      await switchHubTarget(next);
+    } catch (err) {
+      return textResult(
+        `Could not switch to ${describe(next)}: ${err.message}\n` +
+        `Still on ${describe(previous)}.`
+      );
+    }
+    return textResult(
+      `Now driving the ${describe(next)} browser (was ${describe(previous)}).\n` +
+      (next === "local"
+        ? `This is the user's OWN browser - his windows, his sessions, his cookies. ` +
+          `Switch back with target:'remote' when the task no longer needs him.`
+        : `Back on the VPS browser. The user's own windows are untouched from here.`) +
+      `\nCall tabs_context_mcp before any other browser tool: the previous target's tab IDs do not exist here.`
+    );
+  }
+);
+
+// 17. switch_browser
 server.tool(
   "switch_browser",
   "Switch which browser this MCP session drives. Pass browser:'firefox' to route CDP-equivalent tools (computer, javascript_tool, read_console_messages, read_network_requests, resize_window) through host/bidi-driver.js (WebDriver BiDi WebSocket to Firefox :9222). Pass browser:'chromium' to forward all tools to the extension over native messaging (Chrome/Brave/Edge). Calling without `browser` reports the current setting.",
