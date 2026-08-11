@@ -182,6 +182,35 @@ async function sendToExtension(tool, args) {
   });
 }
 
+/**
+ * Resolve once something accepts TCP on host:port, or reject after timeoutMs.
+ * Used to confirm a freshly-spawned hub really came up: the spawn is detached
+ * with stdio ignored, so a probe is the only honest signal that it is alive.
+ */
+function waitForHubListening(port, host, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const probe = new net.Socket();
+      probe.once("connect", () => { probe.destroy(); resolve(); });
+      probe.once("error", () => {
+        probe.destroy();
+        if (Date.now() >= deadline) {
+          reject(new Error(
+            `Spawned hub never listened on ${host}:${port} within ${timeoutMs}ms. ` +
+            `Run it in the foreground to see why:\n` +
+            `  node ${path.join(__dirname, "hub.js")} --port=${port}`
+          ));
+          return;
+        }
+        setTimeout(attempt, 150);
+      });
+      probe.connect(port, host);
+    };
+    attempt();
+  });
+}
+
 /** Ensure hub.js is running. Spawns it as a detached background process if needed. */
 async function ensureHub() {
   // Try connecting - if it works, hub is already running
@@ -205,17 +234,32 @@ async function ensureHub() {
         ));
         return;
       }
-      // Hub not running - spawn it
-      log("Hub not running, spawning...");
+      // Hub not running - spawn it.
+      //
+      // Pass the port EXPLICITLY and strip ORELLIUS_HUB_PORT from the child's
+      // env. That var points at the SSH tunnel to the VPS (18775 on Ziv's box)
+      // and hub.js reads it in its own getPort(), so inheriting it made every
+      // auto-spawn of the LOCAL hub try to bind the tunnel's port, log
+      // "Port 18775 already in use - another hub is running" and exit 0. With
+      // stdio ignored and the child unref'd, nobody ever saw that line:
+      // browser_target('local') simply never self-healed and had to be started
+      // by hand every single time. getConfigPort() goes out of its way to
+      // ignore that var for precisely this reason; this spawn put it back.
+      log(`Hub not running, spawning on port ${TCP_PORT}...`);
       const hubPath = path.join(__dirname, "hub.js");
-      const child = spawn(process.execPath, [hubPath], {
+      const hubEnv = { ...process.env };
+      delete hubEnv.ORELLIUS_HUB_PORT;
+      const child = spawn(process.execPath, [hubPath, `--port=${TCP_PORT}`], {
         detached: true,
         stdio: "ignore",
-        env: { ...process.env },
+        env: hubEnv,
       });
       child.unref();
-      // Wait a moment for it to start listening
-      setTimeout(resolve, 1000);
+      // Wait until it actually accepts a connection rather than assuming 1s was
+      // enough. A spawn that died instantly used to resolve here anyway, and the
+      // real failure surfaced 15s later as the misleading
+      // "hub did not acknowledge registration within 15s".
+      waitForHubListening(TCP_PORT, HUB_HOST, 5000).then(resolve, reject);
     });
   });
 }

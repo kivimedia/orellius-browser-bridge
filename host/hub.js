@@ -647,8 +647,14 @@ process.on("SIGINT", shutdown);
 
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    log(`Port ${TCP_PORT} already in use - another hub is running. Exiting.`);
-    process.exit(0);
+    // Exit NON-ZERO: "the port I was told to bind is taken" is a failure, not a
+    // no-op. It exited 0 before, which made a hub that never started look like a
+    // hub that started fine - the silent half of the 18775-vs-18765 bug, where
+    // an auto-spawned local hub aimed at the SSH tunnel's port and died unnoticed.
+    // The message is also misleading when the port is not another hub at all,
+    // so say what actually happened.
+    log(`Port ${TCP_PORT} already in use - something else owns it (another hub, or an SSH tunnel). Exiting.`);
+    process.exit(1);
   } else {
     log(`Server error: ${err.message}`);
   }
