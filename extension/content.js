@@ -457,6 +457,14 @@
   }
 
   // --- Message handler ---
+  // When the extension reloads or updates, content scripts already injected into open tabs
+  // are orphaned: `chrome.runtime` becomes undefined, so touching it throws
+  // "Cannot read properties of undefined (reading 'onMessage')" and that lands in the
+  // extension's error list once per open tab. An orphaned script can never be messaged
+  // again, so there is nothing worth registering - leave quietly instead of throwing.
+  // `chrome.runtime.id` is the standard liveness check; it is undefined once invalidated.
+  if (!chrome?.runtime?.id) return;
+
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "generateAccessibilityTree") {
       const result = generateAccessibilityTree(msg.options || {});
