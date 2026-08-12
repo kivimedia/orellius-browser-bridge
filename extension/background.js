@@ -203,7 +203,14 @@ function connectNativeHost() {
     nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
     log(`connectNative() returned successfully (attempt #${attempt})`);
     setBadge("connected");
-    connectAttempts = 0;
+    // 🚨 Do NOT reset connectAttempts here. connectNative() returns
+    // synchronously and only means Chrome SPAWNED the host - not that the host
+    // reached the hub. When the hub is down the host retries for 30s and then
+    // exit(0)s by design, so resetting here made every cycle look like a fresh
+    // success and pinned the backoff below at 2^0 = 2s forever: a node.exe
+    // spawned every ~32s, indefinitely, whenever no session was running.
+    // The counter is reset on the "registered" ack instead - the first proof
+    // the host is actually useful. Diagnosed 2026-08-12.
 
     // Multi-browser handshake: tell the native host which browser we're
     // running in so the hub can route per-browser. Required for Chrome +
@@ -217,6 +224,9 @@ function connectNativeHost() {
     nativePort.onMessage.addListener((msg) => {
       if (msg.type === "registered") {
         log(`Hub acknowledged: ${msg.role}`);
+        // The host is genuinely up and registered - only now is this a real
+        // success, so the reconnect backoff starts from zero again.
+        connectAttempts = 0;
         return;
       }
       if (typeof msg.type === "string" && msg.type.startsWith("vrec_") && msg.requestId) {
