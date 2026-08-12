@@ -193,7 +193,65 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // --- Native messaging ---
 let connectAttempts = 0;
 
-function connectNativeHost() {
+// --- Hub reachability probe -------------------------------------------------
+// Spawning a native host costs a real OS process, and when the hub is down that
+// process retries for 30s, exit(0)s by design, and Chrome respawns it - forever.
+// Probing the hub's admin port first costs one localhost fetch and no process
+// at all. `host_permissions` already grants http://127.0.0.1:18766/*, so this
+// needs no new permission. Added 2026-08-13.
+const HUB_ADMIN_URL = "http://127.0.0.1:18766/admin/status";
+const PROBE_TIMEOUT_MS = 1500;
+// FAIL OPEN. If this probe is ever wrong - hub moved to a custom port, admin
+// endpoint renamed - it must never be able to wedge the bridge permanently
+// shut. Every Nth consecutive dry probe we spawn a host regardless, so the
+// worst case degrades to one spawn per ~5 minutes instead of one per ~32s.
+const DRY_PROBE_FALLBACK = 10;
+let dryProbes = 0;
+let probeInFlight = false;
+
+async function hubAlive() {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(HUB_ADMIN_URL, { signal: ctl.signal, cache: "no-store" });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function connectNativeHost() {
+  if (nativePort || probeInFlight) return;
+  probeInFlight = true;
+  let alive;
+  try {
+    alive = await hubAlive();
+  } finally {
+    probeInFlight = false;
+  }
+  // Another path may have connected while we were awaiting the probe.
+  if (nativePort) return;
+  if (alive) {
+    dryProbes = 0;
+  } else {
+    dryProbes++;
+    if (dryProbes % DRY_PROBE_FALLBACK !== 0) {
+      // Log only the first one - this repeats every keepalive tick while no
+      // session is running, and the whole point is to stop the noise.
+      if (dryProbes === 1) {
+        log("Hub not reachable - skipping native host spawn. Keepalive will retry.");
+      }
+      setBadge("disconnected");
+      return;
+    }
+    log(`Hub still unreachable after ${dryProbes} probes - spawning anyway (fail-open).`);
+  }
+  spawnNativeHost();
+}
+
+function spawnNativeHost() {
   if (nativePort) return;
   connectAttempts++;
   const attempt = connectAttempts;
