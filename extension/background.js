@@ -3340,7 +3340,24 @@ const toolHandlers = {
         if (!args.text) return { content: [{ type: "text", text: "text is required for type action" }] };
         await focusTabForInput(tabId);
         await ensureAttached(tabId);
-        // Type character by character for better compatibility
+        // SHORT text stays character-by-character: autocompletes, React-controlled
+        // inputs and rich editors often only behave correctly with one input event
+        // per character.
+        //
+        // LONG text cannot use that path at all. Every character is a full CDP round
+        // trip plus a 10ms sleep - measured at ~35ms/char, so 22KB would take over 13
+        // minutes and the MCP call dies around 4KB. Input.insertText accepts an
+        // arbitrarily long string in ONE call (22KB lands in ~300ms, 43KB in ~1.1s),
+        // so above the threshold send it in bulk. Verified 2026-08-16 against a
+        // cross-origin OOPIF textarea; see tools/cross-origin-input-repro.
+        const BULK_TYPE_THRESHOLD = 500;
+        if (args.text.length >= BULK_TYPE_THRESHOLD) {
+          const CHUNK = 32768;
+          for (let i = 0; i < args.text.length; i += CHUNK) {
+            await cdp(tabId, "Input.insertText", { text: args.text.slice(i, i + CHUNK) });
+          }
+          return { content: [{ type: "text", text: `Typed ${args.text.length} chars in bulk (single-shot Input.insertText, not per-character)` }] };
+        }
         for (const char of args.text) {
           await cdp(tabId, "Input.insertText", { text: char });
           await sleep(10);
