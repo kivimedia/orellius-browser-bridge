@@ -359,6 +359,10 @@ function connectToHub() {
   if (hubSocket && !hubSocket.destroyed) return;
 
   hubSocket = new net.Socket();
+  // See the matching note in hub.js: these are small request/response lines and
+  // Nagle costs a full extra RTT per call over the tunnel. Both ends must set
+  // it - one side alone still leaves the other side's writes delayed.
+  hubSocket.setNoDelay(true);
   hubSocket.connect(TCP_PORT, HUB_HOST, () => {
     log(`Connected to hub at ${HUB_HOST}:${TCP_PORT}${HUB_IS_LOCAL ? "" : " (REMOTE)"}`);
     // Register as MCP client with our sessionId

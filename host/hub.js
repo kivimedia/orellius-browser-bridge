@@ -242,6 +242,14 @@ function forwardToMcpClient(msg) {
 // --- TCP Server ---
 
 const server = net.createServer((socket) => {
+  // Every message on this socket is a small, latency-critical, request/response
+  // line. Nagle holds a small write back until previously sent data is ACKed,
+  // which over the SSH tunnel to a remote session costs a whole extra network
+  // round trip per call. Measured 2026-08-16 from Ziv's PC: raw RTT to the VPS
+  // is 135ms and a bare echo through the same tunnel answers in 147ms, but a
+  // hub round trip that the VPS itself serves in 1ms took 306ms - almost
+  // exactly 2x RTT. There is no throughput to protect here; turn Nagle off.
+  socket.setNoDelay(true);
   const remote = `${socket.remoteAddress}:${socket.remotePort}`;
   let socketType = null; // "native_host" or "mcp_client"
   let socketSessionId = null;

@@ -102,6 +102,9 @@ function connectTcp() {
   log(`Connecting to MCP server at 127.0.0.1:${TCP_PORT}...`);
   tcpSocket = new net.Socket();
 
+  // Small request/response lines, latency over throughput. See hub.js.
+  tcpSocket.setNoDelay(true);
+
   // Detect a half-open socket (hub killed hard, no FIN delivered) instead of
   // sitting on a dead connection forever.
   tcpSocket.setKeepAlive(true, 15000);
