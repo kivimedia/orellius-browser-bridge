@@ -37,9 +37,28 @@ Don't run `chrome.exe --new-window <url>` or equivalent to "warm up" before call
 
 **Read what's on the page**: `mcp__orellius-browser-bridge__get_page_text` (cheap, text only) or `mcp__orellius-browser-bridge__read_page` (DOM with structure).
 
-**Click / type / scroll / screenshot**: `mcp__orellius-browser-bridge__computer({ action: "click" | "type" | "scroll" | "screenshot", ... })`. For screenshots that need to land on disk, pass `savePath`.
+**Interact - use `act`**: `mcp__orellius-browser-bridge__act({ tabId, target: "Sign in", action: "click" })`.
+One call resolves the element by visible text (or `css=` selector), acts on it with
+page-level events, settles, and returns the new URL/title/text - replacing the
+`screenshot -> left_click -> screenshot` loop. `action` is `click` (default) | `fill` |
+`select` | `submit` | `hover` | `scroll_to`; `fill` goes through the native value setter so
+React/Vue `onChange` fires.
 
-**Find an element first**: `mcp__orellius-browser-bridge__find({ query })` returns coords + selector. Real-mouse click via `computer` is more reliable than JS injection on most modern sites - use `javascript_tool` only for sites where real mouse fails (Cloudflare-protected forms, fingerprinting checks, etc.).
+⚡ **Do not use `computer` for mouse.** Benchmarked 2026-08-16 on example.com:
+every tool sits at the ~306ms hub round-trip floor, but `computer/left_click`
+costs **5,283ms** and `computer/scroll` **times out at 60s**. Cause: a headless
+or occluded tab produces no compositor frames, so CDP
+`Input.dispatchMouseEvent` blocks on a renderer ack that never arrives
+(`mousePressed` falls back after ~5s, `mouseWheel` never acks). Launch Chrome
+with `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding
+--disable-background-timer-throttling` to avoid it - and prefer `act` regardless,
+since it needs no coordinates and costs one round trip instead of four.
+
+`computer` remains the right tool for `type`, `key`, and real screenshots (all ~330ms),
+and for canvas/WebGL surfaces or drags with no DOM handle. For screenshots that need to
+land on disk, pass `savePath`.
+
+**Find an element first**: `mcp__orellius-browser-bridge__find({ query })` returns coords + selector. Useful for orientation; to actually act on the result, pass its text to `act`.
 
 **Login flows / human handoff**: when the user has to type a password or click a 2FA prompt, use `browser_show` to bring the window to their foreground, do whatever ping pattern your environment supports (a voice alert, a chat message, etc.), then after they finish, `browser_hide`.
 

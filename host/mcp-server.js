@@ -507,7 +507,7 @@ async function callTool(toolName, args) {
     }
 
     // Auto-save after successful tool calls (except read-only tools)
-    const writeTools = ["navigate", "computer", "form_input", "tabs_create_mcp", "javascript_tool"];
+    const writeTools = ["navigate", "computer", "form_input", "tabs_create_mcp", "javascript_tool", "act"];
     if (writeTools.includes(toolName)) {
       // Fire and forget
       autoSaveSession(toolName).catch(() => {});
@@ -786,6 +786,27 @@ server.tool(
     tabId: z.number().describe("Tab ID to search in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
   async (args) => callTool("find", args)
+);
+
+// 5b. act - the fast path. Prefer this over computer/left_click.
+server.tool(
+  "act",
+  "PREFERRED way to interact with a page. Does one thing to one element and returns the resulting page state in a SINGLE call, replacing the slow screenshot -> left_click -> screenshot loop. " +
+    "Target the element by visible text/label (e.g. \"Sign in\", \"Email address\") or by CSS selector (prefix with css= to force it, e.g. \"css=#email\"). " +
+    "Runs page-level events instead of OS mouse input, so it costs ~200-350ms where computer/left_click costs ~5s and computer/scroll times out entirely. " +
+    "Returns JSON: what it matched, whether the URL or DOM changed, the new title/URL, and (by default) the new page text - so you usually do NOT need a follow-up screenshot or get_page_text. " +
+    "If nothing matches, it returns the list of visible clickable labels so you can retry immediately without taking a screenshot. " +
+    "Use computer/left_click ONLY for canvas/WebGL surfaces or drag interactions that genuinely need real mouse coordinates.",
+  {
+    target: z.string().describe('Which element: its visible text or label ("Sign in", "Add to cart"), or a CSS selector. Prefix with "css=" to force selector interpretation.'),
+    action: z.enum(["click", "fill", "select", "submit", "hover", "scroll_to"]).optional().describe('What to do. Default "click". Use "fill" for text inputs (fires React/Vue onChange correctly), "select" for <select>, "submit" to submit the owning form.'),
+    text: z.string().optional().describe('Value for action "fill" or "select". Ignored otherwise.'),
+    wait_ms: z.number().optional().describe("How long to let the page settle after acting, in ms. Default 400. Raise it for a slow SPA route change, lower it to 0 for a pure form fill you are about to follow with another act."),
+    returns: z.enum(["text", "outline", "none"]).optional().describe('What page state to return. "text" (default) = the new main-content text. "outline" = headings/buttons/links only, much cheaper on a huge page. "none" = just the result envelope.'),
+    max_chars: z.number().optional().describe("Cap on returned text. Default 3000."),
+    tabId: z.number().describe("Tab ID to act in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+  },
+  async (args) => callTool("act", args)
 );
 
 // 6. form_input

@@ -3501,6 +3501,201 @@ const toolHandlers = {
     return { content: [{ type: "text", text }] };
   },
 
+  // act: resolve a target, do one thing to it, settle, and return the new page
+  // state - in ONE round trip.
+  //
+  // Why this exists: the classic loop was screenshot -> read pixels ->
+  // computer/left_click -> screenshot, which is four hub round trips AND four
+  // model turns for a single button press. Worse, computer/left_click goes
+  // through CDP Input.dispatchMouseEvent, which blocks until the renderer's
+  // compositor acks the event. On a headless/Xvfb Chrome whose tab reports
+  // visibilityState "hidden" there are no compositor frames at all, so
+  // mousePressed falls back on an internal ~5s timeout and mouseWheel never
+  // acks (measured 2026-08-16: click 5,283ms, scroll a hard 60s timeout, on
+  // example.com - so it is not page weight). 5,959 recorded mouse calls cost
+  // 16.95 hours, 24.7% of all Orellius wall clock.
+  //
+  // act dispatches the same trusted-shaped pointer sequence synthClick uses
+  // (pointerdown -> mousedown -> pointerup -> mouseup -> click) from inside the
+  // page via Runtime.evaluate. No compositor involvement, so it costs the
+  // transport floor (~200-350ms) whether or not the tab is being painted.
+  async act(args) {
+    const { tabId } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
+    if (!args.target) return { content: [{ type: "text", text: "target is required (a CSS selector, or the visible text / label of the element)" }] };
+
+    const action = args.action || "click";
+    const settleMs = Math.max(0, Math.min(10000, typeof args.wait_ms === "number" ? args.wait_ms : 400));
+    const returns = args.returns || "text";
+    const maxChars = Math.max(200, Math.min(20000, args.max_chars || 3000));
+
+    await ensureAttached(tabId);
+
+    // Everything below runs INSIDE the page. Kept as one expression so a single
+    // Runtime.evaluate covers resolve + act + settle + report.
+    const expression = `(async () => {
+  const TARGET = ${JSON.stringify(args.target)};
+  const ACTION = ${JSON.stringify(action)};
+  const VALUE  = ${JSON.stringify(args.text ?? "")};
+  const SETTLE = ${settleMs};
+  const RETURNS = ${JSON.stringify(returns)};
+  const MAXC = ${maxChars};
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  const visible = (el) => {
+    if (!el || !el.getClientRects || el.getClientRects().length === 0) return false;
+    const s = getComputedStyle(el);
+    if (s.visibility === "hidden" || s.display === "none" || s.opacity === "0") return false;
+    return true;
+  };
+  const nameOf = (el) => (
+    el.getAttribute?.("aria-label") ||
+    (el.labels && el.labels[0] && el.labels[0].textContent) ||
+    el.getAttribute?.("placeholder") ||
+    el.getAttribute?.("title") ||
+    el.getAttribute?.("name") ||
+    el.value ||
+    el.textContent ||
+    ""
+  ).replace(/\\s+/g, " ").trim();
+
+  // 1. Resolve the target. An explicit css= prefix wins; otherwise try it as a
+  //    selector, then fall back to matching on the accessible name.
+  let el = null, how = "";
+  const asSelector = TARGET.startsWith("css=") ? TARGET.slice(4) : TARGET;
+  const looksLikeSelector = /^[#.\\[]|^[a-z]+[#.\\[>\\s]|^[a-z-]+$/i.test(asSelector);
+  if (TARGET.startsWith("css=") || looksLikeSelector) {
+    try {
+      const hits = [...document.querySelectorAll(asSelector)].filter(visible);
+      if (hits.length) { el = hits[0]; how = "css:" + asSelector + (hits.length > 1 ? " (" + hits.length + " matches, took first)" : ""); }
+    } catch (e) { /* not a valid selector - fall through to text matching */ }
+  }
+  if (!el) {
+    const INTERACTIVE = 'a,button,input,select,textarea,summary,label,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[role=checkbox],[role=radio],[onclick],[tabindex]';
+    let pool = [...document.querySelectorAll(INTERACTIVE)].filter(visible);
+    // For a read-only action, anything visible is fair game.
+    if (ACTION === "scroll_to" || ACTION === "hover") pool = pool.concat([...document.querySelectorAll('h1,h2,h3,h4,p,li,td,th,div,span')].filter(visible));
+    const needle = TARGET.toLowerCase();
+    const scored = [];
+    for (const c of pool) {
+      const n = nameOf(c).toLowerCase();
+      if (!n) continue;
+      let score = 0;
+      if (n === needle) score = 100;
+      else if (n.startsWith(needle)) score = 80;
+      else if (n.includes(needle)) score = 60;
+      else continue;
+      // Prefer the tightest match: a short label that is mostly the needle.
+      score -= Math.min(20, Math.abs(n.length - needle.length) / 4);
+      scored.push({ c, score, n });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    if (scored.length) { el = scored[0].c; how = 'text:"' + scored[0].n.slice(0, 60) + '"' + (scored.length > 1 ? " (" + scored.length + " candidates)" : ""); }
+  }
+
+  if (!el) {
+    // Fail with USEFUL context so the next turn can retry without a screenshot.
+    const cands = [...document.querySelectorAll('a,button,input,select,textarea,[role=button],[role=link]')]
+      .filter(visible).map(nameOf).filter(Boolean).slice(0, 40);
+    return JSON.stringify({ ok: false, error: "no element matched " + JSON.stringify(TARGET), url: location.href, title: document.title, candidates: cands });
+  }
+
+  const before = { url: location.href, title: document.title, html: document.body ? document.body.innerHTML.length : 0 };
+  const desc = { tag: el.tagName.toLowerCase(), type: el.type || undefined, name: nameOf(el).slice(0, 80), how };
+
+  try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (e) {}
+
+  // 2. Act. No CDP mouse anywhere - these are page-level events, so they do not
+  //    need a compositor frame.
+  const rect = el.getBoundingClientRect();
+  const pt = { clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2 };
+  const evInit = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, buttons: 1, ...pt };
+
+  const nativeSet = (node, v) => {
+    // React (and Vue) track the value property themselves; assigning el.value
+    // directly does NOT fire their onChange. Going through the prototype's
+    // native setter is what makes framework-controlled inputs actually update.
+    const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(node, v); else node.value = v;
+  };
+
+  if (ACTION === "click") {
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...evInit, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mousedown", evInit));
+    try { el.focus({ preventScroll: true }); } catch (e) {}
+    el.dispatchEvent(new PointerEvent("pointerup", { ...evInit, pointerType: "mouse", buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("mouseup", { ...evInit, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("click", { ...evInit, buttons: 0 }));
+  } else if (ACTION === "fill") {
+    try { el.focus({ preventScroll: true }); } catch (e) {}
+    if (el.isContentEditable) {
+      el.textContent = VALUE;
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true }));
+    } else {
+      nativeSet(el, VALUE);
+      el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    }
+  } else if (ACTION === "select") {
+    const opt = [...el.options || []].find(o => o.value === VALUE || (o.textContent || "").trim() === VALUE);
+    if (!opt) return JSON.stringify({ ok: false, error: "no option " + JSON.stringify(VALUE), options: [...el.options || []].map(o => o.textContent.trim()).slice(0, 40) });
+    el.value = opt.value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  } else if (ACTION === "submit") {
+    const form = el.form || el.closest("form");
+    if (!form) return JSON.stringify({ ok: false, error: "element is not inside a form" });
+    if (form.requestSubmit) form.requestSubmit(); else form.submit();
+  } else if (ACTION === "hover") {
+    el.dispatchEvent(new PointerEvent("pointerover", { ...evInit, pointerType: "mouse", buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("mouseover", { ...evInit, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("mousemove", { ...evInit, buttons: 0 }));
+  } else if (ACTION !== "scroll_to") {
+    return JSON.stringify({ ok: false, error: "unknown action " + JSON.stringify(ACTION) + " (click|fill|select|submit|hover|scroll_to)" });
+  }
+
+  // 3. Settle. setTimeout, never requestAnimationFrame - rAF does not fire at
+  //    all in a hidden tab, which would hang this call until the 60s timeout.
+  await sleep(SETTLE);
+
+  // 4. Report the new state, so the caller does not need a follow-up read.
+  const after = { url: location.href, title: document.title, html: document.body ? document.body.innerHTML.length : 0 };
+  const out = {
+    ok: true,
+    acted: ACTION,
+    matched: desc,
+    changed: { url: before.url !== after.url, dom: Math.abs(after.html - before.html) > 32 },
+    url: after.url,
+    title: after.title,
+  };
+  if (ACTION === "fill" || ACTION === "select") out.value = el.value;
+  if (RETURNS === "text") {
+    const main = document.querySelector("main,[role=main],article") || document.body;
+    out.text = (main.innerText || "").replace(/\\n{3,}/g, "\\n\\n").trim().slice(0, MAXC);
+  } else if (RETURNS === "outline") {
+    out.outline = [...document.querySelectorAll("h1,h2,h3,button,a[href]")].filter(visible)
+      .map(e => e.tagName.toLowerCase() + ': ' + nameOf(e).slice(0, 60)).filter(s => s.length > 4).slice(0, 60);
+  }
+  return JSON.stringify(out);
+})()`;
+
+    try {
+      const result = await retriableCdp(tabId, "Runtime.evaluate", {
+        expression,
+        returnByValue: true,
+        awaitPromise: true,
+      });
+      if (result.exceptionDetails) {
+        return { content: [{ type: "text", text: `act failed: ${result.exceptionDetails.text || JSON.stringify(result.exceptionDetails)}` }] };
+      }
+      return { content: [{ type: "text", text: String(result.result?.value ?? "act returned nothing") }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `act failed: ${e.message}` }] };
+    }
+  },
+
   async form_input(args) {
     const { ref, value, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
