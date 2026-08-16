@@ -193,6 +193,94 @@ function start() {
   });
 }
 
+// --- Latency watchdog ------------------------------------------------------
+//
+// A tunnel can stay UP and still go SLOW, and nothing above notices: ssh is
+// alive, the port answers, the hub handshakes. Measured 2026-08-16 against a
+// tunnel that had been up since the previous day - every browser call paid an
+// extra full network round trip:
+//
+//   raw ICMP RTT to the VPS ............ 135 ms
+//   hub round trip, FRESH tunnel ....... 138 ms   (one clean RTT)
+//   hub round trip, day-old tunnel ..... 329 ms   (2.4x, same hub, same minute)
+//   the same call served ON the VPS ...... 1 ms
+//
+// The work was never the cost; the tunnel was. Restarting ssh restored it
+// immediately. So: sample the round trip, and if it degrades badly against the
+// best this tunnel has ever achieved, respawn ssh and let the existing exit
+// handler reconnect.
+const PROBE_INTERVAL_MS = 120000;
+const BAD_FACTOR = 2;          // 2x the best we have ever seen here
+const BAD_MARGIN_MS = 60;      // ...and at least this much worse, so a fast
+                               // link does not trip on normal jitter
+const BAD_STREAK = 3;          // consecutive bad samples before acting
+const RESPAWN_COOLDOWN_MS = 600000;
+const MAX_LATENCY_RESPAWNS = 3; // then give up rather than loop forever
+
+let bestRttMs = Infinity;
+let badStreak = 0;
+let lastLatencyRespawn = 0;
+let latencyRespawns = 0;
+let watchdogDisabled = false;
+
+/** Time ONLY the register round trip, so the TCP/channel setup is excluded. */
+function probeLatency(port) {
+  return new Promise((resolve) => {
+    const s = new net.Socket();
+    s.setNoDelay(true);
+    let buf = "", t0 = 0;
+    const done = (v) => { s.destroy(); resolve(v); };
+    s.setTimeout(8000);
+    s.once("timeout", () => done(null));
+    s.once("error", () => done(null));
+    s.connect(port, "127.0.0.1", () => {
+      t0 = Date.now();
+      s.write(JSON.stringify({ type: "register_mcp_client", sessionId: "probelat" }) + "\n");
+    });
+    s.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      const line = buf.split("\n").find((l) => l.trim());
+      if (!line) return;
+      try {
+        const msg = JSON.parse(line);
+        done(msg.type === "registered" ? Date.now() - t0 : null);
+      } catch { done(null); }
+    });
+  });
+}
+
+async function latencyWatchdog() {
+  if (stopping || watchdogDisabled || !child || child.killed) return;
+  const rtt = await probeLatency(LOCAL_PORT);
+  if (rtt === null) return; // connectivity problems are the exit handler's job
+
+  if (rtt < bestRttMs) bestRttMs = rtt;
+  const threshold = Math.max(bestRttMs * BAD_FACTOR, bestRttMs + BAD_MARGIN_MS);
+  if (rtt <= threshold) { badStreak = 0; return; }
+
+  badStreak++;
+  log(`Tunnel latency ${rtt}ms vs best ${bestRttMs}ms (threshold ${Math.round(threshold)}ms) - ${badStreak}/${BAD_STREAK}`);
+  if (badStreak < BAD_STREAK) return;
+
+  const sinceLast = Date.now() - lastLatencyRespawn;
+  if (lastLatencyRespawn && sinceLast < RESPAWN_COOLDOWN_MS) return;
+
+  if (latencyRespawns >= MAX_LATENCY_RESPAWNS) {
+    watchdogDisabled = true;
+    log(`Latency still bad after ${latencyRespawns} respawns - the network itself is probably slower now. Watchdog OFF; not restarting in a loop.`);
+    return;
+  }
+
+  latencyRespawns++;
+  lastLatencyRespawn = Date.now();
+  badStreak = 0;
+  bestRttMs = Infinity; // the new tunnel sets its own baseline
+  log(`Tunnel is UP but SLOW (${rtt}ms). Respawning ssh (${latencyRespawns}/${MAX_LATENCY_RESPAWNS}).`);
+  if (child && !child.killed) child.kill(); // exit handler reconnects
+}
+
+setInterval(() => { latencyWatchdog().catch(() => {}); }, PROBE_INTERVAL_MS).unref?.();
+
 function stop() {
   stopping = true;
   log("Shutting down tunnel.");
