@@ -539,6 +539,26 @@ async function ensureAttached(tabId) {
     deviceScaleFactor: 1,
     mobile: false,
   });
+  // Tell the renderer to behave as a focused, active page even though the tab
+  // is not the visible one. In private mode we deliberately never raise the
+  // window, so the tab reports visibilityState "hidden" and produces no
+  // compositor frames - and CDP Input.dispatchMouseEvent blocks waiting for a
+  // renderer ack that a non-compositing widget never sends (measured: click
+  // 5.3s, wheel a hard 60s timeout). The three Chrome backgrounding flags do
+  // NOT fix this: with them live, rAF still fires 0 frames in 700ms.
+  //
+  // Both calls are best-effort. If they do not help, the fix is not to use
+  // mouse input at all - see the `act` handler.
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
+  } catch (e) {
+    log(`setFocusEmulationEnabled unavailable on tab ${tabId}: ${e.message}`);
+  }
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Page.setWebLifecycleState", { state: "active" });
+  } catch (e) {
+    log(`setWebLifecycleState unavailable on tab ${tabId}: ${e.message}`);
+  }
 }
 
 async function ensureDomain(tabId, domain) {
