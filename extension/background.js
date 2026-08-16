@@ -539,16 +539,33 @@ async function ensureAttached(tabId) {
     deviceScaleFactor: 1,
     mobile: false,
   });
-  // Tell the renderer to behave as a focused, active page even though the tab
-  // is not the visible one. In private mode we deliberately never raise the
-  // window, so the tab reports visibilityState "hidden" and produces no
-  // compositor frames - and CDP Input.dispatchMouseEvent blocks waiting for a
-  // renderer ack that a non-compositing widget never sends (measured: click
-  // 5.3s, wheel a hard 60s timeout). The three Chrome backgrounding flags do
-  // NOT fix this: with them live, rAF still fires 0 frames in 700ms.
+  // THIS IS THE FIX for slow mouse input. Do not remove.
   //
-  // Both calls are best-effort. If they do not help, the fix is not to use
-  // mouse input at all - see the `act` handler.
+  // In private mode we deliberately never raise the window, so the tab reports
+  // visibilityState "hidden" and CDP Input.dispatchMouseEvent blocks waiting
+  // for a renderer ack a non-active widget never sends. Measured 2026-08-16 on
+  // example.com: left_click 5,283ms, scroll a hard 60s timeout, while every
+  // other tool sat at the ~306ms transport floor. Across 33,734 recorded calls
+  // that was 5,959 mouse actions, 16.95 hours, 24.7% of all Orellius wall
+  // clock, 492 of them hitting the 60s wall.
+  //
+  // Chrome's --disable-renderer-backgrounding / -backgrounding-occluded-windows
+  // / -background-timer-throttling flags do NOT fix it (verified with all three
+  // live: rAF still 0 frames in 700ms, click still 5,468ms). Those flags govern
+  // throttling of an already-backgrounded renderer; they do not make the widget
+  // active. These two CDP calls do:
+  //
+  //   after: visibilityState "visible", hasFocus true,
+  //          left_click 317ms (17x), scroll 648ms (93x),
+  //          and on a heavy app page both went from a 60s timeout to ~360ms.
+  //
+  // Note rAF still reports 0 frames - the compositor genuinely is not painting.
+  // What changed is that the renderer now ACKS input. So this does NOT fix
+  // rAF-driven animation on the VPS (see vps-chrome-background-throttles-raf);
+  // anything waiting on requestAnimationFrame must still use setTimeout.
+  //
+  // Both calls are best-effort so an older Chrome degrades to the old behavior
+  // rather than failing to attach.
   try {
     await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
   } catch (e) {
@@ -3701,18 +3718,50 @@ const toolHandlers = {
   return JSON.stringify(out);
 })()`;
 
+    // A click that NAVIGATES tears down the execution context this evaluate is
+    // running in, so the call rejects with "Inspected target navigated or
+    // closed" even though the click did exactly what was asked. That is the
+    // single most common click there is, so treat it as success: wait out the
+    // settle, then read the new page in a fresh context and report it.
+    const navGone = (m) => /navigated|context was destroyed|Target closed|Cannot find context/i.test(m || "");
+
+    let result = null, navigated = false;
     try {
-      const result = await retriableCdp(tabId, "Runtime.evaluate", {
-        expression,
-        returnByValue: true,
-        awaitPromise: true,
-      });
+      result = await retriableCdp(tabId, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
       if (result.exceptionDetails) {
-        return { content: [{ type: "text", text: `act failed: ${result.exceptionDetails.text || JSON.stringify(result.exceptionDetails)}` }] };
+        const detail = result.exceptionDetails.text || JSON.stringify(result.exceptionDetails);
+        if (!navGone(detail)) return { content: [{ type: "text", text: `act failed: ${detail}` }] };
+        navigated = true;
       }
-      return { content: [{ type: "text", text: String(result.result?.value ?? "act returned nothing") }] };
     } catch (e) {
-      return { content: [{ type: "text", text: `act failed: ${e.message}` }] };
+      if (!navGone(e.message)) return { content: [{ type: "text", text: `act failed: ${e.message}` }] };
+      navigated = true;
+    }
+
+    if (!navigated) {
+      return { content: [{ type: "text", text: String(result.result?.value ?? "act returned nothing") }] };
+    }
+
+    await sleep(settleMs);
+    const report = `(() => {
+  const main = document.querySelector("main,[role=main],article") || document.body;
+  return JSON.stringify({
+    ok: true,
+    acted: ${JSON.stringify(action)},
+    navigated: true,
+    matched: { how: "target navigated - the action took effect and the page changed" },
+    changed: { url: true, dom: true },
+    url: location.href,
+    title: document.title,
+    ${returns === "text" ? `text: (main.innerText || "").replace(/\\n{3,}/g, "\\n\\n").trim().slice(0, ${maxChars}),` : ""}
+    readyState: document.readyState
+  });
+})()`;
+    try {
+      const after = await retriableCdp(tabId, "Runtime.evaluate", { expression: report, returnByValue: true, awaitPromise: true });
+      return { content: [{ type: "text", text: String(after.result?.value ?? `{"ok":true,"navigated":true}`) }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `{"ok":true,"navigated":true,"note":"acted and the page navigated; reading the new page failed: ${String(e.message).replace(/"/g, "'")}"}` }] };
     }
   },
 
