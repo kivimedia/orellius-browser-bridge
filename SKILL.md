@@ -44,15 +44,24 @@ page-level events, settles, and returns the new URL/title/text - replacing the
 `select` | `submit` | `hover` | `scroll_to`; `fill` goes through the native value setter so
 React/Vue `onChange` fires.
 
-⚡ **Do not use `computer` for mouse.** Benchmarked 2026-08-16 on example.com:
-every tool sits at the ~306ms hub round-trip floor, but `computer/left_click`
-costs **5,283ms** and `computer/scroll` **times out at 60s**. Cause: a headless
-or occluded tab produces no compositor frames, so CDP
-`Input.dispatchMouseEvent` blocks on a renderer ack that never arrives
-(`mousePressed` falls back after ~5s, `mouseWheel` never acks). Launch Chrome
-with `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding
---disable-background-timer-throttling` to avoid it - and prefer `act` regardless,
-since it needs no coordinates and costs one round trip instead of four.
+⚡ **The mouse stall, and its fix.** Benchmarked 2026-08-16 on example.com: every
+tool sits at the ~306ms hub round-trip floor, but `computer/left_click` cost
+**5,283ms** and `computer/scroll` **timed out at 60s**. Cause: an occluded tab
+reports `visibilityState: "hidden"`, so CDP `Input.dispatchMouseEvent` blocks on
+a renderer ack a non-active widget never sends.
+
+Fixed in 1.11.19 - `ensureAttached` issues `Emulation.setFocusEmulationEnabled`
+and `Page.setWebLifecycleState({state:"active"})`, taking left_click to **332ms**
+and scroll to **652ms**. Chrome's `--disable-renderer-backgrounding` family does
+**not** fix this (verified: still 5,468ms with all three live) - it governs
+throttling, not widget activity. If a ~5s click returns, the unpacked extension
+is stale: `curl -X POST http://127.0.0.1:<hubPort+1>/admin/reload-extension`.
+
+Note `requestAnimationFrame` still fires 0 frames in this environment even after
+the fix, so never terminate a wait on rAF - use `setTimeout`.
+
+Prefer `act` regardless: no coordinates, no devicePixelRatio bug, and one round
+trip instead of four.
 
 `computer` remains the right tool for `type`, `key`, and real screenshots (all ~330ms),
 and for canvas/WebGL surfaces or drags with no DOM handle. For screenshots that need to
