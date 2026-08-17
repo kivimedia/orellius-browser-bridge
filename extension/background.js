@@ -3263,8 +3263,18 @@ const toolHandlers = {
       await chrome.tabs.goForward(tabId);
     } else {
       let targetUrl = url;
+      // Schemes that are already complete and must NOT be touched. Anything not
+      // listed here gets https:// prepended, which turns a real URL into a DNS
+      // lookup of its own scheme: navigate("chrome-extension://<id>/manifest.json")
+      // became https://chrome-extension://... and failed with
+      // DNS_PROBE_FINISHED_NXDOMAIN. chrome-extension: in particular is how you
+      // inspect an extension's own pages, and it was unreachable. The strip regex
+      // below cannot catch it either - it only matches 1-5 letters before the
+      // colon, and "chrome-extension" is neither short nor purely alphabetic.
+      const COMPLETE_SCHEMES = ["about:", "chrome:", "chrome-extension:", "brave:", "edge:", "devtools:", "view-source:", "file:", "data:", "blob:"];
+      const hasCompleteScheme = COMPLETE_SCHEMES.some((s) => targetUrl.toLowerCase().startsWith(s));
       // Strip any malformed protocol prefix before normalizing
-      if (!targetUrl.match(/^https?:\/\//i) && !targetUrl.startsWith("about:") && !targetUrl.startsWith("chrome:") && !targetUrl.startsWith("brave:")) {
+      if (!targetUrl.match(/^https?:\/\//i) && !hasCompleteScheme) {
         // Remove any partial/broken protocol prefix (e.g., "hps://", "http:/", "ht://")
         targetUrl = targetUrl.replace(/^[a-z]{1,5}:\/+/i, "");
         targetUrl = "https://" + targetUrl;
