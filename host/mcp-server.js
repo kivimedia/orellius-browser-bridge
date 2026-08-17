@@ -249,12 +249,35 @@ async function ensureHub() {
       const hubPath = path.join(__dirname, "hub.js");
       const hubEnv = { ...process.env };
       delete hubEnv.ORELLIUS_HUB_PORT;
+      // Keep the hub's stderr. It was "ignore", which threw away every line the
+      // hub writes - including the two that explain its disappearances:
+      //   "No MCP clients for 5 minutes. Shutting down."   (a normal, by-design exit)
+      //   "Port N already in use - something else owns it. Exiting."
+      // A hub that exits on purpose and a hub that crashes looked identical from
+      // outside: the pid is simply gone and the admin port stops answering. That
+      // cost a wrong diagnosis on 2026-08-17, when a routine idle shutdown was
+      // blamed on POST /admin/reload-extension (which is innocent - it responds
+      // 200 and survives the native host vanishing, verified in isolation).
+      // The comment above already noted nobody ever saw these lines; this is that
+      // fix. Append-only, one file per port, harmless if it cannot be opened.
+      const hubLogPath = path.join(os.tmpdir(), `orellius-hub-${TCP_PORT}.log`);
+      let hubOut = "ignore";
+      try {
+        hubOut = fs.openSync(hubLogPath, "a");
+        fs.writeSync(hubOut, `\n=== hub spawn ${new Date().toISOString()} by mcp-server pid ${process.pid} ===\n`);
+      } catch (e) {
+        log(`could not open hub log ${hubLogPath}: ${e.message} - falling back to ignore`);
+        hubOut = "ignore";
+      }
       const child = spawn(process.execPath, [hubPath, `--port=${TCP_PORT}`], {
         detached: true,
-        stdio: "ignore",
+        stdio: hubOut === "ignore" ? "ignore" : ["ignore", hubOut, hubOut],
         env: hubEnv,
       });
       child.unref();
+      // The child holds its own dup of the fd; ours would otherwise leak on every spawn.
+      if (hubOut !== "ignore") { try { fs.closeSync(hubOut); } catch {} }
+      log(`Hub stderr -> ${hubLogPath}`);
       // Wait until it actually accepts a connection rather than assuming 1s was
       // enough. A spawn that died instantly used to resolve here anyway, and the
       // real failure surfaced 15s later as the misleading
