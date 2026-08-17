@@ -179,15 +179,56 @@ const pendingFileChoosers = new Map(); // tabId -> { resolve, reject, filePath, 
 let _currentSessionId = null;
 
 // --- Keep-alive alarm ---
-chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "keepalive") {
-    if (!nativePort) {
-      log("Keepalive: native port is null, attempting reconnect...");
-      setBadge("connecting");
-      connectNativeHost();
-    }
+// 0.5 = 30s, which is Chrome's floor for a periodic alarm. The old 0.4 (24s)
+// was silently clamped up to 30s anyway; saying 0.5 just makes the real cadence
+// honest.
+chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
+
+// How many consecutive ticks the hub may disagree with us before we tear the
+// port down. Two, so we never kill a port that is simply mid-registration:
+// connectNative() returns as soon as Chrome SPAWNS the host, well before that
+// host has opened its socket and registered with the hub.
+const HALF_OPEN_STRIKES = 2;
+let halfOpenCount = 0;
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== "keepalive") return;
+
+  if (!nativePort) {
+    log("Keepalive: native port is null, attempting reconnect...");
+    setBadge("connecting");
+    halfOpenCount = 0;
+    connectNativeHost();
+    return;
   }
+
+  // We believe we are connected - but "nativePort is non-null" only means the
+  // Chrome<->host pipe is open. It says nothing about whether that host still
+  // holds a socket to the hub. When a hub dies and a new one takes its place,
+  // the old host can linger (or exit while Chrome keeps a stale port), leaving
+  // a HALF-OPEN state: the extension thinks it is fine, the hub reports
+  // "No browser extensions are connected", and /admin/reload-extension answers
+  // delivered: 0. Nothing in here used to notice, because the only trigger was
+  // nativePort === null. The single known cure was a human clicking the
+  // extension icon, which restarts the service worker and forces a fresh
+  // connect - which is exactly the "voodoo" this removes.
+  //
+  // So: ask the hub whether it agrees that we are connected.
+  const status = await hubStatus();
+  if (!status) { halfOpenCount = 0; return; }   // hub down - not our problem to fix here
+  const hubSeesUs = Array.isArray(status.nativeHosts) && status.nativeHosts.includes(BROWSER_ID);
+  if (hubSeesUs) { halfOpenCount = 0; return; }
+
+  halfOpenCount++;
+  log(`Keepalive: hub is up (pid ${status.pid}) but does not list "${BROWSER_ID}" - half-open strike ${halfOpenCount}/${HALF_OPEN_STRIKES}`);
+  if (halfOpenCount < HALF_OPEN_STRIKES) return;
+
+  log("Keepalive: forcing native port teardown and reconnect (no human click needed).");
+  halfOpenCount = 0;
+  try { nativePort.disconnect(); } catch {}
+  nativePort = null;
+  setBadge("connecting");
+  connectNativeHost();
 });
 
 // --- Native messaging ---
@@ -209,17 +250,29 @@ const DRY_PROBE_FALLBACK = 10;
 let dryProbes = 0;
 let probeInFlight = false;
 
-async function hubAlive() {
+// The browser key this extension registers under. Must match what we send in
+// the init message below and hub.js's DEFAULT_BROWSER, because the half-open
+// check looks for exactly this string in the hub's nativeHosts list.
+const BROWSER_ID = "chromium";
+
+// Returns the hub's parsed /admin/status, or null if it is unreachable or not
+// answering usefully. hubAlive() is now just "did this return anything".
+async function hubStatus() {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
   try {
     const res = await fetch(HUB_ADMIN_URL, { signal: ctl.signal, cache: "no-store" });
-    return res.ok;
+    if (!res.ok) return null;
+    return await res.json();
   } catch {
-    return false;
+    return null;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function hubAlive() {
+  return (await hubStatus()) !== null;
 }
 
 async function connectNativeHost() {
@@ -274,7 +327,7 @@ function spawnNativeHost() {
     // running in so the hub can route per-browser. Required for Chrome +
     // Firefox extensions to coexist on the same hub.
     try {
-      nativePort.postMessage({ type: "init", browser: "chromium" });
+      nativePort.postMessage({ type: "init", browser: BROWSER_ID });
     } catch (e) {
       log(`Failed to send init handshake: ${e.message}`);
     }
