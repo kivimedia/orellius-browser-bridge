@@ -3982,10 +3982,18 @@ const toolHandlers = {
   // could assert whether a reduced-motion path even existed.
   //
   // Emulation.setDeviceMetricsOverride was already used here (screenshots,
-  // scroll-stitch), so the CCDP plumbing was present; setEmulatedMedia simply
-  // had no caller. Verified in headless Chrome before writing this: forcing
-  // prefers-color-scheme:dark flips matchMedia AND repaints the computed
-  // background, and passing an empty feature list clears it cleanly.
+  // scroll-stitch), so the CDP plumbing was present; setEmulatedMedia simply
+  // had no caller.
+  //
+  // Verified end to end 2026-08-26 through the real hub and extension, against
+  // a served page, 10/10:
+  //   before  bg rgb(255,255,255)  backdrop-filter blur(20px)  transition 0.4s
+  //   forced  bg rgb(0,0,0)        backdrop-filter none        transition 0s
+  //   cleared bg rgb(255,255,255)  backdrop-filter blur(20px)  transition 0.4s
+  // So dark, reduced-transparency and reduced-motion all take effect and all
+  // reverse. Harness: scratchpad/verify-emulate-live.mjs, which speaks the hub's
+  // TCP protocol directly (register_mcp_client, then tool_request) and needs no
+  // MCP client.
   async emulate(args) {
     const { tabId, mode = "media", colorScheme, reducedMotion, reducedTransparency, contrast, forcedColors, mediaType } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
