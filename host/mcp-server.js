@@ -984,6 +984,23 @@ server.tool(
   async (args) => callTool("resize_window", args)
 );
 
+// 13b. emulate
+server.tool(
+  "emulate",
+  "Force CSS media features on the current page so an audit can SEE the state it is meant to check: dark mode, reduced motion, reduced transparency, high contrast, forced colors, or print. Without this an audit only ever sees whatever the browser happened to default to, which is how a dark-theme or reduced-motion rule gets certified without ever being rendered. Set what you need, take the screenshot, then call mode:'clear' - the override survives navigation for the life of the debugger attachment, so a forgotten one silently poisons every later capture on that tab. Reads the features back off the page and reports what it observed, so a silently-ignored override does not look like a pass.",
+  {
+    tabId: z.number().describe("Tab ID to emulate on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
+    mode: z.enum(["media", "clear", "status"]).optional().describe("'media' (default) applies the settings below. 'clear' removes ALL emulation from the tab. 'status' reports what is currently forced."),
+    colorScheme: z.enum(["light", "dark", "no-preference"]).optional().describe("Forces prefers-color-scheme. Use 'dark' to verify the dark-theme form-control and contrast rules."),
+    reducedMotion: z.enum(["reduce", "no-preference"]).optional().describe("Forces prefers-reduced-motion. Use 'reduce' to check that a motion-free path exists and is not a blank page."),
+    reducedTransparency: z.enum(["reduce", "no-preference"]).optional().describe("Forces prefers-reduced-transparency. Use 'reduce' to assert backdrop-filter computes to none."),
+    contrast: z.enum(["more", "less", "custom", "no-preference"]).optional().describe("Forces prefers-contrast."),
+    forcedColors: z.enum(["active", "none"]).optional().describe("Forces forced-colors (Windows High Contrast)."),
+    mediaType: z.enum(["screen", "print"]).optional().describe("Forces the CSS media type. 'print' checks the print stylesheet without a print dialog."),
+  },
+  async (args) => callTool("emulate", args)
+);
+
 // 14. shortcuts_list
 server.tool(
   "shortcuts_list",

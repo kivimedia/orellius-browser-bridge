@@ -166,6 +166,10 @@ let tabGroupTabs = new Set();
 const sessionGroups = new Map(); // sessionId -> { tabGroupId, tabGroupTabs: Set }
 
 const attachedTabs = new Map(); // tabId -> { enabledDomains: Set }
+// tabId -> the CSS media features currently forced on that tab by `emulate`.
+// Reporting only; the browser holds the real state. Cleared when the debugger
+// detaches, because the override dies with the attachment.
+const emulatedMedia = new Map();
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp}]
 const screenshotStore = new Map(); // imageId -> base64
@@ -561,7 +565,8 @@ async function isInGroup(tabId) {
         try {
           const group = await chrome.tabGroups.get(tab.groupId);
           const expectedTitle = sessionId ? `MCP-${sessionId}` : "MCP";
-          if (group.title === expectedTitle || group.title === "MCP") {
+          const claudeTitle = sessionId ? `\u{1F512} Claude \u00b7 ${sessionId.slice(0, 8)}` : "";
+          if (group.title === expectedTitle || group.title === "MCP" || (claudeTitle && group.title === claudeTitle)) {
             state.tabGroupId = group.id;
             const groupTabs = await chrome.tabs.query({ groupId: state.tabGroupId });
             state.tabGroupTabs = new Set(groupTabs.map((t) => t.id));
@@ -1433,6 +1438,10 @@ chrome.tabs.onCreated.addListener((tab) => {
 chrome.debugger.onDetach.addListener((source, reason) => {
   lastDetachReason.set(source.tabId, reason);
   attachedTabs.delete(source.tabId);
+  // The media override lives on the debugger attachment, so it is already gone
+  // by now. Drop our record of it or `emulate mode:status` reports a dark page
+  // that is no longer dark.
+  emulatedMedia.delete(source.tabId);
   // Cancel any pending upload_file waiting for a chooser on this tab.
   const pendingUpload = pendingFileChoosers.get(source.tabId);
   if (pendingUpload) {
@@ -3961,6 +3970,81 @@ const toolHandlers = {
     return { content: [{ type: "text", text: `Network requests (${reqs.length}):\n${text}` }] };
   },
 
+  // Force CSS media features on a live page: prefers-color-scheme,
+  // prefers-reduced-motion, prefers-reduced-transparency, prefers-contrast,
+  // forced-colors, and the print/screen media type.
+  //
+  // Why this exists: rule 06 mandates dark-theme form controls and strict
+  // contrast minimums, and /design-review + /accessibility-audit are supposed
+  // to enforce them - but there was no way to make a page BE dark, so an audit
+  // only ever saw whatever the browser happened to default to. Separately, the
+  // VPS Chrome renders framer-motion stuck at its `initial` state, and nothing
+  // could assert whether a reduced-motion path even existed.
+  //
+  // Emulation.setDeviceMetricsOverride was already used here (screenshots,
+  // scroll-stitch), so the CCDP plumbing was present; setEmulatedMedia simply
+  // had no caller. Verified in headless Chrome before writing this: forcing
+  // prefers-color-scheme:dark flips matchMedia AND repaints the computed
+  // background, and passing an empty feature list clears it cleanly.
+  async emulate(args) {
+    const { tabId, mode = "media", colorScheme, reducedMotion, reducedTransparency, contrast, forcedColors, mediaType } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    try { ensureLockOwnedByCurrentSession(tabId); } catch (e) { return { content: [{ type: "text", text: e.message }] }; }
+
+    if (mode === "clear") {
+      // An empty features array plus an empty media string is the documented
+      // reset. Do NOT skip this between audits: an override survives navigation
+      // for the life of the debugger attachment, so a forgotten dark override
+      // silently poisons every later screenshot on that tab.
+      try {
+        await cdp(tabId, "Emulation.setEmulatedMedia", { media: "", features: [] });
+        emulatedMedia.delete(tabId);
+        return { content: [{ type: "text", text: "Cleared all media emulation on this tab." }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Could not clear media emulation: ${e.message}` }] };
+      }
+    }
+
+    if (mode === "status") {
+      const cur = emulatedMedia.get(tabId);
+      return { content: [{ type: "text", text: cur ? `Emulating: ${JSON.stringify(cur)}` : "No media emulation active on this tab." }] };
+    }
+
+    const features = [];
+    const add = (name, value) => { if (value) features.push({ name, value }); };
+    add("prefers-color-scheme", colorScheme);
+    add("prefers-reduced-motion", reducedMotion);
+    add("prefers-reduced-transparency", reducedTransparency);
+    add("prefers-contrast", contrast);
+    add("forced-colors", forcedColors);
+
+    if (!features.length && !mediaType) {
+      return { content: [{ type: "text", text: "Nothing to emulate. Pass at least one of colorScheme, reducedMotion, reducedTransparency, contrast, forcedColors, mediaType - or mode:'clear'." }] };
+    }
+
+    try {
+      await cdp(tabId, "Emulation.setEmulatedMedia", { media: mediaType || "", features });
+      const state = { ...(mediaType ? { mediaType } : {}), ...Object.fromEntries(features.map((f) => [f.name, f.value])) };
+      emulatedMedia.set(tabId, state);
+
+      // Read the features back from the page rather than trusting the command.
+      // A silently-ignored override is exactly the false-clean shape that makes
+      // an audit certify a page it never actually saw in that state.
+      let observed = "";
+      try {
+        const r = await cdp(tabId, "Runtime.evaluate", {
+          expression: `JSON.stringify({dark:matchMedia('(prefers-color-scheme: dark)').matches,reduced:matchMedia('(prefers-reduced-motion: reduce)').matches,bg:getComputedStyle(document.body).backgroundColor})`,
+          returnByValue: true,
+        });
+        if (r?.result?.value) observed = ` Page now reports: ${r.result.value}`;
+      } catch { /* the confirmation is a bonus, not the contract */ }
+
+      return { content: [{ type: "text", text: `Emulating ${JSON.stringify(state)}.${observed}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Could not set media emulation: ${e.message}` }] };
+    }
+  },
+
   async resize_window(args) {
     const { width, height, tabId, left, top, maximize } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
@@ -4865,19 +4949,33 @@ async function recoverTabGroupState() {
     // Recover all MCP tab groups (legacy "MCP" and session-specific "MCP-xxx")
     const allGroups = await chrome.tabGroups.query({});
     for (const group of allGroups) {
-      if (!group.title?.startsWith("MCP")) continue;
+      const title = group.title || "";
       const tabs = await chrome.tabs.query({ groupId: group.id });
       const tabSet = new Set(tabs.map((t) => t.id));
-
-      if (group.title === "MCP") {
-        // Legacy single-session group
+      let sid = null;
+      if (title === "MCP") {
         tabGroupId = group.id;
         tabGroupTabs = tabSet;
-      } else if (group.title.startsWith("MCP-")) {
-        // Session-specific group
-        const sid = group.title.slice(4);
-        sessionGroups.set(sid, { tabGroupId: group.id, tabGroupTabs: tabSet });
+        continue;
+      } else if (title.startsWith("MCP-")) {
+        sid = title.slice(4);
+      } else {
+        const m = /Claude \u00b7 (.+)$/.exec(title);
+        if (m) sid = m[1];
       }
+      if (!sid) continue;
+      const prev = sessionGroups.get(sid);
+      if (!prev) {
+        sessionGroups.set(sid, { tabGroupId: group.id, tabGroupTabs: tabSet });
+        continue;
+      }
+      try {
+        const prevTabs = await chrome.tabs.query({ groupId: prev.tabGroupId });
+        const winTabs = prevTabs[0] ? await chrome.tabs.query({ windowId: prevTabs[0].windowId }) : [];
+        const prevAllOurs = winTabs.length > 0 && winTabs.every((t) => prev.tabGroupTabs.has(t.id));
+        if (!prevAllOurs) sessionGroups.set(sid, { tabGroupId: group.id, tabGroupTabs: tabSet });
+      } catch {}
+
     }
     log(`Recovered ${sessionGroups.size} session groups + ${tabGroupId ? 1 : 0} legacy group`);
   } catch {
