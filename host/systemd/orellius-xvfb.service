@@ -1,0 +1,22 @@
+[Unit]
+# The X display Ziv's VPS browser draws on.
+#
+# It ran for 16 days as an ORPHAN: started by hand from an ssh session on
+# 10-Aug-2026, reparented to pid 1 when that session closed, and living in
+# user-1000.slice/session-101.scope - which looks exactly like a systemd
+# service in `ps` and is nothing of the sort. A reboot would have taken it and
+# left orellius-chrome, -x11vnc, -wm and -websockify all restarting happily
+# against a display that no longer existed.
+#
+# Geometry matches what was running: 1920x1080x24.
+Description=Orellius: X display :99 for Ziv's VPS browser
+After=network.target
+
+[Service]
+User=ziv
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
