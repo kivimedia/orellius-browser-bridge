@@ -177,6 +177,25 @@ async function case4() {
     const nf = await (await fetch(`${hub.admin}/admin/does-not-exist`)).json();
     assert(Array.isArray(nf.available) && nf.available.includes("POST /admin/reload-extension"), "404 list names reload-extension", JSON.stringify(nf.available));
     assert(nf.available.some((s) => s.startsWith("POST /admin/set-pin")), "404 list names set-pin");
+    // Admin Origin gate: web pages refused, no-Origin (CLI) and the pinned extension origin accepted.
+    const web = await fetch(`${hub.admin}/admin/status`, { headers: { Origin: "https://example.com" } });
+    assert(web.status === 403, "web-page Origin is refused with 403", `status=${web.status}`);
+    const other = await fetch(`${hub.admin}/admin/status`, { headers: { Origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } });
+    let pinned = null;
+    try {
+      const mp = process.platform === "win32"
+        ? path.join(os.homedir(), ".orellius-browser-bridge", "com.orellius.browser_bridge.json")
+        : path.join(os.homedir(), ".config", "google-chrome", "NativeMessagingHosts", "com.orellius.browser_bridge.json");
+      pinned = (JSON.parse(fs.readFileSync(mp, "utf8")).allowed_origins || [])[0] || null;
+    } catch {}
+    if (pinned) {
+      assert(other.status === 403, "an unknown extension origin is refused when a manifest pins the real one", `status=${other.status}`);
+      const own = await fetch(`${hub.admin}/admin/status`, { headers: { Origin: pinned.replace(/\/$/, "") } });
+      assert(own.status === 200, "the pinned Orellius extension origin is accepted", `${pinned} -> ${own.status}`);
+    } else {
+      assert(other.status === 200, "with no manifest to pin an id, any extension origin is accepted (fail open)", `status=${other.status}`);
+    }
+    assert(hub.logs.join("").includes("Admin: refused GET /admin/status from origin https://example.com"), "refusal is logged with method, path and origin");
   } finally { hub.child.kill(); }
 }
 

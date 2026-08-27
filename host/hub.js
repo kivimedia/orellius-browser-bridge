@@ -590,6 +590,24 @@ const server = net.createServer((socket) => {
             // Legacy: treat as native host with default browser (back-compat
             // with pre-multi-browser native-host.js that omits the browser
             // field on register).
+            //
+            // GATED 2026-08-25 (written on the VPS, committed upstream
+            // 2026-08-28). An UNRECOGNISED first message was silently
+            // accepted as a native-host registration, and the branch below
+            // then DESTROYS the incumbent socket. So any local process could
+            // evict the real browser and start receiving every other
+            // session's tool_requests, including Ziv's own live sessions.
+            //
+            // It is dead code on both machines: native-host.js always sends
+            // an explicit register_native_host, and this branch has never
+            // fired in a hub log. Gated rather than deleted, in case an older
+            // native host is ever pointed here.
+            if (process.env.ORELLIUS_ALLOW_LEGACY_NATIVE_HOST !== "1") {
+              log(`Refusing legacy native-host registration from ${remote}` +
+                  ` (set ORELLIUS_ALLOW_LEGACY_NATIVE_HOST=1 to allow)`);
+              socket.destroy();
+              return;
+            }
             socketType = "native_host";
             socketBrowser = DEFAULT_BROWSER;
             const prev = nativeHostSockets.get(socketBrowser);
@@ -695,7 +713,57 @@ function broadcastAdminMessage(adminMsg) {
   return delivered;
 }
 
+// Origins allowed to call the admin port WITH an Origin header. Local CLI
+// tooling and scripts send none and are always accepted. The extension's
+// service worker probes /admin/status every 30s (probe-before-spawn gate and
+// half-open self-heal in background.js). Chrome 152 sends NO Origin on that
+// probe - verified with tcpdump on the VPS loopback, 2026-08-28 - so a blanket
+// refusal of Origin-bearing requests did not break it. That is a Chrome
+// implementation detail, though, so the extension's own origin is allowed
+// explicitly: its id is already pinned in the native-host manifest's
+// allowed_origins; read it from there. If no manifest can be read,
+// any browser-extension origin is accepted (fail open for the bridge, web
+// pages are still refused).
+function readAllowedExtensionOrigins() {
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, ".orellius-browser-bridge", "com.orellius.browser_bridge.json"),
+    path.join(home, ".config", "google-chrome", "NativeMessagingHosts", "com.orellius.browser_bridge.json"),
+    path.join(home, ".config", "chromium", "NativeMessagingHosts", "com.orellius.browser_bridge.json"),
+    path.join(home, "Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts", "com.orellius.browser_bridge.json"),
+  ];
+  const out = new Set();
+  for (const p of candidates) {
+    try {
+      const m = JSON.parse(fs.readFileSync(p, "utf8"));
+      for (const o of m.allowed_origins || []) out.add(String(o).replace(/\/$/, ""));
+    } catch {}
+  }
+  return out;
+}
+const ALLOWED_EXTENSION_ORIGINS = readAllowedExtensionOrigins();
+
+function originAllowed(origin) {
+  if (!origin) return true; // CLI / scripts
+  const isExt = /^(chrome|moz)-extension:\/\//.test(origin);
+  if (!isExt) return false;
+  if (ALLOWED_EXTENSION_ORIGINS.size === 0) return true;
+  return ALLOWED_EXTENSION_ORIGINS.has(origin.replace(/\/$/, ""));
+}
+
 const adminServer = http.createServer((req, res) => {
+  // A page loaded in ANY browser on this box could drive this port: the handler
+  // set Access-Control-Allow-Origin:* and never checked who was calling, so a
+  // site the agents or Ziv happened to visit could force-private every session,
+  // reload the extension, or close windows. Web origins are refused outright
+  // (VPS hardening 2026-08-25, committed upstream 2026-08-28). originAllowed()
+  // additionally lets the extension's own origin through - see its comment.
+  if (!originAllowed(req.headers.origin)) {
+    log(`Admin: refused ${req.method} ${req.url} from origin ${req.headers.origin}`);
+    res.writeHead(403, { "content-type": "text/plain" });
+    res.end("cross-origin requests are not accepted on the admin port");
+    return;
+  }
   const cors = () => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");

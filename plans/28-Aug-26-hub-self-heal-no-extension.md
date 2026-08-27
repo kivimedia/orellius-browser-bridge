@@ -41,6 +41,19 @@ missing action was launching Chrome (case 1) or waiting ~60s for the extension's
 - `--no-startup-window` cold launch: Chrome exits immediately with nothing holding a keep-alive
   (verified with a throwaway profile). Dropped; a normal launch is what Ziv does by hand anyway.
 
+## Found on the way: the VPS hub.js had 3 days of uncommitted edits
+Both VPS checkouts (`~/.openclaw/workspace/orellius-browser-bridge`, which pm2 runs, and
+`~/orellius-browser-bridge`) carried the same uncommitted 2026-08-25 hardening: the legacy
+native-host registration is gated behind `ORELLIUS_ALLOW_LEGACY_NATIVE_HOST=1`, and the admin
+port refuses any request carrying an `Origin` header. Ported upstream in this change, with the
+extension's own origin (from the native-host manifest) allowed explicitly and refusals logged.
+
+Suspected, then DISPROVED: that the blanket Origin refusal 403'd the extension's own keepalive
+probe and disabled the half-open self-heal. `curl -H "Origin: chrome-extension://<vps id>"`
+did get 403, but a 40s `tcpdump -i lo` on the VPS caught two real probes from Chrome 152 and
+neither carried an Origin header at all. Extension fetches to a host-permitted URL send no
+Origin. The allowance stays as future-proofing; it was not the cause of anything.
+
 ## Verification
 - `node --check` on hub.js and mcp-server.js.
 - `node scripts/test-hub-recovery.mjs` -> all cases pass (see commit).
