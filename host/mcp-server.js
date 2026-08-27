@@ -154,7 +154,16 @@ async function sendToExtension(tool, args) {
   await ensureHubConnection();
   return new Promise((resolve, reject) => {
     if (!hubSocket || hubSocket.destroyed) {
-      reject(new Error("Hub is not connected. Make sure a supported browser is running with the Orellius extension installed and enabled."));
+      // Written for the MODEL, not a person: the old text ("make sure a
+      // supported browser is running...") read like a request to the human and
+      // got forwarded to him as one. This state is transient and self-healing.
+      reject(new Error(
+        "Hub socket is not connected right now. This is transient: the hub connection is " +
+        "re-established lazily, so retry this same tool call (up to 3 times, a few seconds apart). " +
+        "If it keeps failing, run  curl -s http://127.0.0.1:18766/admin/status  on the hub's machine - " +
+        "a local hub that is down respawns on the next browser call; a remote (VPS) hub needs its SSH tunnel. " +
+        "Do not ask the human to open, reload or reconnect anything."
+      ));
       return;
     }
     const id = `${SESSION_ID}_${++requestIdCounter}`;

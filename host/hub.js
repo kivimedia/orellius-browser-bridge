@@ -9,6 +9,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { spawn, execFile } from "node:child_process";
 
 const DEFAULT_PORT = 18765;
 // 5 minutes with no MCP clients -> exit. Set ORELLIUS_IDLE_TIMEOUT_MS=0 to stay
@@ -189,6 +190,269 @@ function cleanupPidfile() {
   } catch {}
 }
 
+// ---------------------------------------------------------------------------
+// Native-host recovery: park the call, fix the cause, deliver late.
+//
+// Before 2026-08-28 a tool_request that arrived while no native host was
+// connected failed INSTANTLY with "No chromium browser extension connected to
+// hub (registered: none). Open a chromium browser with the Orellius extension
+// loaded." That last sentence is addressed to a human, and the model on the
+// other end of the MCP call read it as one. Twice on 2026-08-27 a Claude
+// session stopped and asked Ziv to "reconnect the extension": once when Chrome
+// had simply been closed (the extension re-registered by itself seconds after
+// he relaunched Chrome - launching it was the ONLY missing action), and once
+// when Chrome was running with 73 processes and only the registration had
+// dropped (the extension's keepalive fixes that on its own inside a minute).
+// Neither condition ever needed a person. Ziv: "couldn't it manage to solve
+// this by himself? All I did was run a new chrome."
+//
+// So the hub now does what the person would have done:
+//   1. park the request instead of failing it. mcp-server.js waits 60s per
+//      call; we use RECOVERY_WAIT_MS of that budget;
+//   2. if the browser process is not running at all, launch it. On Windows the
+//      extension lives in ONE profile (Ziv's "Default"), so the launch names
+//      that profile - a 13-profile Chrome launched bare may show the profile
+//      picker and never start any extension. Launching Chrome when there is no
+//      Chrome is not "controlling his desktop" (rule 15): it is the one click
+//      he would have made himself, and he asked for it;
+//   3. if the browser IS running, do nothing but wait: the extension's own
+//      keepalive alarm probes /admin/status every 30s and reconnects a null or
+//      half-open native port by itself (see background.js, HALF_OPEN_STRIKES);
+//   4. the moment a native host registers, flush every parked request to it;
+//   5. only when the deadline passes, fail - with a message written FOR THE
+//      MODEL: what the hub already did, and the exact next steps, none of
+//      which is "ask the human".
+//
+// Env overrides (all optional; scripts/test-hub-recovery.mjs uses them):
+//   ORELLIUS_RECOVERY_WAIT_MS       how long a call may wait for a host (default 50s)
+//   ORELLIUS_RECOVERY_REKICK_MS     min gap between two launch/probe cycles (default 20s)
+//   ORELLIUS_BROWSER_PROCESS_NAME   what to count (default chrome.exe / Google Chrome / chrome)
+//   ORELLIUS_BROWSER_EXE            what to launch (default: Chrome's standard install paths;
+//                                   on Linux there is NO default - the VPS Chrome is pm2's)
+//   ORELLIUS_BROWSER_ARGS           launch args, whitespace-separated (default --profile-directory=<P>)
+//   ORELLIUS_BROWSER_PROFILE_DIR    the profile that holds the extension (default "Default")
+// ---------------------------------------------------------------------------
+const RECOVERY_WAIT_MS = Number(process.env.ORELLIUS_RECOVERY_WAIT_MS) || 50 * 1000;
+const RECOVERY_REKICK_MS = Number(process.env.ORELLIUS_RECOVERY_REKICK_MS) || 20 * 1000;
+
+/** @type {Array<{msg: object, browser: string, parkedAt: number, deadline: number}>} */
+const parkedRequests = [];
+/** The most recent recovery attempt - shown on /admin/status and quoted in the failure text. */
+let lastRecovery = null;
+let recoveryInFlight = null;
+let parkTimer = null;
+
+function browserProcessName(browser) {
+  if (process.env.ORELLIUS_BROWSER_PROCESS_NAME) return process.env.ORELLIUS_BROWSER_PROCESS_NAME;
+  if (browser === "firefox") return process.platform === "win32" ? "firefox.exe" : "firefox";
+  if (process.platform === "win32") return "chrome.exe";
+  if (process.platform === "darwin") return "Google Chrome";
+  return "chrome";
+}
+
+function execFileP(cmd, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(err); else resolve(String(stdout));
+    });
+  });
+}
+
+/** How many processes of the browser exist right now. null = could not tell. */
+async function countBrowserProcesses(browser) {
+  const name = browserProcessName(browser);
+  try {
+    if (process.platform === "win32") {
+      const out = await execFileP("tasklist", ["/FI", `IMAGENAME eq ${name}`, "/NH", "/FO", "CSV"], 10000);
+      const needle = `"${name.toLowerCase()}"`;
+      return out.split(/\r?\n/).filter((l) => l.toLowerCase().startsWith(needle)).length;
+    }
+    const out = await execFileP("pgrep", process.platform === "darwin" ? ["-x", name] : ["-f", name], 10000);
+    return out.split(/\r?\n/).filter(Boolean).length;
+  } catch (err) {
+    // pgrep exits 1 when nothing matches - that is a real zero, not a failure.
+    if (process.platform !== "win32" && err && err.code === 1) return 0;
+    log(`Recovery: could not count ${name} processes: ${err.message}`);
+    return null;
+  }
+}
+
+function browserExecutable(browser) {
+  if (process.env.ORELLIUS_BROWSER_EXE) return process.env.ORELLIUS_BROWSER_EXE;
+  if (browser !== "chromium") return null;
+  if (process.platform === "win32") {
+    const candidates = [
+      path.join(process.env["ProgramFiles"] || "C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
+    ];
+    return candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || null;
+  }
+  if (process.platform === "darwin") return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  // Linux: the VPS Chrome is supervised by pm2 (orellius-chrome) and carries its
+  // own --user-data-dir; a bare launch here would start a second, unrelated
+  // Chrome. Opt in explicitly with ORELLIUS_BROWSER_EXE if you want it.
+  return null;
+}
+
+function browserLaunchArgs() {
+  if (process.env.ORELLIUS_BROWSER_ARGS !== undefined) {
+    return process.env.ORELLIUS_BROWSER_ARGS.split(/\s+/).filter(Boolean);
+  }
+  const profile = process.env.ORELLIUS_BROWSER_PROFILE_DIR || "Default";
+  return [`--profile-directory=${profile}`];
+}
+
+/**
+ * Start the browser. On Windows this goes through WMI (Win32_Process.Create):
+ * the new process is a child of WmiPrvSE.exe in the caller's interactive
+ * session, so it is never inside any job object the hub might be running in and
+ * outlives the hub's own idle exit. Verified 2026-08-28 (parent WmiPrvSE.exe,
+ * session 1). Falls back to a detached spawn if WMI is unavailable.
+ */
+async function launchBrowser(browser) {
+  const exe = browserExecutable(browser);
+  if (!exe) {
+    return { ok: false, reason: `no ${browser} executable known on ${process.platform} (set ORELLIUS_BROWSER_EXE)` };
+  }
+  const args = browserLaunchArgs();
+  const cmdline = [`"${exe}"`, ...args].join(" ");
+  if (process.platform === "win32") {
+    const ps = `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${cmdline.replace(/'/g, "''")}' }; "$($r.ReturnValue) $($r.ProcessId)"`;
+    try {
+      const out = (await execFileP("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], 20000)).trim();
+      const [rv, pid] = out.split(/\s+/);
+      if (rv === "0" && pid) return { ok: true, pid: Number(pid), via: "wmi", cmdline };
+      log(`Recovery: WMI launch returned "${out}" - falling back to spawn`);
+    } catch (err) {
+      log(`Recovery: WMI launch failed (${err.message}) - falling back to spawn`);
+    }
+  }
+  try {
+    const child = spawn(exe, args, { detached: true, stdio: "ignore" });
+    child.on("error", (err) => log(`Recovery: spawned browser errored: ${err.message}`));
+    child.unref();
+    return { ok: true, pid: child.pid, via: "spawn", cmdline };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+}
+
+async function runRecovery(browser) {
+  const rec = {
+    browser,
+    startedMs: Date.now(),
+    startedAt: new Date().toISOString(),
+    processName: browserProcessName(browser),
+    processCount: null,
+    browserRunning: null,
+    launched: null,
+    steps: [],
+  };
+  lastRecovery = rec;
+  const count = await countBrowserProcesses(browser);
+  rec.processCount = count;
+  rec.browserRunning = count === null ? null : count > 0;
+  if (count === null) {
+    rec.steps.push(`could not tell whether ${rec.processName} is running; waiting for the extension to register`);
+  } else if (count > 0) {
+    rec.steps.push(`${rec.processName} is running (${count} processes); waiting for its Orellius extension to re-register on its own (keepalive every 30s)`);
+  } else {
+    rec.steps.push(`${rec.processName} is NOT running`);
+    const launched = await launchBrowser(browser);
+    rec.launched = launched;
+    rec.steps.push(launched.ok
+      ? `launched ${launched.cmdline} (pid ${launched.pid}, via ${launched.via}); waiting for its extension to register`
+      : `could not launch it: ${launched.reason}`);
+  }
+  log(`Recovery: ${rec.steps.join("; ")}`);
+  return rec;
+}
+
+function kickRecovery(browser) {
+  if (recoveryInFlight) return;
+  if (lastRecovery && Date.now() - lastRecovery.startedMs < RECOVERY_REKICK_MS) return;
+  recoveryInFlight = runRecovery(browser)
+    .catch((err) => log(`Recovery: attempt threw: ${err.message}`))
+    .finally(() => { recoveryInFlight = null; });
+}
+
+function parkRequest(msg, browser) {
+  const now = Date.now();
+  parkedRequests.push({ msg, browser, parkedAt: now, deadline: now + RECOVERY_WAIT_MS });
+  log(`No ${browser} native host - parked ${msg.tool || "request"} ${msg.id} from session ${msg.sessionId} (${parkedRequests.length} parked, up to ${Math.round(RECOVERY_WAIT_MS / 1000)}s)`);
+  kickRecovery(browser);
+  if (!parkTimer) {
+    parkTimer = setInterval(expireParked, 1000);
+    if (parkTimer.unref) parkTimer.unref();
+  }
+}
+
+/** A native host for the browser just registered: deliver everything waiting for it. */
+function flushParked(browser) {
+  const socket = nativeHostSockets.get(browser);
+  if (!socket || socket.destroyed) return;
+  const mine = parkedRequests.filter((p) => p.browser === browser);
+  if (mine.length === 0) return;
+  for (const p of mine) parkedRequests.splice(parkedRequests.indexOf(p), 1);
+  let delivered = 0;
+  for (const p of mine) {
+    const client = mcpClients.get(p.msg.sessionId);
+    if (!client || client.destroyed) continue; // session left while waiting
+    if (p.msg.id && p.msg.sessionId) requestRouting.set(p.msg.id, { sessionId: p.msg.sessionId, browser });
+    socket.write(JSON.stringify(p.msg) + "\n");
+    delivered++;
+  }
+  const waited = Math.round((Date.now() - Math.min(...mine.map((p) => p.parkedAt))) / 1000);
+  log(`Native host back - delivered ${delivered} parked request(s) after up to ${waited}s`);
+}
+
+function recoveryFailureText(p) {
+  const known = [...nativeHostSockets.keys()].join(", ") || "none";
+  const waited = Math.round((Date.now() - p.parkedAt) / 1000);
+  const rec = lastRecovery;
+  const name = browserProcessName(p.browser);
+  const lines = [
+    `No ${p.browser} browser extension is connected to the Orellius hub (registered: ${known}) and none registered within ${waited}s.`,
+    `What the hub already did: ${rec ? rec.steps.join("; ") : "no recovery attempt ran"}.`,
+    `This is a known SELF-HEALING condition. Do the following yourself. Do NOT ask the human to open Chrome, reload or reconnect anything:`,
+  ];
+  if (rec && rec.browserRunning === false && rec.launched && rec.launched.ok) {
+    lines.push(`1. ${name} was just launched by the hub (pid ${rec.launched.pid}); a cold start plus extension registration can outlast one wait. Retry this exact tool call now.`);
+  } else if (rec && rec.browserRunning === false) {
+    lines.push(`1. ${name} is not running and the hub could not launch it (${rec.launched ? rec.launched.reason : "unknown reason"}). Launch it yourself, then retry this call. Windows: Start-Process "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" -ArgumentList "--profile-directory=Default" (the extension lives in the Default profile). VPS: pm2 restart orellius-chrome.`);
+  } else {
+    lines.push(`1. ${name} is running but its extension has not re-registered. The extension reconnects on its own within about 60s of noticing (30s keepalive, two strikes for a half-open port). Retry this exact tool call once.`);
+  }
+  lines.push(`2. On this hub's machine: curl -s http://127.0.0.1:${ADMIN_HTTP_PORT}/admin/status -> "nativeHosts" must list "${p.browser}". Then curl -s -X POST http://127.0.0.1:${ADMIN_HTTP_PORT}/admin/reload-extension (delivered:0 means no host is connected, i.e. the extension itself is not running).`);
+  lines.push(`3. If it is still absent after that, the extension is crashed or disabled. Reload it: open chrome://extensions in the browser that holds it and click Reload on Orellius. On Ziv's PC do that through the windows-desktop MCP - he authorized exactly this on 2026-08-27 ("claude can control my desktop on orellius, even go into extension to reload it"), one bounded action, say what you are doing. On the VPS: pm2 restart orellius-chrome. Then retry.`);
+  lines.push(`Never end your turn by asking the human to reconnect, reload or open the browser (memory: orellius-never-hand-back-a-connection-failure).`);
+  return lines.join("\n");
+}
+
+function expireParked() {
+  const now = Date.now();
+  for (let i = 0; i < parkedRequests.length;) {
+    const p = parkedRequests[i];
+    if (p.deadline > now) { i++; continue; }
+    parkedRequests.splice(i, 1);
+    const client = mcpClients.get(p.msg.sessionId);
+    if (client && !client.destroyed) {
+      client.write(JSON.stringify({
+        id: p.msg.id,
+        sessionId: p.msg.sessionId,
+        type: "tool_error",
+        error: recoveryFailureText(p),
+      }) + "\n");
+    }
+    log(`Recovery: gave up on parked ${p.msg.tool || "request"} ${p.msg.id} after ${Math.round((now - p.parkedAt) / 1000)}s - no ${p.browser} native host registered`);
+  }
+  if (parkedRequests.length === 0 && parkTimer) {
+    clearInterval(parkTimer);
+    parkTimer = null;
+  }
+}
+
 // --- Message routing ---
 
 function forwardToNativeHost(msg) {
@@ -196,18 +460,13 @@ function forwardToNativeHost(msg) {
   const socket = nativeHostSockets.get(browser);
 
   if (!socket || socket.destroyed) {
-    // Send error back to the MCP client
+    // No native host right now. Do NOT fail the call - park it and recover
+    // (see "Native-host recovery" above for why the instant error was wrong).
+    // Only requests that can be answered are parked: a known client and an id.
     const sessionId = msg.sessionId;
     const client = sessionId ? mcpClients.get(sessionId) : null;
-    if (client && !client.destroyed) {
-      const known = [...nativeHostSockets.keys()].join(", ") || "none";
-      const errMsg = JSON.stringify({
-        id: msg.id,
-        sessionId,
-        type: "tool_error",
-        error: `No ${browser} browser extension connected to hub (registered: ${known}). Open a ${browser} browser with the Orellius extension loaded.`,
-      }) + "\n";
-      client.write(errMsg);
+    if (client && !client.destroyed && msg.id) {
+      parkRequest(msg, browser);
     }
     return;
   }
@@ -298,6 +557,7 @@ const server = net.createServer((socket) => {
             nativeHostSockets.set(socketBrowser, socket);
             log(`Native host registered from ${remote} (browser=${socketBrowser}, total=${nativeHostSockets.size})`);
             socket.write(JSON.stringify({ type: "registered", role: "native_host", browser: socketBrowser }) + "\n");
+            flushParked(socketBrowser);
             continue;
           } else if (msg.type === "register_mcp_client" && msg.sessionId) {
             socketType = "mcp_client";
@@ -339,6 +599,7 @@ const server = net.createServer((socket) => {
             }
             nativeHostSockets.set(socketBrowser, socket);
             log(`Native host connected (legacy, browser=${socketBrowser}) from ${remote}`);
+            flushParked(socketBrowser);
             // Fall through to process this message
           }
         }
@@ -455,6 +716,11 @@ const adminServer = http.createServer((req, res) => {
       adminPort: ADMIN_HTTP_PORT,
       pid: process.pid,
       nativeHosts: [...nativeHostSockets.keys()],
+      // Calls waiting for a native host to (re)appear, and what the hub did
+      // about it - so "why is it slow / why did it fail" is answerable here.
+      parkedRequests: parkedRequests.length,
+      recovery: lastRecovery,
+      recoveryInFlight: recoveryInFlight !== null,
       mcpClientCount: mcpClients.size,
       mcpSessions: [...mcpClients.keys()],
       // Registered != active. `activeSessions` are the ones that actually made
@@ -643,11 +909,16 @@ const adminServer = http.createServer((req, res) => {
   res.end(JSON.stringify({
     ok: false,
     error: "Unknown admin endpoint",
+    // Keep this COMPLETE. It used to omit reload-extension and set-pin, and on
+    // 2026-08-27 a session probed the admin surface, read this list, concluded
+    // "this build has no reload-extension" and handed the outage to the human.
     available: [
       "GET /admin/status",
       "POST /admin/force-private",
-      "POST /admin/unlock",
+      "POST /admin/unlock?pin=<pin>",
+      "POST /admin/set-pin?old=<current>&new=<new>",
       "POST /admin/close-unused",
+      "POST /admin/reload-extension",
       "POST /admin/shutdown",
     ],
   }));
@@ -688,5 +959,5 @@ server.listen(TCP_PORT, "127.0.0.1", () => {
 });
 
 adminServer.listen(ADMIN_HTTP_PORT, "127.0.0.1", () => {
-  log(`Admin HTTP listening on 127.0.0.1:${ADMIN_HTTP_PORT} (POST /admin/{force-private,unlock,close-unused,shutdown}, GET /admin/status)`);
+  log(`Admin HTTP listening on 127.0.0.1:${ADMIN_HTTP_PORT} (POST /admin/{force-private,unlock,set-pin,close-unused,reload-extension,shutdown}, GET /admin/status)`);
 });
