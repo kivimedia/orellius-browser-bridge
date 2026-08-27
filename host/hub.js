@@ -11,7 +11,20 @@ import path from "node:path";
 import os from "node:os";
 
 const DEFAULT_PORT = 18765;
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes with no MCP clients -> exit
+// 5 minutes with no MCP clients -> exit. Set ORELLIUS_IDLE_TIMEOUT_MS=0 to stay
+// up forever, which is what a SUPERVISOR wants.
+//
+// The default is right for the normal case: a hub is auto-spawned on demand by
+// mcp-server.js and should not outlive the session that needed it. It is wrong
+// for the reverse-tunnel case. When a KM BOT agent on the VPS reaches this PC
+// through the tunnel, the thing that would respawn the hub - mcp-server.js -
+// is on the OTHER side of it, so a hub that exits leaves the tunnel forwarding
+// to a closed port. Doni read Ziv's WhatsApp at 09:21 on 27-Aug-2026 and, at
+// 09:28, could not: same tunnel, same grant, hub gone. Its own status still
+// said connected, because ssh was up.
+const IDLE_TIMEOUT_MS = process.env.ORELLIUS_IDLE_TIMEOUT_MS !== undefined
+  ? Number(process.env.ORELLIUS_IDLE_TIMEOUT_MS)
+  : 5 * 60 * 1000;
 
 // How long a registered MCP session may go WITHOUT making a browser tool call
 // before the hub evicts it: its Chrome window is closed and its socket dropped.
@@ -153,10 +166,10 @@ if (sweepTimer.unref) sweepTimer.unref();
 
 function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
-  if (mcpClients.size === 0) {
+  if (mcpClients.size === 0 && IDLE_TIMEOUT_MS > 0) {
     idleTimer = setTimeout(() => {
       if (mcpClients.size === 0) {
-        log("No MCP clients for 5 minutes. Shutting down.");
+        log(`No MCP clients for ${IDLE_TIMEOUT_MS}ms. Shutting down.`);
         shutdown();
       }
     }, IDLE_TIMEOUT_MS);
