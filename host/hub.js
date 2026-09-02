@@ -37,7 +37,13 @@ const IDLE_TIMEOUT_MS = process.env.ORELLIUS_IDLE_TIMEOUT_MS !== undefined
 // that meant windows from two-day-old conversations were still pinned open, and
 // /admin/close-unused could never reap anything because every session with a
 // live process counted as active.
-const SESSION_IDLE_TTL_MS = Number(process.env.ORELLIUS_SESSION_TTL_MS) || 15 * 60 * 1000;
+// Raised from 15min to 60min on 2026-09-02. At 15 minutes an ordinary pause in
+// a conversation was enough to evict a session and close its window, and with
+// many concurrent sessions the sweeper fired constantly. The eviction itself is
+// now non-destructive (the extension closes only the agent's own tabs, and
+// never the last window - see handleAdminCloseTabs), so a longer TTL costs
+// nothing but makes the churn rare.
+const SESSION_IDLE_TTL_MS = Number(process.env.ORELLIUS_SESSION_TTL_MS) || 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = Number(process.env.ORELLIUS_SWEEP_INTERVAL_MS) || 60 * 1000;
 // How long a freshly-registered session is protected from the sweeper before
 // it has to show a real browser call. Short on purpose: registration is a
@@ -51,15 +57,42 @@ const REGISTER_GRACE_MS = 60 * 1000;
 // orellius-hub-error.log and buried the handful of lines that are real
 // errors. Same failure mode as pr-pipeline. out.log had sat at 0 bytes since
 // 2026-06-08 while error.log carried 100% of the traffic.
+//
+// BOTH streams are also mirrored to a file, because the stdout/stderr split
+// only helps where something is capturing them. On Ziv's PC the hub runs
+// detached under no supervisor, so both streams go nowhere at all: on
+// 2026-09-02 the sweeper's own "Idle sweep: evicting N session(s)" lines were
+// the one missing piece of evidence in a Chrome-keeps-dying investigation,
+// purely because nothing was reading either stream.
+const LOG_DIR = path.join(os.homedir(), ".orellius-browser-bridge", "logs");
+const LOG_FILE = path.join(LOG_DIR, "hub.log");
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch {}
+
+function logToFile(msg) {
+  try {
+    // Cheap size cap: one rotation to .1, no external dependency, and a failed
+    // rotate must never take the hub down with it.
+    if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) {
+      fs.renameSync(LOG_FILE, `${LOG_FILE}.1`);
+    }
+  } catch {}
+  try {
+    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {}
+}
+
 function log(msg) {
   const ts = new Date().toISOString().slice(11, 19);
   process.stdout.write(`[hub ${ts}] ${msg}\n`);
+  logToFile(msg);
 }
 
 // Genuine faults keep stderr, so orellius-hub-error.log means something again.
 function logError(msg) {
   const ts = new Date().toISOString().slice(11, 19);
   process.stderr.write(`[hub ${ts}] ${msg}\n`);
+  logToFile(`ERROR ${msg}`);
 }
 
 function getPort() {

@@ -19,6 +19,18 @@ function log(msg) {
   } catch {}
 }
 
+// Log line that also survives the service worker. MV3 wipes the console every
+// idle cycle, so anything we want to be able to explain AFTER the fact - above
+// all "which window did we close, and why" - has to leave the extension. The
+// native host appends these to ~/.orellius-browser-bridge/logs/<channel>.log.
+// Never called in a hot path: window lifecycle events only.
+function auditLog(msg, channel = "windows") {
+  log(msg);
+  try {
+    if (nativePort) nativePort.postMessage({ type: "orellius_log", channel, line: msg });
+  } catch {}
+}
+
 // TEMPORARY diagnostic: per-window census - who owns each window's tabs?
 async function _debugWindowsOverview() {
   try {
@@ -762,6 +774,46 @@ async function setPrivateLock(value) {
 // locked by a *different* active session than the window owner, we leave the
 // whole window alone and report the conflict in the log. This prevents
 // admin shutdown from blowing away work another session is in the middle of.
+//
+// 🚨 What this must NEVER do (both learned the hard way on 2026-09-02):
+//   1. Take the human's tabs with it. A window is only ours to remove if EVERY
+//      tab in it is in an Orellius group. Otherwise we close our own tabs and
+//      leave his window standing.
+//   2. Close the last window. Chrome needs no kill to die - when the final
+//      window closes the browser process exits, cleanly, with no crash dump.
+//      Ziv saw Chrome "killed" 12 times in 100 minutes and it was this line.
+//      When ours is the only window left we pin a keep-alive tab and close our
+//      tabs inside it instead of removing the window.
+
+// Chrome exits when its last normal window closes. Ask before removing one.
+async function isLastNormalWindow(windowId) {
+  try {
+    const wins = await chrome.windows.getAll({ windowTypes: ["normal"] });
+    return wins.filter((w) => w.id !== windowId).length === 0;
+  } catch {
+    // If we cannot tell, assume it IS the last one. A window left open is a
+    // recoverable annoyance; ending the user's browser is not.
+    return true;
+  }
+}
+
+// A pinned, ungrouped tab that belongs to nobody: it exists purely so the
+// window - and therefore the browser process - outlives our own tabs.
+const KEEPALIVE_URL = "chrome://newtab/";
+async function ensureKeepAliveTab(windowId) {
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    // TAB_GROUP_ID_NONE is -1. A pinned ungrouped tab is already doing this job.
+    if (tabs.some((t) => t.pinned && t.groupId === -1)) return true;
+    const t = await chrome.tabs.create({ windowId, url: KEEPALIVE_URL, pinned: true, active: false });
+    auditLog(`keep-alive: pinned tab ${t.id} in window ${windowId} so the browser survives`);
+    return true;
+  } catch (e) {
+    auditLog(`keep-alive: could NOT pin a tab in window ${windowId} (${e.message}) - leaving the window alone`);
+    return false;
+  }
+}
+
 async function handleAdminCloseTabs(msg) {
   const mode = msg.mode === "all" ? "all" : "unused";
   const activeSessionIds = new Set(Array.isArray(msg.activeSessionIds) ? msg.activeSessionIds : []);
@@ -781,38 +833,61 @@ async function handleAdminCloseTabs(msg) {
   }
   const orellGroups = groups.filter((g) => typeof g.title === "string" && (g.title.startsWith("🔒 Claude") || g.title === "MCP"));
   log(`admin_close_tabs: found ${orellGroups.length} Orellius tab group(s)`);
+  // Group ids that are OURS. Any tab outside these is the human's, and its
+  // presence in a window is a veto on removing that window.
+  const orelliusGroupIds = new Set(orellGroups.map((g) => g.id));
 
   // Build per-window target list. shortId is the first 8 chars of the owning
   // sessionId (extracted from the group title) - we match it as a prefix
   // against the hub's activeSessionIds list for mode=unused.
-  const targets = orellGroups.map((g) => {
+  // Several groups can share ONE window - concurrent sessions, or leftovers from
+  // earlier ones. Aggregate per window and decide once. Iterating per GROUP had
+  // two faults, both seen on 2026-09-02: the same window was processed six times
+  // (six near-identical log lines, five of them no-ops), and an idle group could
+  // act on a window an ACTIVE session was still holding, because the preserve
+  // check only looked at one group at a time. A window is preserved if ANY group
+  // in it belongs to a live session.
+  const byWindow = new Map();
+  for (const g of orellGroups) {
     const m = /Claude · ([a-f0-9]+)/.exec(g.title || "");
-    return { windowId: g.windowId, groupId: g.id, shortId: m ? m[1] : null };
-  });
+    const shortId = m ? m[1] : null;
+    let entry = byWindow.get(g.windowId);
+    if (!entry) {
+      entry = { windowId: g.windowId, shortIds: [], anyActive: false };
+      byWindow.set(g.windowId, entry);
+    }
+    if (shortId) entry.shortIds.push(shortId);
+    if (shortId && [...activeSessionIds].some((sid) => sid.startsWith(shortId))) {
+      entry.anyActive = true;
+    }
+  }
+  const targets = [...byWindow.values()];
 
-  let closed = 0;
+  let closed = 0;        // whole windows removed (all ours, and not the last)
+  let tabsOnly = 0;      // mixed windows: our tabs closed, his window kept
+  let keptAlive = 0;     // last window: pinned a keep-alive tab instead
+  let skipped = 0;       // refused to act because we could not prove it was safe
   let preserved = 0;
   let blockedByLock = 0;
 
-  for (const { windowId: wid, shortId } of targets) {
-    // mode=unused: skip windows whose session is still live. We only have the
-    // short prefix from the title, so check for any active sessionId starting
-    // with it.
-    if (mode === "unused" && shortId) {
-      const stillActive = [...activeSessionIds].some((sid) => sid.startsWith(shortId));
-      if (stillActive) {
-        preserved++;
-        log(`admin_close_tabs: preserving window ${wid} (session shortId=${shortId} is still active)`);
-        continue;
-      }
+  for (const { windowId: wid, shortIds, anyActive } of targets) {
+    // mode=unused: skip windows where any owning session is still live. We only
+    // have the short prefix from the group title, so `anyActive` was resolved
+    // above by prefix-matching every active sessionId.
+    if (mode === "unused" && anyActive) {
+      preserved++;
+      log(`admin_close_tabs: preserving window ${wid} (session(s) ${shortIds.join(", ") || "?"} still active)`);
+      continue;
     }
 
     // Honour cross-session tab locks: if any tab in this window is held by an
     // active session, skip - we don't want shutdown to nuke work in progress.
+    let winTabs = [];
     let lockConflict = null;
+    let queryFailed = false;
     try {
-      const tabs = await chrome.tabs.query({ windowId: wid });
-      for (const t of tabs) {
+      winTabs = await chrome.tabs.query({ windowId: wid });
+      for (const t of winTabs) {
         const lock = tabLocks.get(t.id);
         if (lock && !isLockExpired(lock) && activeSessionIds.size > 0 && activeSessionIds.has(lock.sessionId)) {
           lockConflict = { tabId: t.id, lockedBy: lock.sessionId };
@@ -820,27 +895,68 @@ async function handleAdminCloseTabs(msg) {
         }
       }
     } catch (e) {
+      queryFailed = true;
       log(`admin_close_tabs: chrome.tabs.query failed for window ${wid}: ${e.message}`);
     }
     if (lockConflict) {
       blockedByLock++;
-      log(`admin_close_tabs: skipping window ${wid} - tab ${lockConflict.tabId} locked by active session ${lockConflict.lockedBy}`);
+      auditLog(`admin_close_tabs: skipping window ${wid} - tab ${lockConflict.tabId} locked by active session ${lockConflict.lockedBy}`);
+      continue;
+    }
+    if (queryFailed) {
+      // We could not see what is in this window, so we cannot prove it is ours.
+      // Removing it blind is how the human's tabs got taken. Skip it.
+      skipped++;
+      auditLog(`admin_close_tabs: skipping window ${wid} - could not read its tabs, refusing to close a window we cannot inspect`);
       continue;
     }
 
+    // Split the window: our tabs (in an Orellius group) vs everything else.
+    const agentTabIds = [];
+    const humanTabIds = [];
+    for (const t of winTabs) {
+      if (orelliusGroupIds.has(t.groupId)) agentTabIds.push(t.id);
+      else humanTabIds.push(t.id);
+    }
+
     try {
-      await chrome.windows.remove(wid);
-      closed++;
-      log(`admin_close_tabs: closed window ${wid}`);
+      if (humanTabIds.length > 0) {
+        // Mixed window. Close only what is ours; his window stays.
+        if (agentTabIds.length) await chrome.tabs.remove(agentTabIds);
+        tabsOnly++;
+        auditLog(
+          `admin_close_tabs: window ${wid} also holds ${humanTabIds.length} non-agent tab(s) - ` +
+          `closed our ${agentTabIds.length} tab(s) only, window left open`
+        );
+      } else if (await isLastNormalWindow(wid)) {
+        // All ours, but it is the only window left: removing it ends Chrome.
+        const pinned = await ensureKeepAliveTab(wid);
+        if (!pinned) {
+          // No keep-alive means closing our tabs would still empty the window.
+          skipped++;
+          auditLog(`admin_close_tabs: window ${wid} is the last one and no keep-alive tab could be pinned - left untouched rather than risk ending the browser`);
+          continue;
+        }
+        if (agentTabIds.length) await chrome.tabs.remove(agentTabIds);
+        keptAlive++;
+        auditLog(`admin_close_tabs: window ${wid} was the LAST window - kept it alive with a pinned tab and closed our ${agentTabIds.length} tab(s); browser survives`);
+      } else {
+        await chrome.windows.remove(wid);
+        closed++;
+        auditLog(`admin_close_tabs: closed window ${wid} (${agentTabIds.length} agent tab(s), no human tabs, not the last window)`);
+      }
       // Best-effort sessionWindows cleanup (the Map may be empty after a
       // service-worker wake-up - that's fine, the close still happened).
       for (const [sid, w] of sessionWindows) if (w === wid) sessionWindows.delete(sid);
     } catch (e) {
-      log(`admin_close_tabs: failed to close window ${wid}: ${e.message}`);
+      auditLog(`admin_close_tabs: failed to clear window ${wid}: ${e.message}`);
     }
   }
 
-  log(`admin_close_tabs done: closed=${closed} preserved=${preserved} blockedByLock=${blockedByLock}`);
+  auditLog(
+    `admin_close_tabs done: closedWindows=${closed} tabsOnly=${tabsOnly} keptAlive=${keptAlive} ` +
+    `preserved=${preserved} blockedByLock=${blockedByLock} skipped=${skipped}`
+  );
 }
 
 // Handler for hub-originated admin_set_mode messages (POST /admin/force-private

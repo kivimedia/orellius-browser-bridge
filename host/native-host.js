@@ -18,6 +18,31 @@ function log(msg) {
   process.stderr.write(`[native-host ${ts}] ${msg}\n`);
 }
 
+// --- Audit log on behalf of the extension -----------------------------------
+// The extension's own log() only reaches the service-worker console, which is
+// wiped every time MV3 idles the worker out. That made window closes forensically
+// invisible: on 2026-09-02 Chrome exited repeatedly and the only actor who knew
+// which window it had closed, and why, was a console nobody could read after the
+// fact. The extension now ships those lines here via {type:"orellius_log"} and we
+// append them to a real file. These messages are handled locally and NEVER
+// forwarded to the hub.
+const AUDIT_DIR = path.join(os.homedir(), ".orellius-browser-bridge", "logs");
+const AUDIT_MAX_BYTES = 5 * 1024 * 1024;
+try { fs.mkdirSync(AUDIT_DIR, { recursive: true }); } catch {}
+
+function auditAppend(channel, line) {
+  const safe = /^[a-z0-9_-]{1,32}$/i.test(String(channel || "")) ? channel : "misc";
+  const file = path.join(AUDIT_DIR, `${safe}.log`);
+  try {
+    if (fs.statSync(file).size > AUDIT_MAX_BYTES) fs.renameSync(file, `${file}.1`);
+  } catch {}
+  try {
+    fs.appendFileSync(file, `[${new Date().toISOString()}] ${line}\n`);
+  } catch (err) {
+    log(`audit append failed (${safe}): ${err.message}`);
+  }
+}
+
 function getPort() {
   const configPath = path.join(
     os.homedir(),
@@ -206,6 +231,15 @@ process.stdin.on("data", (chunk) => {
     // strip the init out of the regular message stream.
     if (msg.type === "init" && msg.browser) {
       registerWithHub(String(msg.browser).toLowerCase());
+      continue;
+    }
+
+    // Audit lines from the extension: host-only, never forwarded to the hub.
+    // Handled before the `registered` gate below so a close that happens while
+    // the hub connection is down still lands on disk - that is exactly the
+    // moment worth having a record of.
+    if (msg.type === "orellius_log") {
+      auditAppend(msg.channel, String(msg.line || ""));
       continue;
     }
 
