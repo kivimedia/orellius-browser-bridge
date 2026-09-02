@@ -45,7 +45,19 @@ const SWEEP_INTERVAL_MS = Number(process.env.ORELLIUS_SWEEP_INTERVAL_MS) || 60 *
 // /admin/status unable to answer "who is driving the browser right now".
 const REGISTER_GRACE_MS = 60 * 1000;
 
+// Informational hub chatter goes to STDOUT so pm2 keeps it in
+// orellius-hub-out.log. It used to go to stderr, which meant every routine
+// "Hub listening" / "MCP client registered" line landed in
+// orellius-hub-error.log and buried the handful of lines that are real
+// errors. Same failure mode as pr-pipeline. out.log had sat at 0 bytes since
+// 2026-06-08 while error.log carried 100% of the traffic.
 function log(msg) {
+  const ts = new Date().toISOString().slice(11, 19);
+  process.stdout.write(`[hub ${ts}] ${msg}\n`);
+}
+
+// Genuine faults keep stderr, so orellius-hub-error.log means something again.
+function logError(msg) {
   const ts = new Date().toISOString().slice(11, 19);
   process.stderr.write(`[hub ${ts}] ${msg}\n`);
 }
@@ -325,12 +337,12 @@ async function launchBrowser(browser) {
       if (rv === "0" && pid) return { ok: true, pid: Number(pid), via: "wmi", cmdline };
       log(`Recovery: WMI launch returned "${out}" - falling back to spawn`);
     } catch (err) {
-      log(`Recovery: WMI launch failed (${err.message}) - falling back to spawn`);
+      logError(`Recovery: WMI launch failed (${err.message}) - falling back to spawn`);
     }
   }
   try {
     const child = spawn(exe, args, { detached: true, stdio: "ignore" });
-    child.on("error", (err) => log(`Recovery: spawned browser errored: ${err.message}`));
+    child.on("error", (err) => logError(`Recovery: spawned browser errored: ${err.message}`));
     child.unref();
     return { ok: true, pid: child.pid, via: "spawn", cmdline };
   } catch (err) {
@@ -603,7 +615,7 @@ const server = net.createServer((socket) => {
             // fired in a hub log. Gated rather than deleted, in case an older
             // native host is ever pointed here.
             if (process.env.ORELLIUS_ALLOW_LEGACY_NATIVE_HOST !== "1") {
-              log(`Refusing legacy native-host registration from ${remote}` +
+              logError(`Refusing legacy native-host registration from ${remote}` +
                   ` (set ORELLIUS_ALLOW_LEGACY_NATIVE_HOST=1 to allow)`);
               socket.destroy();
               return;
@@ -642,7 +654,7 @@ const server = net.createServer((socket) => {
   });
 
   socket.on("error", (err) => {
-    log(`Socket error (${socketType || "unknown"} ${remote}): ${err.message}`);
+    logError(`Socket error (${socketType || "unknown"} ${remote}): ${err.message}`);
   });
 
   socket.on("close", () => {
@@ -706,7 +718,7 @@ function broadcastAdminMessage(adminMsg) {
         sock.write(JSON.stringify({ ...adminMsg, browser }) + "\n");
         delivered++;
       } catch (err) {
-        log(`broadcast to ${browser} failed: ${err.message}`);
+        logError(`broadcast to ${browser} failed: ${err.message}`);
       }
     }
   }
@@ -759,7 +771,7 @@ const adminServer = http.createServer((req, res) => {
   // (VPS hardening 2026-08-25, committed upstream 2026-08-28). originAllowed()
   // additionally lets the extension's own origin through - see its comment.
   if (!originAllowed(req.headers.origin)) {
-    log(`Admin: refused ${req.method} ${req.url} from origin ${req.headers.origin}`);
+    logError(`Admin: refused ${req.method} ${req.url} from origin ${req.headers.origin}`);
     res.writeHead(403, { "content-type": "text/plain" });
     res.end("cross-origin requests are not accepted on the admin port");
     return;
@@ -996,7 +1008,7 @@ adminServer.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
     log(`Admin HTTP port ${ADMIN_HTTP_PORT} already in use - skipping admin server (another hub may own it).`);
   } else {
-    log(`Admin server error: ${err.message}`);
+    logError(`Admin server error: ${err.message}`);
   }
 });
 
@@ -1016,7 +1028,7 @@ server.on("error", (err) => {
     log(`Port ${TCP_PORT} already in use - something else owns it (another hub, or an SSH tunnel). Exiting.`);
     process.exit(1);
   } else {
-    log(`Server error: ${err.message}`);
+    logError(`Server error: ${err.message}`);
   }
 });
 
