@@ -558,6 +558,41 @@ function forwardToMcpClient(msg) {
 
 // --- TCP Server ---
 
+// R34-HUB-SESSION-TAKEOVER (17-Sep-2026). Registration used to be first come,
+// last wins: any local socket could claim a live sessionId (and read the pages
+// that session drives, e.g. a 2FA code the login filler just typed) or claim
+// the native host (and receive EVERY session's tool_requests). Session ids are
+// not secret - diagnostics and logs show them. So bind each registration to
+// the connecting socket's real OS uid and refuse replacements across uids.
+//
+// Linux exposes the owning uid of every TCP socket in /proc/net/tcp{,6}; the
+// client's row has local port = our socket.remotePort and remote port = the
+// hub port. Returns null where that is unavailable (Windows, macOS).
+function hexPort(p) { return p.toString(16).toUpperCase().padStart(4, "0"); }
+function peerUid(socket) {
+  if (process.platform !== "linux") return null;
+  const lp = hexPort(socket.remotePort), rp = hexPort(socket.localPort);
+  for (const f of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text;
+    try { text = fs.readFileSync(f, "utf-8"); } catch { continue; }
+    for (const row of text.split("\n").slice(1)) {
+      const c = row.trim().split(/\s+/);
+      if (c.length < 8) continue;
+      if (c[1].endsWith(":" + lp) && c[2].endsWith(":" + rp)) return Number(c[7]);
+    }
+  }
+  return null;
+}
+const HUB_UID = typeof process.getuid === "function" ? process.getuid() : null;
+/** @type {WeakMap<net.Socket, number|null>} */
+const socketUids = new WeakMap();
+// May `newUid` displace a live socket owned by `oldUid`? On Linux an unknown uid
+// on either side refuses; elsewhere (no /proc) the old behaviour stands.
+function mayReplace(oldUid, newUid) {
+  if (process.platform !== "linux") return true;
+  return oldUid !== null && newUid !== null && oldUid === newUid;
+}
+
 const server = net.createServer((socket) => {
   // Every message on this socket is a small, latency-critical, request/response
   // line. Nagle holds a small write back until previously sent data is ACKed,
@@ -589,8 +624,19 @@ const server = net.createServer((socket) => {
         // Identify socket type from first message
         if (!socketType) {
           if (msg.type === "register_native_host") {
+            const nhBrowser = msg.browser || DEFAULT_BROWSER;
+            const nhUid = peerUid(socket);
+            // The browser (and so its native host) runs as the hub's own user.
+            // A different uid must never become the thing every request goes to.
+            if (process.platform === "linux" && HUB_UID !== null && nhUid !== HUB_UID &&
+                process.env.ORELLIUS_ALLOW_FOREIGN_NATIVE_HOST !== "1") {
+              logError(`Refusing native host registration from ${remote}: peer uid ${nhUid} is not the hub uid ${HUB_UID}`);
+              socket.destroy();
+              return;
+            }
             socketType = "native_host";
-            socketBrowser = msg.browser || DEFAULT_BROWSER;
+            socketBrowser = nhBrowser;
+            socketUids.set(socket, nhUid);
             // Only replace the same-browser socket; do not kick out other
             // browsers' native_hosts (the original bug that prevented Chrome
             // and Firefox from coexisting).
@@ -605,11 +651,20 @@ const server = net.createServer((socket) => {
             flushParked(socketBrowser);
             continue;
           } else if (msg.type === "register_mcp_client" && msg.sessionId) {
+            const newUid = peerUid(socket);
+            // If an old client with same sessionId exists, replace it - but only
+            // when the newcomer is the same OS user. Otherwise it is a takeover.
+            const old = mcpClients.get(msg.sessionId);
+            if (old && !old.destroyed && !mayReplace(socketUids.get(old) ?? null, newUid)) {
+              logError(`Refusing takeover of live session ${msg.sessionId} from ${remote} (peer uid ${newUid}, holder uid ${socketUids.get(old)})`);
+              socket.write(JSON.stringify({ type: "error", error: "session id in use by another user" }) + "\n");
+              socket.destroy();
+              return;
+            }
             socketType = "mcp_client";
             socketSessionId = msg.sessionId;
+            socketUids.set(socket, newUid);
 
-            // If an old client with same sessionId exists, replace it
-            const old = mcpClients.get(socketSessionId);
             if (old && !old.destroyed) {
               log(`Replacing stale MCP client session ${socketSessionId}`);
               old.destroy();
