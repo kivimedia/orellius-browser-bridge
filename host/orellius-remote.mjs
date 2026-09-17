@@ -38,6 +38,9 @@
 
 import { spawn } from "node:child_process";
 import net from "node:net";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const DEFAULTS = {
   localPort: 18775,
@@ -58,9 +61,20 @@ const REMOTE_HOST = flag("host", process.env.ORELLIUS_VPS_HOST || DEFAULTS.remot
 const REMOTE_USER = flag("user", process.env.ORELLIUS_VPS_USER || DEFAULTS.remoteUser);
 const REMOTE_HUB_PORT = Number(flag("remote-port", DEFAULTS.remoteHubPort));
 
+/* Also written to a file. On Windows this runs under run-hidden.vbs, which
+   discards stderr, so on 16-Sep-2026 a tunnel that hung for hours left no
+   record of when it dropped or what ssh said. The file is the evidence. */
+const LOG_FILE = process.env.ORELLIUS_REMOTE_LOG
+  || path.join(os.homedir(), ".orellius-browser-bridge", "logs", "remote-tunnel.log");
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
 function log(msg) {
-  const ts = new Date().toISOString().slice(11, 19);
-  process.stderr.write(`[orellius-remote ${ts}] ${msg}\n`);
+  const line = `[orellius-remote ${new Date().toISOString()}] ${msg}\n`;
+  process.stderr.write(line);
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    try { if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) fs.renameSync(LOG_FILE, LOG_FILE + ".1"); } catch {}
+    fs.appendFileSync(LOG_FILE, line);
+  } catch { /* logging must never take the tunnel down */ }
 }
 
 /** Resolve true if something is listening on 127.0.0.1:port. */
@@ -161,7 +175,12 @@ const BACKOFF_MAX_MS = 30000;
 function start() {
   if (stopping) return;
   log(`Connecting: ssh ${SSH_ARGS.join(" ")}`);
-  child = spawn("ssh", SSH_ARGS, { stdio: ["ignore", "pipe", "pipe"] });
+  // ORELLIUS_REMOTE_FAKE_SSH=<script.mjs> swaps in a stand-in ssh for the
+  // dead-tunnel test only (Windows spawn cannot resolve a .cmd shim as "ssh").
+  const fake = process.env.ORELLIUS_REMOTE_FAKE_SSH;
+  child = fake
+    ? spawn(process.execPath, [fake, ...SSH_ARGS], { stdio: ["ignore", "pipe", "pipe"] })
+    : spawn("ssh", SSH_ARGS, { stdio: ["ignore", "pipe", "pipe"] });
 
   child.stdout.on("data", (d) => log(`ssh: ${String(d).trim()}`));
   child.stderr.on("data", (d) => {
@@ -209,7 +228,7 @@ function start() {
 // immediately. So: sample the round trip, and if it degrades badly against the
 // best this tunnel has ever achieved, respawn ssh and let the existing exit
 // handler reconnect.
-const PROBE_INTERVAL_MS = 120000;
+const PROBE_INTERVAL_MS = Number(process.env.ORELLIUS_REMOTE_PROBE_MS) || 120000; // env only for the dead-tunnel test
 const BAD_FACTOR = 2;          // 2x the best we have ever seen here
 const BAD_MARGIN_MS = 60;      // ...and at least this much worse, so a fast
                                // link does not trip on normal jitter
@@ -249,10 +268,42 @@ function probeLatency(port) {
   });
 }
 
+/* A dead tunnel that ssh has not noticed: the local port still accepts (ssh
+   holds it) but the hub never answers the handshake, so every browser call
+   waits its full 60s and fails. ssh does not exit, so the exit handler never
+   runs, and the latency check used to skip a failed probe as "not its job".
+   Nothing owned that case. Two failed probes in a row (about 2 minutes) now
+   respawn ssh. Separate from the slow-tunnel respawns: a dead tunnel is always
+   worth one more try, so it has no lifetime cap, only the exit backoff. */
+const DEAD_STREAK = 2;
+let deadStreak = 0;
+
+let probing = false; // one probe at a time: overlapping probes race the streak counters
+
 async function latencyWatchdog() {
-  if (stopping || watchdogDisabled || !child || child.killed) return;
+  if (stopping || probing || !child || child.killed) return;
+  probing = true;
+  try { await latencyWatchdogOnce(); } finally { probing = false; }
+}
+
+async function latencyWatchdogOnce() {
+  if (stopping || !child || child.killed) return;
   const rtt = await probeLatency(LOCAL_PORT);
-  if (rtt === null) return; // connectivity problems are the exit handler's job
+  if (rtt === null) {
+    deadStreak++;
+    const listening = await portAnswers(LOCAL_PORT);
+    log(`Hub did not answer through the tunnel (port ${listening ? "open" : "closed"}) - ${deadStreak}/${DEAD_STREAK}`);
+    if (deadStreak >= DEAD_STREAK && child && !child.killed) {
+      deadStreak = 0;
+      bestRttMs = Infinity;
+      log("Tunnel is open but DEAD. Respawning ssh.");
+      child.kill(); // exit handler reconnects with backoff
+    }
+    return;
+  }
+  if (deadStreak) log(`Hub answering again (${rtt}ms) after ${deadStreak} failed probe(s).`);
+  deadStreak = 0;
+  if (watchdogDisabled) return;
 
   if (rtt < bestRttMs) bestRttMs = rtt;
   const threshold = Math.max(bestRttMs * BAD_FACTOR, bestRttMs + BAD_MARGIN_MS);
