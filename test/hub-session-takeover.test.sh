@@ -8,7 +8,7 @@
 # port with its own HOME, and only session ids this script invents.
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-HUB="$HERE/host/hub.js"
+HUB="${ORELLIUS_HUB_JS:-$HERE/host/hub.js}"  # override to test a live copy
 if [ "$(uname -s)" != "Linux" ] || ! sudo -n -u nobody true 2>/dev/null; then
   echo "SKIP: needs Linux + sudo -n -u nobody"; exit 0
 fi
@@ -56,5 +56,16 @@ NH=$!; sleep 0.5
 sudo -n -u nobody node "$WORK/client.cjs" $PORT '{"type":"register_native_host","browser":"testbrowser"}' 800 >"$WORK/nhatk.out"
 wait $NH
 check "foreign uid cannot replace the native host" "grep -q ALIVE '$WORK/nh.out' && ! grep -q '\"role\":\"native_host\"' '$WORK/nhatk.out'"
+
+# 4. R56: a CLOSED session id stays bound to its owner uid. The id is visible in
+#    the extension's group title and the extension still authorizes it for the
+#    leftover tab group, so a foreign uid registering it could read that page.
+node "$WORK/client.cjs" $PORT "{\"type\":\"register_mcp_client\",\"sessionId\":\"${SID}3\"}" 300 >"$WORK/dead-a.out"
+sleep 0.3
+sudo -n -u nobody node "$WORK/client.cjs" $PORT "{\"type\":\"register_mcp_client\",\"sessionId\":\"${SID}3\"}" 800 >"$WORK/dead-b.out"
+check "owner registered the id before closing" "grep -q '\"role\":\"mcp_client\"' '$WORK/dead-a.out'"
+check "foreign uid cannot register a closed session id" "! grep -q '\"role\":\"mcp_client\"' '$WORK/dead-b.out' && grep -q 'in use by another user' '$WORK/dead-b.out'"
+node "$WORK/client.cjs" $PORT "{\"type\":\"register_mcp_client\",\"sessionId\":\"${SID}3\"}" 800 >"$WORK/dead-a2.out"
+check "owner uid can re-register its closed session id" "grep -q '\"role\":\"mcp_client\"' '$WORK/dead-a2.out'"
 
 exit $fail

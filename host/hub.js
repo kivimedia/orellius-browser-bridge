@@ -592,6 +592,24 @@ function peerUid(socket) {
 const HUB_UID = typeof process.getuid === "function" ? process.getuid() : null;
 /** @type {WeakMap<net.Socket, number|null>} */
 const socketUids = new WeakMap();
+// R56-HUB-DEAD-SESSION-ID-REUSE (17-Sep-2026). Refusing a takeover only while
+// the session's socket is LIVE is not enough: once the holder disconnects, its
+// 8-char id is still visible (the extension's "Claude · <id>" group title,
+// tabs_context_mcp diagnostics) and the extension still authorizes that id for
+// the leftover tab group - sessionGroups is only dropped in session_end. So a
+// different uid registering the dead id could read what the old session left
+// on the page (a typed code, a password). The owner uid of every id is kept
+// here after the socket closes, and only that uid may register it again.
+// Entries are pruned 24h after their last activity, never while live.
+/** @type {Map<string, {uid: number|null, seen: number}>} */
+const sessionOwnerUids = new Map();
+const SESSION_OWNER_TTL_MS = 24 * 60 * 60 * 1000;
+function pruneSessionOwners(now) {
+  for (const [sid, o] of sessionOwnerUids) {
+    const live = mcpClients.get(sid);
+    if ((!live || live.destroyed) && now - o.seen > SESSION_OWNER_TTL_MS) sessionOwnerUids.delete(sid);
+  }
+}
 // May `newUid` displace a live socket owned by `oldUid`? On Linux an unknown uid
 // on either side refuses; elsewhere (no /proc) the old behaviour stands.
 function mayReplace(oldUid, newUid) {
@@ -661,8 +679,12 @@ const server = net.createServer((socket) => {
             // If an old client with same sessionId exists, replace it - but only
             // when the newcomer is the same OS user. Otherwise it is a takeover.
             const old = mcpClients.get(msg.sessionId);
-            if (old && !old.destroyed && !mayReplace(socketUids.get(old) ?? null, newUid)) {
-              logError(`Refusing takeover of live session ${msg.sessionId} from ${remote} (peer uid ${newUid}, holder uid ${socketUids.get(old)})`);
+            pruneSessionOwners(Date.now());
+            const oldLive = !!(old && !old.destroyed);
+            const tomb = sessionOwnerUids.get(msg.sessionId);
+            const holderUid = oldLive ? (socketUids.get(old) ?? null) : (tomb ? tomb.uid : undefined);
+            if (holderUid !== undefined && !mayReplace(holderUid, newUid)) {
+              logError(`Refusing ${oldLive ? "takeover of live" : "reuse of closed"} session ${msg.sessionId} from ${remote} (peer uid ${newUid}, holder uid ${holderUid})`);
               socket.write(JSON.stringify({ type: "error", error: "session id in use by another user" }) + "\n");
               socket.destroy();
               return;
@@ -670,6 +692,7 @@ const server = net.createServer((socket) => {
             socketType = "mcp_client";
             socketSessionId = msg.sessionId;
             socketUids.set(socket, newUid);
+            sessionOwnerUids.set(socketSessionId, { uid: newUid, seen: Date.now() });
 
             if (old && !old.destroyed) {
               log(`Replacing stale MCP client session ${socketSessionId}`);
@@ -759,6 +782,8 @@ const server = net.createServer((socket) => {
       log(`MCP client disconnected: session=${socketSessionId} (${remote})`);
       mcpClients.delete(socketSessionId);
       sessionActivity.delete(socketSessionId);
+      const tomb = sessionOwnerUids.get(socketSessionId);
+      if (tomb) tomb.seen = Date.now();
       // Clean up pending request routing for this session
       for (const [reqId, route] of requestRouting) {
         if (route.sessionId === socketSessionId) requestRouting.delete(reqId);
