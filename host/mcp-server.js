@@ -301,12 +301,56 @@ async function ensureHub() {
  * our registration. Called from sendToExtension() on every browser tool call;
  * a no-op once connected. Concurrent callers share one in-flight attempt.
  */
+/**
+ * R36 (17-Sep-2026): before talking to a LOOPBACK hub on Linux, prove the
+ * listener belongs to the hub's uid. Any local user can bind a free loopback
+ * port, so "something answers on 127.0.0.1:18785" is not "the hub answers".
+ * Expected uid: ORELLIUS_HUB_UID, else (port 18785 only) the kmbrowse user.
+ * No expectation resolvable -> no check (PC / Windows behaviour unchanged).
+ */
+function verifyLoopbackHubOwner() {
+  if (process.platform !== "linux") return;
+  if (!(HUB_HOST === "127.0.0.1" || HUB_HOST === "localhost" || HUB_HOST === "::1")) return;
+  let expected = process.env.ORELLIUS_HUB_UID;
+  if (expected === undefined || expected === "") {
+    if (TCP_PORT !== 18785) return;
+    try {
+      const row = fs.readFileSync("/etc/passwd", "utf8").split("\n").find((l) => l.startsWith("kmbrowse:"));
+      if (!row) return;
+      expected = row.split(":")[2];
+    } catch { return; }
+  }
+  expected = String(expected).trim();
+  const portHex = ":" + TCP_PORT.toString(16).toUpperCase().padStart(4, "0");
+  const owners = [];
+  for (const f of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let txt;
+    try { txt = fs.readFileSync(f, "utf8"); } catch { continue; }
+    for (const line of txt.split("\n").slice(1)) {
+      const c = line.trim().split(/\s+/);
+      if (c.length < 8 || c[3] !== "0A" || !c[1].endsWith(portHex)) continue;
+      owners.push(`${c[1]} uid=${c[7]}`);
+      if (c[7] !== expected) {
+        throw new Error(
+          `Refusing to use the hub at ${HUB_HOST}:${TCP_PORT}: its listener (${c[1]}) is owned by uid ${c[7]}, ` +
+          `not the hub's uid ${expected}. Another local user may be squatting the port. Nothing was sent. ` +
+          `Retry in a few seconds; if it persists, report it as a security issue.`
+        );
+      }
+    }
+  }
+  if (owners.length === 0) {
+    throw new Error(`No verifiable listener for ${HUB_HOST}:${TCP_PORT} in /proc/net/tcp; refusing to connect. Nothing was sent.`);
+  }
+}
+
 function ensureHubConnection() {
   if (registered && hubSocket && !hubSocket.destroyed) return Promise.resolve();
   if (hubConnectPromise) return hubConnectPromise;
 
   hubConnectPromise = (async () => {
     await ensureHub();
+    verifyLoopbackHubOwner();
     connectToHub();
     await new Promise((resolve, reject) => {
       if (registered) return resolve();
