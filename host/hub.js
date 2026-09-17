@@ -26,6 +26,12 @@ const DEFAULT_PORT = 18765;
 const IDLE_TIMEOUT_MS = process.env.ORELLIUS_IDLE_TIMEOUT_MS !== undefined
   ? Number(process.env.ORELLIUS_IDLE_TIMEOUT_MS)
   : 5 * 60 * 1000;
+// R36 (17-Sep-2026): under a supervisor the idle self-exit is a squat window.
+// systemd restarts the hub 5s later, and in that gap any local uid can bind the
+// port first; the real hub then exits "already in use" and every client talks to
+// the squatter. A supervised hub (ORELLIUS_NO_IDLE_EXIT=1, set by the systemd
+// drop-in) never gives the port up. Auto-spawned hubs keep the idle exit.
+const NO_IDLE_EXIT = process.env.ORELLIUS_NO_IDLE_EXIT === "1";
 
 // How long a registered MCP session may go WITHOUT making a browser tool call
 // before the hub evicts it: its Chrome window is closed and its socket dropped.
@@ -212,7 +218,7 @@ if (sweepTimer.unref) sweepTimer.unref();
 
 function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
-  if (mcpClients.size === 0 && IDLE_TIMEOUT_MS > 0) {
+  if (mcpClients.size === 0 && IDLE_TIMEOUT_MS > 0 && !NO_IDLE_EXIT) {
     idleTimer = setTimeout(() => {
       if (mcpClients.size === 0) {
         log(`No MCP clients for ${IDLE_TIMEOUT_MS}ms. Shutting down.`);
