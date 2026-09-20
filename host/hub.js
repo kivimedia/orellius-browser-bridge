@@ -26,6 +26,12 @@ const DEFAULT_PORT = 18765;
 const IDLE_TIMEOUT_MS = process.env.ORELLIUS_IDLE_TIMEOUT_MS !== undefined
   ? Number(process.env.ORELLIUS_IDLE_TIMEOUT_MS)
   : 5 * 60 * 1000;
+// R36 (17-Sep-2026): under a supervisor the idle self-exit is a squat window.
+// systemd restarts the hub 5s later, and in that gap any local uid can bind the
+// port first; the real hub then exits "already in use" and every client talks to
+// the squatter. A supervised hub (ORELLIUS_NO_IDLE_EXIT=1, set by the systemd
+// drop-in) never gives the port up. Auto-spawned hubs keep the idle exit.
+const NO_IDLE_EXIT = process.env.ORELLIUS_NO_IDLE_EXIT === "1";
 
 // How long a registered MCP session may go WITHOUT making a browser tool call
 // before the hub evicts it: its Chrome window is closed and its socket dropped.
@@ -212,7 +218,7 @@ if (sweepTimer.unref) sweepTimer.unref();
 
 function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
-  if (mcpClients.size === 0 && IDLE_TIMEOUT_MS > 0) {
+  if (mcpClients.size === 0 && IDLE_TIMEOUT_MS > 0 && !NO_IDLE_EXIT) {
     idleTimer = setTimeout(() => {
       if (mcpClients.size === 0) {
         log(`No MCP clients for ${IDLE_TIMEOUT_MS}ms. Shutting down.`);
@@ -558,6 +564,59 @@ function forwardToMcpClient(msg) {
 
 // --- TCP Server ---
 
+// R34-HUB-SESSION-TAKEOVER (17-Sep-2026). Registration used to be first come,
+// last wins: any local socket could claim a live sessionId (and read the pages
+// that session drives, e.g. a 2FA code the login filler just typed) or claim
+// the native host (and receive EVERY session's tool_requests). Session ids are
+// not secret - diagnostics and logs show them. So bind each registration to
+// the connecting socket's real OS uid and refuse replacements across uids.
+//
+// Linux exposes the owning uid of every TCP socket in /proc/net/tcp{,6}; the
+// client's row has local port = our socket.remotePort and remote port = the
+// hub port. Returns null where that is unavailable (Windows, macOS).
+function hexPort(p) { return p.toString(16).toUpperCase().padStart(4, "0"); }
+function peerUid(socket) {
+  if (process.platform !== "linux") return null;
+  const lp = hexPort(socket.remotePort), rp = hexPort(socket.localPort);
+  for (const f of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text;
+    try { text = fs.readFileSync(f, "utf-8"); } catch { continue; }
+    for (const row of text.split("\n").slice(1)) {
+      const c = row.trim().split(/\s+/);
+      if (c.length < 8) continue;
+      if (c[1].endsWith(":" + lp) && c[2].endsWith(":" + rp)) return Number(c[7]);
+    }
+  }
+  return null;
+}
+const HUB_UID = typeof process.getuid === "function" ? process.getuid() : null;
+/** @type {WeakMap<net.Socket, number|null>} */
+const socketUids = new WeakMap();
+// R56-HUB-DEAD-SESSION-ID-REUSE (17-Sep-2026). Refusing a takeover only while
+// the session's socket is LIVE is not enough: once the holder disconnects, its
+// 8-char id is still visible (the extension's "Claude · <id>" group title,
+// tabs_context_mcp diagnostics) and the extension still authorizes that id for
+// the leftover tab group - sessionGroups is only dropped in session_end. So a
+// different uid registering the dead id could read what the old session left
+// on the page (a typed code, a password). The owner uid of every id is kept
+// here after the socket closes, and only that uid may register it again.
+// Entries are pruned 24h after their last activity, never while live.
+/** @type {Map<string, {uid: number|null, seen: number}>} */
+const sessionOwnerUids = new Map();
+const SESSION_OWNER_TTL_MS = 24 * 60 * 60 * 1000;
+function pruneSessionOwners(now) {
+  for (const [sid, o] of sessionOwnerUids) {
+    const live = mcpClients.get(sid);
+    if ((!live || live.destroyed) && now - o.seen > SESSION_OWNER_TTL_MS) sessionOwnerUids.delete(sid);
+  }
+}
+// May `newUid` displace a live socket owned by `oldUid`? On Linux an unknown uid
+// on either side refuses; elsewhere (no /proc) the old behaviour stands.
+function mayReplace(oldUid, newUid) {
+  if (process.platform !== "linux") return true;
+  return oldUid !== null && newUid !== null && oldUid === newUid;
+}
+
 const server = net.createServer((socket) => {
   // Every message on this socket is a small, latency-critical, request/response
   // line. Nagle holds a small write back until previously sent data is ACKed,
@@ -589,8 +648,19 @@ const server = net.createServer((socket) => {
         // Identify socket type from first message
         if (!socketType) {
           if (msg.type === "register_native_host") {
+            const nhBrowser = msg.browser || DEFAULT_BROWSER;
+            const nhUid = peerUid(socket);
+            // The browser (and so its native host) runs as the hub's own user.
+            // A different uid must never become the thing every request goes to.
+            if (process.platform === "linux" && HUB_UID !== null && nhUid !== HUB_UID &&
+                process.env.ORELLIUS_ALLOW_FOREIGN_NATIVE_HOST !== "1") {
+              logError(`Refusing native host registration from ${remote}: peer uid ${nhUid} is not the hub uid ${HUB_UID}`);
+              socket.destroy();
+              return;
+            }
             socketType = "native_host";
-            socketBrowser = msg.browser || DEFAULT_BROWSER;
+            socketBrowser = nhBrowser;
+            socketUids.set(socket, nhUid);
             // Only replace the same-browser socket; do not kick out other
             // browsers' native_hosts (the original bug that prevented Chrome
             // and Firefox from coexisting).
@@ -605,11 +675,25 @@ const server = net.createServer((socket) => {
             flushParked(socketBrowser);
             continue;
           } else if (msg.type === "register_mcp_client" && msg.sessionId) {
+            const newUid = peerUid(socket);
+            // If an old client with same sessionId exists, replace it - but only
+            // when the newcomer is the same OS user. Otherwise it is a takeover.
+            const old = mcpClients.get(msg.sessionId);
+            pruneSessionOwners(Date.now());
+            const oldLive = !!(old && !old.destroyed);
+            const tomb = sessionOwnerUids.get(msg.sessionId);
+            const holderUid = oldLive ? (socketUids.get(old) ?? null) : (tomb ? tomb.uid : undefined);
+            if (holderUid !== undefined && !mayReplace(holderUid, newUid)) {
+              logError(`Refusing ${oldLive ? "takeover of live" : "reuse of closed"} session ${msg.sessionId} from ${remote} (peer uid ${newUid}, holder uid ${holderUid})`);
+              socket.write(JSON.stringify({ type: "error", error: "session id in use by another user" }) + "\n");
+              socket.destroy();
+              return;
+            }
             socketType = "mcp_client";
             socketSessionId = msg.sessionId;
+            socketUids.set(socket, newUid);
+            sessionOwnerUids.set(socketSessionId, { uid: newUid, seen: Date.now() });
 
-            // If an old client with same sessionId exists, replace it
-            const old = mcpClients.get(socketSessionId);
             if (old && !old.destroyed) {
               log(`Replacing stale MCP client session ${socketSessionId}`);
               old.destroy();
@@ -698,6 +782,8 @@ const server = net.createServer((socket) => {
       log(`MCP client disconnected: session=${socketSessionId} (${remote})`);
       mcpClients.delete(socketSessionId);
       sessionActivity.delete(socketSessionId);
+      const tomb = sessionOwnerUids.get(socketSessionId);
+      if (tomb) tomb.seen = Date.now();
       // Clean up pending request routing for this session
       for (const [reqId, route] of requestRouting) {
         if (route.sessionId === socketSessionId) requestRouting.delete(reqId);
