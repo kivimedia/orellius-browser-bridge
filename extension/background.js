@@ -32,7 +32,12 @@ function auditLog(msg, channel = "windows") {
 }
 
 // TEMPORARY diagnostic: per-window census - who owns each window's tabs?
-async function _debugWindowsOverview() {
+async function _debugWindowsOverview(mySessionId) {
+  // mySessionId: the caller's own id. Its own title and its own claim print in full
+  // (it already knows them); every other session is redacted.
+  const myGroupTitle = mySessionId
+    ? `\u{1F512} Claude · ${String(mySessionId).slice(0, 8)}`
+    : null;
   try {
     const wins = await chrome.windows.getAll({ populate: true });
     const lines = [];
@@ -44,13 +49,21 @@ async function _debugWindowsOverview() {
         if (t.groupId !== undefined && t.groupId !== -1) {
           try {
             const g = await chrome.tabGroups.get(t.groupId);
-            if ((g.title || "").startsWith("\u{1F512} Claude")) { isClaude = true; groups.add(g.title); }
+            if ((g.title || "").startsWith("\u{1F512} Claude")) {
+              isClaude = true;
+              // The TITLE carries the owning session's id, and this census goes back to
+              // whichever session asked for diagnostics - so printing it handed every
+              // caller the routing id of every other live session. The census answers
+              // how many windows, how many Claude tabs and who claimed this one: it
+              // keeps the counts and drops the ids. Ziv, 20-Sep-2026 ("leak").
+              groups.add(g.title === myGroupTitle ? g.title : "\u{1F512} Claude · <other session>");
+            }
           } catch {}
         }
         if (isClaude) claude++; else human++;
       }
       const owner = findOwnerOfWindow(w.id);
-      lines.push(`window ${w.id}: ${w.state}${w.focused ? " FOCUSED" : ""} tabs=${(w.tabs || []).length} claude=${claude} human=${human}${owner ? ` claimedBy=${owner}` : ""}${groups.size ? ` groups=[${[...groups].join(" | ")}]` : ""}`);
+      lines.push(`window ${w.id}: ${w.state}${w.focused ? " FOCUSED" : ""} tabs=${(w.tabs || []).length} claude=${claude} human=${human}${owner ? ` claimedBy=${owner === mySessionId ? owner : "<other session>"}` : ""}${groups.size ? ` groups=[${[...groups].join(" | ")}]` : ""}`);
     }
     return lines.join("\n");
   } catch (e) { return `windows overview FAILED: ${e.message}`; }
@@ -3343,7 +3356,7 @@ const toolHandlers = {
     const _trace = args.diagnostics
       ? `\n\n===FOCUS-TRACE (${_focusTrace.length} events, newest last)===\n` +
         _focusTrace.slice(-30).map((e) => JSON.stringify(e)).join("\n") +
-        `\n\n===WINDOWS===\n${await _debugWindowsOverview()}` +
+        `\n\n===WINDOWS===\n${await _debugWindowsOverview(_currentSessionId)}` +
         `\n\n===CREATE-PROBE===\n${await _probeWindowCreate()}` +
         `\n\n===RECENT-LOGS===\n${_logRing.slice(-40).join("\n")}`
       : "";
