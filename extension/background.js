@@ -32,6 +32,27 @@ function auditLog(msg, channel = "windows") {
 }
 
 // TEMPORARY diagnostic: per-window census - who owns each window's tabs?
+// Every session id this worker has served a request for. The focus trace and the
+// log ring name the session behind each entry, and both go back whole to whoever
+// asks for diagnostics - so 107cc74 closed the census and left these two open
+// (measured live 22-Sep-2026: a second agent's id in RECENT-LOGS and in every
+// focus-trace entry). Redacting by KNOWN id rather than by pattern keeps tab and
+// window ids (long decimals) intact; the hex pattern below catches an id that was
+// recovered from storage before this worker served it (restored group titles).
+const _seenSessionIds = new Set();
+function _redactOtherSessions(text, mySessionId) {
+  const mine = mySessionId ? String(mySessionId) : "";
+  let out = String(text);
+  for (const id of _seenSessionIds) {
+    if (!id || id === mine) continue;
+    out = out.split(id).join("<other session>");
+  }
+  // An 8-hex token with at least one letter, not the caller's own short id.
+  // Lookarounds, not \b: "_" is a word character, so \b misses "15c7cfb0_1".
+  return out.replace(/(?<![0-9a-f])(?=[0-9]*[a-f])[0-9a-f]{8}(?![0-9a-f])/g,
+    (tok) => (mine && mine.startsWith(tok)) ? tok : "<other session>");
+}
+
 async function _debugWindowsOverview(mySessionId) {
   // mySessionId: the caller's own id. Its own title and its own claim print in full
   // (it already knows them); every other session is redacted.
@@ -3355,10 +3376,10 @@ const toolHandlers = {
     // still runs, so the trace is complete the moment you ask for it.
     const _trace = args.diagnostics
       ? `\n\n===FOCUS-TRACE (${_focusTrace.length} events, newest last)===\n` +
-        _focusTrace.slice(-30).map((e) => JSON.stringify(e)).join("\n") +
+        _redactOtherSessions(_focusTrace.slice(-30).map((e) => JSON.stringify(e)).join("\n"), _currentSessionId) +
         `\n\n===WINDOWS===\n${await _debugWindowsOverview(_currentSessionId)}` +
         `\n\n===CREATE-PROBE===\n${await _probeWindowCreate()}` +
-        `\n\n===RECENT-LOGS===\n${_logRing.slice(-40).join("\n")}`
+        `\n\n===RECENT-LOGS===\n${_redactOtherSessions(_logRing.slice(-40).join("\n"), _currentSessionId)}`
       : "";
 
     if (state.tabGroupId === null) {
@@ -5058,6 +5079,7 @@ const toolHandlers = {
 
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args, sessionId) {
+  if (sessionId) _seenSessionIds.add(String(sessionId));
   const handler = toolHandlers[tool];
   if (!handler) {
     _currentSessionId = sessionId;
