@@ -1,0 +1,72 @@
+{
+  "manifest_version": 3,
+  "name": "KM BOT Portal Bridge",
+  "version": "1.0.0",
+  "description": "Hardened, isolated browser automation for three login portals only. Forked from Orellius Browser Bridge and cut down: no file:// access, no upload tools, no script execution, no relation to any other browser profile.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAonuf/o0py62alVnzreOHq9UjIvfiUsQhvhew+pIBjQZJ2lP6H8Il/3+8B812yPa74cejTprapPt9q7pmEWB+TNZeW2upzSWkG2kUA+YXGFBKsfPd0h8NAIgF5I1fcuVS+3lzRN2YIe+0O5Qgr3UAqaWCQSQG565XEuGuMOf4D7Hb3slLVAf8RIvtpslRp0aLgjll878EMI1MWykrxUAI7pDCDYlVInjypsxMR1z7/y/BlZNnpog/ztIa9WAuORmjnN4Dxk/txr7MPpVBcvm92vAUGW8ZaLVxmPbWzJjJ6NhKqGkJHmJSEEfgH39YFq7k/tgkw/54YZpBaWbWmk5F2wIDAQAB",
+  "permissions": [
+    "tabs",
+    "debugger",
+    "activeTab",
+    "scripting",
+    "nativeMessaging",
+    "tabGroups",
+    "windows",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://hostgator.com/*",
+    "https://www.hostgator.com/*",
+    "https://portal.hostgator.com/*",
+    "https://cloudways.com/*",
+    "https://www.cloudways.com/*",
+    "https://unified.cloudways.com/*",
+    "https://platform.cloudways.com/*",
+    "https://api.cloudways.com/*",
+    "https://dash.cloudflare.com/*",
+    "https://challenges.cloudflare.com/*",
+    "https://hagen.challenges.cloudflare.com/*",
+    "http://127.0.0.1:18788/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://hostgator.com/*",
+        "https://www.hostgator.com/*",
+        "https://portal.hostgator.com/*",
+        "https://cloudways.com/*",
+        "https://www.cloudways.com/*",
+        "https://unified.cloudways.com/*",
+        "https://platform.cloudways.com/*",
+        "https://api.cloudways.com/*",
+        "https://dash.cloudflare.com/*",
+        "https://challenges.cloudflare.com/*",
+        "https://hagen.challenges.cloudflare.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "Browser Bridge: checking...",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

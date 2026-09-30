@@ -309,14 +309,97 @@ function execFileP(cmd, args, timeoutMs) {
   });
 }
 
+// --- Cross-instance browser-process disambiguation --------------------------
+//
+// Recovery decides "is the browser already running?" by counting OS processes
+// with the browser's image name (chrome.exe on Windows). That was correct as
+// long as this machine ran at most one thing launching that image - which
+// stopped being true the day a second, fully isolated Chrome instance (the
+// portal browser: its own --user-data-dir, its own hub, running continuously
+// alongside whatever browser THIS hub manages) showed up. Without this, hub A's
+// recovery sees hub B's Chrome in the process list, concludes "chrome.exe is
+// running", and silently stops relaunching its OWN browser - forever, for as
+// long as hub B's Chrome stays up. That is a standing, invisible failure of
+// Ziv's own hub's auto-relaunch, not a one-time race.
+//
+// Fix: any hub managing an isolated profile registers its --user-data-dir here
+// (env ORELLIUS_BROWSER_USER_DATA_DIR). Every hub's count then excludes
+// processes matching ANOTHER hub's registered directory. A hub that registers
+// nothing - today's default, Ziv's own browser launched into its normal
+// profile - is never excluded by this and pays no cost: with no foreign marker
+// registered, the count takes the exact same fast path as before this patch.
+const BROWSER_TAGS_FILE = path.join(os.tmpdir(), "orellius-browser-tags.json");
+const OWN_USER_DATA_DIR = process.env.ORELLIUS_BROWSER_USER_DATA_DIR || null;
+const BROWSER_TAG_STALE_MS = 5 * 60 * 1000; // a hub that stopped refreshing this is gone
+
+function registerOwnBrowserTag() {
+  if (!OWN_USER_DATA_DIR) return;
+  let all = {};
+  try { all = JSON.parse(fs.readFileSync(BROWSER_TAGS_FILE, "utf8")); } catch {}
+  all[String(TCP_PORT)] = { userDataDir: OWN_USER_DATA_DIR, updatedAt: Date.now() };
+  try { fs.writeFileSync(BROWSER_TAGS_FILE, JSON.stringify(all)); } catch (err) {
+    log(`Could not write ${BROWSER_TAGS_FILE}: ${err.message} (this hub's Chrome will not be excluded from other hubs' process counts)`);
+  }
+}
+registerOwnBrowserTag();
+setInterval(registerOwnBrowserTag, 60 * 1000).unref();
+
+// Pure and hermetically testable: given the parsed tags file, this hub's own
+// port and "now", which OTHER directories are live? Exported for
+// test/hub-browser-process-disambiguation.test.js.
+function liveOtherUserDataDirs(all, ownPort, now) {
+  return Object.entries(all || {})
+    .filter(([port, info]) => port !== String(ownPort) && info && info.userDataDir && (now - (info.updatedAt || 0)) < BROWSER_TAG_STALE_MS)
+    .map(([, info]) => info.userDataDir);
+}
+
+function otherRegisteredUserDataDirs() {
+  let all = {};
+  try { all = JSON.parse(fs.readFileSync(BROWSER_TAGS_FILE, "utf8")); } catch { return []; }
+  return liveOtherUserDataDirs(all, TCP_PORT, Date.now());
+}
+
+// Pure and hermetically testable: given the command-line of every matching
+// process and the set of OTHER hubs' registered profile directories, how many
+// belong to THIS hub (i.e. are not another hub's known Chrome)? Exported via
+// module.exports below for test/hub-browser-process-disambiguation.test.js -
+// this is the one piece of the fix that a real OS process list is not needed
+// to verify.
+function filterExcludedCommandLines(commandLines, excludeDirs) {
+  if (!excludeDirs.length) return commandLines.length;
+  const lowerDirs = excludeDirs.map((d) => d.toLowerCase());
+  return commandLines.filter((l) => !lowerDirs.some((d) => l.toLowerCase().includes(d))).length;
+}
+
+// Test-only export. hub.js is normally run directly as a script (node
+// hub.js --port=...), never imported, so this has no effect outside a test
+// harness that does import it - a plain top-level `export` is inert for a
+// module used as an entry point.
+export { filterExcludedCommandLines, liveOtherUserDataDirs, decideOriginAllowed };
+
+async function countBrowserProcessesWindows(name, excludeDirs) {
+  if (!excludeDirs.length) {
+    // Unchanged fast path - identical to every hub's behavior before this
+    // patch, taken whenever no other hub has registered an isolated profile.
+    const out = await execFileP("tasklist", ["/FI", `IMAGENAME eq ${name}`, "/NH", "/FO", "CSV"], 10000);
+    const needle = `"${name.toLowerCase()}"`;
+    return out.split(/\r?\n/).filter((l) => l.toLowerCase().startsWith(needle)).length;
+  }
+  // A foreign hub has registered an isolated profile directory. Image name
+  // alone cannot tell its Chrome apart from this hub's, so fetch command
+  // lines and exclude anything carrying another hub's exact directory.
+  const ps = `Get-CimInstance Win32_Process -Filter "Name='${name}'" | Select-Object -ExpandProperty CommandLine`;
+  const out = await execFileP("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], 10000);
+  const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return filterExcludedCommandLines(lines, excludeDirs);
+}
+
 /** How many processes of the browser exist right now. null = could not tell. */
 async function countBrowserProcesses(browser) {
   const name = browserProcessName(browser);
   try {
     if (process.platform === "win32") {
-      const out = await execFileP("tasklist", ["/FI", `IMAGENAME eq ${name}`, "/NH", "/FO", "CSV"], 10000);
-      const needle = `"${name.toLowerCase()}"`;
-      return out.split(/\r?\n/).filter((l) => l.toLowerCase().startsWith(needle)).length;
+      return await countBrowserProcessesWindows(name, otherRegisteredUserDataDirs());
     }
     const out = await execFileP("pgrep", process.platform === "darwin" ? ["-x", name] : ["-f", name], 10000);
     return out.split(/\r?\n/).filter(Boolean).length;
@@ -401,6 +484,18 @@ async function runRecovery(browser) {
     steps: [],
   };
   lastRecovery = rec;
+  // The portal hub sets this. launchBrowser() only knows how to do a plain
+  // `--profile-directory=` launch - it has no idea how to hold the DevTools
+  // pipe or call Extensions.loadUnpacked, so if it ever fired for a hub whose
+  // browser needs that dance, the result is a visible, wrong-profile Chrome
+  // window Ziv never asked for (rule 15). The portal's own supervisor is the
+  // only thing that may ever (re)launch its Chrome; this hub's own recovery
+  // must stay a pure observer for it.
+  if (process.env.ORELLIUS_DISABLE_BROWSER_RECOVERY === "1") {
+    rec.steps.push("recovery disabled for this hub (ORELLIUS_DISABLE_BROWSER_RECOVERY=1) - a supervisor outside hub.js owns launching this browser");
+    log(`Recovery: ${rec.steps.join("; ")}`);
+    return rec;
+  }
   const count = await countBrowserProcesses(browser);
   rec.processCount = count;
   rec.browserRunning = count === null ? null : count > 0;
@@ -855,7 +950,34 @@ function broadcastAdminMessage(adminMsg) {
 // allowed_origins; read it from there. If no manifest can be read,
 // any browser-extension origin is accepted (fail open for the bridge, web
 // pages are still refused).
+// A fork (the portal build) has its OWN manifest, at its own path, under its
+// own filename - it is never one of the hardcoded candidates below, which
+// only know the original Orellius manifest name. Without this override, a
+// forked hub instance would either pick up the ORIGINAL extension's origin
+// (if that manifest happens to exist on the box, which it does on Ziv's real
+// PC) and trust the wrong extension's admin calls, or find nothing and fall
+// into the empty-set fail-OPEN path below and trust ANY chrome-extension://
+// origin - both wrong for a hub whose admin surface can shut down/reload/
+// unlock a browser holding live vendor credential sessions. Set by whatever
+// spawns a forked hub (desktop/main.js's spawnPortalHub sets this to
+// ~/.portal-browser-bridge/com.kivimedia.portal_bridge.json).
+const NATIVE_MANIFEST_OVERRIDE = process.env.ORELLIUS_NATIVE_MANIFEST_PATH || null;
+
 function readAllowedExtensionOrigins() {
+  if (NATIVE_MANIFEST_OVERRIDE) {
+    // Never fall back to the shared candidate list here: that list can only
+    // ever name the ORIGINAL extension's manifest, so falling back on a read
+    // failure would silently trust the wrong extension rather than failing
+    // closed (see originAllowed's matching fail-closed branch below).
+    const out = new Set();
+    try {
+      const m = JSON.parse(fs.readFileSync(NATIVE_MANIFEST_OVERRIDE, "utf8"));
+      for (const o of m.allowed_origins || []) out.add(String(o).replace(/\/$/, ""));
+    } catch (err) {
+      logError(`Could not read ORELLIUS_NATIVE_MANIFEST_PATH (${NATIVE_MANIFEST_OVERRIDE}): ${err.message} - this hub's admin endpoints will refuse every extension origin until this is fixed, which is the safe direction for a forked hub.`);
+    }
+    return out;
+  }
   const home = os.homedir();
   const candidates = [
     path.join(home, ".orellius-browser-bridge", "com.orellius.browser_bridge.json"),
@@ -874,12 +996,29 @@ function readAllowedExtensionOrigins() {
 }
 const ALLOWED_EXTENSION_ORIGINS = readAllowedExtensionOrigins();
 
-function originAllowed(origin) {
+// Pure and hermetically testable: given an origin header value, the resolved
+// allowed-origins set, and whether THIS hub instance was told explicitly
+// which manifest is its own, is the origin allowed? Exported for
+// test/hub-origin-allowlist.test.mjs.
+function decideOriginAllowed(origin, allowedOrigins, hasOverride) {
   if (!origin) return true; // CLI / scripts
   const isExt = /^(chrome|moz)-extension:\/\//.test(origin);
   if (!isExt) return false;
-  if (ALLOWED_EXTENSION_ORIGINS.size === 0) return true;
-  return ALLOWED_EXTENSION_ORIGINS.has(origin.replace(/\/$/, ""));
+  if (allowedOrigins.size === 0) {
+    // Fail OPEN only for the original, shared hub - unchanged, pre-existing
+    // behavior for when its manifest genuinely cannot be found. A hub told
+    // explicitly which manifest is its own (NATIVE_MANIFEST_OVERRIDE) fails
+    // CLOSED instead: "any chrome-extension:// origin" is a materially worse
+    // failure mode on a hub whose admin surface can shut down, reload or
+    // unlock a browser holding live vendor credential sessions than it is on
+    // the original hub this fail-open was written for.
+    return !hasOverride;
+  }
+  return allowedOrigins.has(origin.replace(/\/$/, ""));
+}
+
+function originAllowed(origin) {
+  return decideOriginAllowed(origin, ALLOWED_EXTENSION_ORIGINS, Boolean(NATIVE_MANIFEST_OVERRIDE));
 }
 
 const adminServer = http.createServer((req, res) => {
