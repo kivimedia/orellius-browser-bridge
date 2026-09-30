@@ -56,7 +56,7 @@ module.exports = {
       time: true,
     },
     {
-      name: "orellius-view",
+      name: "orellius-websockify",
       // noVNC over websockify, loopback only. Public access is via
       // https://104-200-30-37.sslip.io/orellius-view/ (nginx, basic auth).
       script: "/usr/bin/websockify",
