@@ -23,6 +23,10 @@ module.exports = {
         // Chrome window closed and is deregistered. mcp-server.js re-registers
         // transparently on its next call.
         ORELLIUS_SESSION_TTL_MS: "900000",
+        // pm2 supervises this hub, so it must never idle-exit (hub.js: 0 = stay up, "what a
+        // SUPERVISOR wants"). Without it the hub shut itself down after 5 min with no MCP client
+        // and pm2 restarted it: every 10 min, 4,101 restarts by 04-Oct-26.
+        ORELLIUS_IDLE_TIMEOUT_MS: "0",
       },
     },
     {
