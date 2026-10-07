@@ -108,7 +108,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function killTree(pid) {
   if (!pid) return;
-  try { execFileSync("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore" }); } catch {}
+  try { execFileSync("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true }); } catch {}
 }
 
 // --- Egress proxy (the network-level wall) -----------------------------------
